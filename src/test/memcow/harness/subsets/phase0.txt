@@ -1,0 +1,94 @@
+# phase0 --- the core-regression subset for plan §7.1.
+#
+# §7.1 names categories, not tests: "DDL, DML, vacuum, sequences, temp tables,
+# COPY, index builds".  This file is that mapping.  Selection rule: a test earns
+# a place here if it drives the smgr surface memcow has to reimplement --
+# smgrcreate / smgrextend / smgrstartreadv / smgrreadv / smgrwritev /
+# smgrtruncate / smgrunlink -- and if its expected output is deterministic.
+# Pure expression/type/planner tests are excluded: they exercise no storage the
+# type tests do not already reach through test_setup's tables, and every extra
+# test is extra runtime on every matrix cell.
+#
+# The tests are run through a filtered copy of src/test/regress/parallel_schedule
+# (see gen_schedule.py), so group membership and ordering stay exactly as
+# upstream intends them.  Never reorder by hand.
+#
+# One test per line; # starts a comment.
+
+# --- mandatory setup -------------------------------------------------------
+# Creates onek/tenk1/tenk2/int8_tbl/... via COPY from src/test/regress/data,
+# and the in-place tablespace `regress_tblspace` that the tablespace test
+# later drops.  Everything below depends on it.
+test_setup
+
+# --- COPY ------------------------------------------------------------------
+# Bulk extend path (smgrextend / bulk_write.c) plus COPY TO read paths.
+copy
+copyselect
+copydml
+copyencoding
+copy2
+
+# --- DML -------------------------------------------------------------------
+insert
+insert_conflict
+select
+subselect
+update
+delete
+
+# --- DDL -------------------------------------------------------------------
+# create_misc is a hard dependency of several later tests; create_table /
+# create_type / create_schema are the relation-creation (smgrcreate) surface.
+create_misc
+create_table
+create_type
+create_schema
+create_view
+create_table_like
+constraints
+inherit
+drop_if_exists
+truncate
+alter_table
+
+# --- index builds ----------------------------------------------------------
+# Every AM builds relation forks differently; this is the widest smgrextend /
+# smgrwritev coverage in the tree.
+create_index
+create_index_spgist
+index_including
+index_including_gist
+btree_index
+hash_index
+brin
+brin_bloom
+brin_multi
+gin
+gist
+spgist
+
+# --- vacuum ----------------------------------------------------------------
+# sanity_check is a cluster-wide VACUUM; it must stay because later tests'
+# expected output assumes the heap ordering it produces.
+vacuum
+sanity_check
+vacuum_parallel
+
+# --- rewrites (RelationCopyStorage / smgrreadv direct read path) -----------
+cluster
+matview
+
+# --- sequences -------------------------------------------------------------
+sequence
+
+# --- temp tables -----------------------------------------------------------
+# Local buffer manager: localbuf.c write/extend/read paths, plus temp relation
+# unlink at session end.  NB temp.sql reconnects, so it needs 2 connections.
+temp
+
+# --- tablespaces -----------------------------------------------------------
+# §7.1 calls out ALTER TABLE SET TABLESPACE explicitly: it is the main
+# synchronous smgrreadv caller (RelationCopyStorage, storage.c).  Must stay
+# last: it drops the tablespace test_setup created.
+tablespace

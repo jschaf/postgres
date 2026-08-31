@@ -1,0 +1,14 @@
+# smoke --- a fast subset for wiring up / debugging the harness itself.
+#
+# NOT a gate.  It touches one test per §7.1 category and finishes in seconds.
+# Use subsets/phase0.txt for anything that claims to be a Phase 0 result.
+
+test_setup
+copy
+insert
+create_table
+create_index
+vacuum
+sequence
+temp
+truncate
