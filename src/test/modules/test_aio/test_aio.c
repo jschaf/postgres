@@ -22,6 +22,7 @@
 #include "catalog/pg_type.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "miscadmin.h"
 #include "storage/aio.h"
 #include "storage/aio_internal.h"
 #include "storage/buf_internals.h"
@@ -32,6 +33,7 @@
 #include "storage/proc.h"
 #include "storage/procnumber.h"
 #include "storage/read_stream.h"
+#include "storage/smgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/injection_point.h"
@@ -370,6 +372,112 @@ create_toy_buffer(Relation rel, BlockNumber blkno)
 			 buf);
 
 	return buf;
+}
+
+/*
+ * TEMPORARY SCAFFOLDING for pgtest/memcow commit 1.2 - not for merge.
+ *
+ * Exercises pgaio_io_complete_synthetic(). Imitates what an smgr that serves
+ * reads out of memory does: set up the handle exactly as bufmgr does, put the
+ * page contents into the target buffers by other means (here: a plain
+ * synchronous smgrreadv, standing in for a memcpy out of an overlay/mmap),
+ * then complete the handle synthetically with a result counted in blocks.
+ *
+ * Deliberately reuses read_rel_block_ll()'s setup so the only difference
+ * between the two paths is smgrstartreadv() vs. the synthetic completion.
+ */
+PG_FUNCTION_INFO_V1(read_rel_block_synthetic);
+Datum
+read_rel_block_synthetic(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	BlockNumber blkno = PG_GETARG_UINT32(1);
+	int			nblocks = PG_GETARG_INT32(2);
+	int			result_blocks = PG_GETARG_INT32(3);
+	bool		batchmode = PG_GETARG_BOOL(4);
+	Relation	rel;
+	Buffer		bufs[PG_IOV_MAX];
+	BufferDesc *buf_hdrs[PG_IOV_MAX];
+	Page		pages[PG_IOV_MAX];
+	PgAioReturn ior;
+	PgAioHandle *ioh;
+	PgAioWaitRef iow;
+	SMgrRelation smgr;
+
+	if (nblocks <= 0 || nblocks > PG_IOV_MAX)
+		elog(ERROR, "nblocks is out of range");
+
+	rel = relation_open(relid, AccessShareLock);
+
+	for (int i = 0; i < nblocks; i++)
+	{
+		bufs[i] = create_toy_buffer(rel, blkno + i);
+		pages[i] = BufferGetBlock(bufs[i]);
+		buf_hdrs[i] = BufferIsLocal(bufs[i]) ?
+			GetLocalBufferDescriptor(-bufs[i] - 1) :
+			GetBufferDescriptor(bufs[i] - 1);
+	}
+
+	smgr = RelationGetSmgr(rel);
+
+	pgstat_prepare_report_checksum_failure(smgr->smgr_rlocator.locator.dbOid);
+
+	ioh = pgaio_io_acquire(CurrentResourceOwner, &ior);
+	pgaio_io_get_wref(ioh, &iow);
+
+	if (RelationUsesLocalBuffers(rel))
+	{
+		for (int i = 0; i < nblocks; i++)
+			StartLocalBufferIO(buf_hdrs[i], true, true, NULL);
+		pgaio_io_set_flag(ioh, PGAIO_HF_REFERENCES_LOCAL);
+	}
+	else
+	{
+		for (int i = 0; i < nblocks; i++)
+			StartSharedBufferIO(buf_hdrs[i], true, true, NULL);
+	}
+
+	pgaio_io_set_handle_data_32(ioh, (uint32 *) bufs, nblocks);
+
+	pgaio_io_register_callbacks(ioh,
+								RelationUsesLocalBuffers(rel) ?
+								PGAIO_HCB_LOCAL_BUFFER_READV :
+								PGAIO_HCB_SHARED_BUFFER_READV,
+								0);
+
+	if (batchmode)
+		pgaio_enter_batchmode();
+
+	/*
+	 * Stand-in for the memory-to-memory copy a memory-backed smgr does. Any
+	 * error here is raised before the handle is staged, which is the whole
+	 * point of doing it in this order.
+	 */
+	HOLD_INTERRUPTS();
+	pgaio_io_set_target_smgr(ioh, smgr, MAIN_FORKNUM, blkno, nblocks, false);
+	smgrreadv(smgr, MAIN_FORKNUM, blkno, (void **) pages, nblocks);
+
+	pgaio_io_complete_synthetic(ioh, result_blocks);
+	RESUME_INTERRUPTS();
+
+	if (batchmode)
+		pgaio_exit_batchmode();
+
+	for (int i = 0; i < nblocks; i++)
+		ReleaseBuffer(bufs[i]);
+
+	/* must be a no-op: the handle was already reclaimed */
+	pgaio_wref_wait(&iow);
+
+	if (ior.result.status != PGAIO_RS_OK)
+		pgaio_result_report(ior.result,
+							&ior.target_data,
+							ior.result.status == PGAIO_RS_ERROR ?
+							ERROR : WARNING);
+
+	relation_close(rel, NoLock);
+
+	PG_RETURN_VOID();
 }
 
 /*

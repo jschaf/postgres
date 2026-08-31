@@ -128,3 +128,13 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 CREATE FUNCTION inj_io_reopen_detach()
 RETURNS pg_catalog.void STRICT
 AS 'MODULE_PATHNAME' LANGUAGE C;
+
+/* TEMPORARY SCAFFOLDING for pgtest/memcow commit 1.2 - not for merge */
+CREATE FUNCTION read_rel_block_synthetic(
+    rel regclass,
+    blockno int,
+    nblocks int DEFAULT 1,
+    result_blocks int DEFAULT 1,
+    batchmode bool DEFAULT false)
+RETURNS pg_catalog.void STRICT
+AS 'MODULE_PATHNAME' LANGUAGE C;
