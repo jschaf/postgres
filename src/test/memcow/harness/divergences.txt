@@ -1,0 +1,31 @@
+# divergences.txt --- the REGISTERED, DOCUMENTED ways memcow output may differ
+#                     from stock md output.
+#
+# Plan §7.1's gate is "regression subset zero diffs".  Memcow does not quite
+# achieve zero: a small number of core SQL functions read relation files with
+# stat() instead of going through smgr, so under memcow they measure the
+# (empty) runtime PGDATA rather than the seed plus the overlay.  Those
+# divergences are real, they are understood, and they have file:line citations
+# below.  Everything else must be byte-identical.
+#
+# This file exists so that such a difference shows up in the gate as a NAMED
+# allowance with a justification attached, rather than as a mystery diff that
+# whoever reads the log next has to re-derive.  A diff hunk that no rule here
+# explains fails the gate, and so does a rule that is claimed for a test but
+# never actually matches (see --allow-engine-divergence in diff_engines.sh):
+# a stale allowance is how a gate quietly stops testing anything.
+#
+# Format: three TAB-separated fields per line.
+#
+#     name <TAB> python-regex <TAB> justification
+#
+# The regex is matched (re.search, case sensitive) against the FULL TEXT of a
+# unified-diff hunk -- context lines included -- because the SQL that produced
+# a differing result is context, not a changed line.  Blank lines and lines
+# beginning with '#' are ignored.
+#
+# Portions Copyright (c) 2026, PostgreSQL Global Development Group
+
+dbsize_relation_size	pg_(relation|table|indexes|total_relation)_size\b	calculate_relation_size()/calculate_toast_table_size() stat() the path from relpathbackend() directly (src/backend/utils/adt/dbsize.c:326-348) instead of asking smgr, so under memcow they measure the runtime PGDATA -- which holds no relation files at all -- and report 0 for anything served from the seed or the overlay.  Confirmed by measurement: SELECT pg_relation_size('public.events'), count(*) FROM public.events yields 0|4000.  This is contract ADDENDUM item F, and it is the whole of the currently known memcow-vs-md output divergence.
+dbsize_database_size	pg_database_size\b	calculate_database_size() walks the database directory in the running PGDATA with ReadDir() (src/backend/utils/adt/dbsize.c:107-165).  Same root cause as dbsize_relation_size: relation storage under memcow is the seed plus a DSA overlay, neither of which is a file under DataDir.
+tablespace_not_empty_check	tablespace "[^"]*" is not empty	***THIS ONE IS A HAZARD, NOT JUST A REPORTING DIFFERENCE -- READ BEFORE ACCEPTING IT.***  DROP TABLESPACE refuses to drop a tablespace that still has relations in it by SCANNING THE DIRECTORY: destroy_tablespace_directories() calls directory_is_empty() on each subdirectory (src/backend/commands/tablespace.c:754-769) and returns false, which is what raises "tablespace ... is not empty" (tablespace.c:527-532).  Under memcow a tablespace directory NEVER contains a relation file, so the check always sees an empty directory and the DROP SUCCEEDS -- taking the catalog row with it while the relations it held are still live in the overlay.  Every later statement naming that tablespace then fails with "does not exist", which is the cascade visible in the regress `tablespace` test.  This is a third member of the same family as reinit.c and dbsize.c (contract ADDENDUM §F): a core path that reaches relation storage without going through smgr.  It is registered here so the gate names it instead of drowning in it; it is NOT a statement that the behaviour is acceptable.  Plan §6's precondition list should gain "no DROP TABLESPACE" until it is decided.

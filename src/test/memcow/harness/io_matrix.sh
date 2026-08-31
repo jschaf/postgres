@@ -73,7 +73,13 @@ usage()
 Usage: io_matrix.sh --outputdir DIR --pgdata-template DIR [options]
 
   --outputdir DIR           matrix results root (required)
-  --pgdata-template DIR     PGDATA template every cell is copied from (required)
+  --pgdata-template DIR     PGDATA template every cell is copied from (required
+                            unless both --a-/--b-pgdata-template are given)
+  --a-pgdata-template DIR   per-side template.  Phase 1 needs these: side A is
+  --b-pgdata-template DIR   stock md and needs the seed's relation files in its
+                            PGDATA, side B is memcow and must have NONE, so that
+                            any page it serves demonstrably came from the seed
+                            mapping or the overlay.  See slice/make_templates.sh.
   --init                    initdb the template if it does not exist
   --subset NAME|FILE        default: phase0
   --build-dir DIR           meson build dir
@@ -83,8 +89,15 @@ Usage: io_matrix.sh --outputdir DIR --pgdata-template DIR [options]
   --stress-temp-buffers V   default 100 (the minimum, = 800kB)
 
   --guc NAME=VALUE          extra GUC for BOTH sides of every cell (repeatable)
-  --b-guc NAME=VALUE        extra GUC for side B only (Phase 1: memcow=on)
+  --a-guc NAME=VALUE        extra GUC for side A only (repeatable)
+  --b-guc NAME=VALUE        extra GUC for side B only
+                            (Phase 1: memcow_enabled=on, memcow_seed_directory=)
+  --a-name / --b-name NAME  label prefix for each side (default a-stock /
+                            b-under-test)
   --allow-expected-failure T  passed through to diff_engines.sh (repeatable)
+  --allow-engine-divergence T  passed through to diff_engines.sh (repeatable):
+                            names a test permitted to differ BETWEEN ENGINES,
+                            but only in ways harness/divergences.txt explains
 
   --only GLOB               run only cells whose id matches GLOB, e.g.
                             'sync/*' or '*/cold/*'.  Non-matching cells are
@@ -103,6 +116,10 @@ EOF
 
 OUTPUTDIR=
 TEMPLATE=
+A_TEMPLATE=
+B_TEMPLATE=
+A_NAME=a-stock
+B_NAME=b-under-test
 DO_INIT=0
 SUBSET=phase0
 BUILD_DIR=
@@ -114,13 +131,19 @@ DRY_RUN=0
 REQUIRE_URING=0
 STOP_ON_FAIL=0
 SHARED_GUCS=()
+A_GUCS=()
 B_GUCS=()
 ALLOW=()
+EDIV=()
 
 while [ $# -gt 0 ]; do
 	case $1 in
 		--outputdir)        OUTPUTDIR=$2; shift 2 ;;
 		--pgdata-template)  TEMPLATE=$2; shift 2 ;;
+		--a-pgdata-template) A_TEMPLATE=$2; shift 2 ;;
+		--b-pgdata-template) B_TEMPLATE=$2; shift 2 ;;
+		--a-name)           A_NAME=$2; shift 2 ;;
+		--b-name)           B_NAME=$2; shift 2 ;;
 		--init)             DO_INIT=1; shift ;;
 		--subset)           SUBSET=$2; shift 2 ;;
 		--build-dir)        BUILD_DIR=$2; shift 2 ;;
@@ -128,8 +151,10 @@ while [ $# -gt 0 ]; do
 		--hot-shared-buffers)  HOT_SB=$2; shift 2 ;;
 		--stress-temp-buffers) STRESS_TB=$2; shift 2 ;;
 		--guc)              SHARED_GUCS[${#SHARED_GUCS[@]}]=$2; shift 2 ;;
+		--a-guc)            A_GUCS[${#A_GUCS[@]}]=$2; shift 2 ;;
 		--b-guc)            B_GUCS[${#B_GUCS[@]}]=$2; shift 2 ;;
 		--allow-expected-failure) ALLOW[${#ALLOW[@]}]=$2; shift 2 ;;
+		--allow-engine-divergence) EDIV[${#EDIV[@]}]=$2; shift 2 ;;
 		--only)             ONLY=$2; shift 2 ;;
 		--dry-run)          DRY_RUN=1; shift ;;
 		--require-io-uring) REQUIRE_URING=1; shift ;;
@@ -140,8 +165,11 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
+: "${A_TEMPLATE:=$TEMPLATE}"
+: "${B_TEMPLATE:=$TEMPLATE}"
 [ -n "$OUTPUTDIR" ] || { usage >&2; mc_die "--outputdir is required"; }
-[ -n "$TEMPLATE" ]  || { usage >&2; mc_die "--pgdata-template is required"; }
+[ -n "$A_TEMPLATE" ] && [ -n "$B_TEMPLATE" ] ||
+	{ usage >&2; mc_die "--pgdata-template (or both --a-/--b-pgdata-template) is required"; }
 
 [ -n "$BUILD_DIR" ] || BUILD_DIR=$(mc_default_build_dir) ||
 	mc_die "cannot find a meson build dir; pass --build-dir or set MEMCOW_BUILD_DIR"
@@ -154,17 +182,22 @@ OUTPUTDIR=$(mc_abspath "$OUTPUTDIR")
 # probe: ask the server which io_methods it actually offers
 # ---------------------------------------------------------------------------
 
-TEMPLATE=$(mc_abspath "$TEMPLATE")
-if [ ! -d "$TEMPLATE" ] && [ $DO_INIT -eq 1 ]; then
-	mkdir -p "$(dirname -- "$TEMPLATE")"
-	mc_initdb "$TEMPLATE"
+A_TEMPLATE=$(mc_abspath "$A_TEMPLATE")
+B_TEMPLATE=$(mc_abspath "$B_TEMPLATE")
+if [ ! -d "$A_TEMPLATE" ] && [ $DO_INIT -eq 1 ]; then
+	mkdir -p "$(dirname -- "$A_TEMPLATE")"
+	mc_initdb "$A_TEMPLATE"
 fi
-[ -f "$TEMPLATE/PG_VERSION" ] || mc_die "not a data directory: $TEMPLATE (pass --init)"
+[ -f "$A_TEMPLATE/PG_VERSION" ] || mc_die "not a data directory: $A_TEMPLATE (pass --init)"
+[ -f "$B_TEMPLATE/PG_VERSION" ] || mc_die "not a data directory: $B_TEMPLATE"
+
+# The probe runs stock md with no extra GUCs, so it has to use side A's
+# template: side B's may deliberately contain no relation files at all.
 
 PROBE_DIR="$OUTPUTDIR/probe"
 rm -rf "$PROBE_DIR"
 mkdir -p "$PROBE_DIR"
-cp -R "$TEMPLATE" "$PROBE_DIR/pgdata" || mc_die "cannot copy the template"
+cp -R "$A_TEMPLATE" "$PROBE_DIR/pgdata" || mc_die "cannot copy the template"
 rm -f "$PROBE_DIR/pgdata/postmaster.pid"
 
 PROBE_PORT=$(mc_free_port)
@@ -178,7 +211,7 @@ SERVER_VERSION=$(mc_psql "$PROBE_SOCK" "$PROBE_PORT" postgres "SHOW server_versi
 DEBUG_ASSERTIONS=$(mc_psql "$PROBE_SOCK" "$PROBE_PORT" postgres "SHOW debug_assertions")
 DEFAULT_TB=$(mc_psql "$PROBE_SOCK" "$PROBE_PORT" postgres "SHOW temp_buffers")
 HAS_MEMCOW=$(mc_psql "$PROBE_SOCK" "$PROBE_PORT" postgres \
-	"SELECT count(*) FROM pg_settings WHERE name = 'memcow'")
+	"SELECT count(*) FROM pg_settings WHERE name = 'memcow_enabled'")
 
 mc_server_stop "$PROBE_DIR/pgdata" "$PROBE_DIR/postmaster.log"
 rm -rf "$PROBE_SOCK" "$PROBE_DIR/pgdata"
@@ -261,6 +294,9 @@ print_enumeration()
 		"io_method values this build accepts: $AVAILABLE_METHODS" \
 		"io_method values PostgreSQL defines: $ALL_METHODS" \
 		"memcow GUC present: $([ "${HAS_MEMCOW:-0}" -gt 0 ] && echo yes || echo 'no (Phase 0: A and B are both stock md)')" \
+		"A template:       $A_TEMPLATE" \
+		"B template:       $B_TEMPLATE" \
+		"B-only GUCs:      ${B_GUCS[*]-<none>}" \
 		"subset:           $SUBSET" \
 		"shared_buffers:   cold=$COLD_SB  hot=$HOT_SB" \
 		"temp_buffers:     baseline=$DEFAULT_TB  stress=$STRESS_TB" \
@@ -325,17 +361,25 @@ for i in $(seq 0 $(( ${#CELL_ID[@]} - 1 ))); do
 		*/stress) cellgucs[${#cellgucs[@]}]="temp_buffers=$STRESS_TB" ;;
 	esac
 
-	args=(--outputdir "$celldir" --pgdata-template "$TEMPLATE" --subset "$SUBSET"
-	      --a-label "a-stock[$id]" --b-label "b-under-test[$id]")
+	args=(--outputdir "$celldir"
+	      --a-pgdata-template "$A_TEMPLATE" --b-pgdata-template "$B_TEMPLATE"
+	      --subset "$SUBSET"
+	      --a-label "$A_NAME[$id]" --b-label "$B_NAME[$id]")
 	[ -n "$BUILD_DIR" ] && { args[${#args[@]}]=--build-dir; args[${#args[@]}]=$BUILD_DIR; }
 	for g in "${cellgucs[@]}" ${SHARED_GUCS[@]+"${SHARED_GUCS[@]}"}; do
 		args[${#args[@]}]=--guc; args[${#args[@]}]=$g
+	done
+	for g in ${A_GUCS[@]+"${A_GUCS[@]}"}; do
+		args[${#args[@]}]=--a-guc; args[${#args[@]}]=$g
 	done
 	for g in ${B_GUCS[@]+"${B_GUCS[@]}"}; do
 		args[${#args[@]}]=--b-guc; args[${#args[@]}]=$g
 	done
 	for t in ${ALLOW[@]+"${ALLOW[@]}"}; do
 		args[${#args[@]}]=--allow-expected-failure; args[${#args[@]}]=$t
+	done
+	for t in ${EDIV[@]+"${EDIV[@]}"}; do
+		args[${#args[@]}]=--allow-engine-divergence; args[${#args[@]}]=$t
 	done
 
 	if bash "$HERE/diff_engines.sh" "${args[@]}"; then
@@ -351,9 +395,19 @@ done
 # summary
 # ---------------------------------------------------------------------------
 
-mc_banner "MATRIX SUMMARY"
-printf '%-26s %-9s %-9s %-16s %s\n' CELL io_method shared_buf temp_buffers RESULT
-printf '%-26s %-9s %-9s %-16s %s\n' -------------------------- --------- --------- ---------------- ------
+# The summary is written to summary.txt as well as printed, so a caller
+# (run_gate.sh) can read the coverage verdict back instead of guessing it.
+SUMMARY="$OUTPUTDIR/summary.txt"
+
+{
+	printf '\n'
+	printf '========================================================================\n'
+	printf 'MATRIX SUMMARY\n'
+	printf '========================================================================\n\n'
+	printf '%-26s %-9s %-9s %-16s %s\n' CELL io_method shared_buf temp_buffers RESULT
+	printf '%-26s %-9s %-9s %-16s %s\n' -------------------------- --------- --------- ---------------- ------
+} >"$SUMMARY"
+
 n_pass=0; n_fail=0; n_skip=0
 for i in $(seq 0 $(( ${#CELL_ID[@]} - 1 ))); do
 	r=${CELL_RESULT[$i]:-NOT-RUN}
@@ -364,20 +418,31 @@ for i in $(seq 0 $(( ${#CELL_ID[@]} - 1 ))); do
 	esac
 	printf '%-26s %-9s %-9s %-16s %s\n' \
 		"${CELL_ID[$i]}" "${CELL_METHOD[$i]}" "${CELL_SB[$i]}" "${CELL_TB[$i]}" \
-		"$r${CELL_REASON[$i]:+  <- ${CELL_REASON[$i]}}"
+		"$r${CELL_REASON[$i]:+  <- ${CELL_REASON[$i]}}" >>"$SUMMARY"
 done
-printf '\n%d passed, %d failed, %d skipped by --only, %d UNAVAILABLE on this host\n' \
-	"$n_pass" "$n_fail" "$n_skip" "$n_unavail"
+
+{
+	printf '\n%d passed, %d failed, %d skipped by --only, %d UNAVAILABLE on this host\n' \
+		"$n_pass" "$n_fail" "$n_skip" "$n_unavail"
+} >>"$SUMMARY"
 
 if [ $n_unavail -gt 0 ]; then
-	printf 'MATRIX COVERAGE: INCOMPLETE (%d unrun cells -- see the enumeration above)\n' "$n_unavail"
+	printf 'MATRIX COVERAGE: INCOMPLETE (%d unrun cells -- see the enumeration above)\n' \
+		"$n_unavail" >>"$SUMMARY"
 	if [ $REQUIRE_URING -eq 1 ]; then
-		printf '--require-io-uring was given: treating unavailable cells as a failure\n'
+		printf -- '--require-io-uring was given: treating unavailable cells as a failure\n' \
+			>>"$SUMMARY"
 		RC=1
 	fi
 else
-	printf 'MATRIX COVERAGE: COMPLETE\n'
+	printf 'MATRIX COVERAGE: COMPLETE\n' >>"$SUMMARY"
 fi
 
-[ $RC -eq 0 ] && printf 'MATRIX RESULT: PASS\n' || printf 'MATRIX RESULT: FAIL\n'
+if [ $RC -eq 0 ]; then
+	printf 'MATRIX RESULT: PASS\n' >>"$SUMMARY"
+else
+	printf 'MATRIX RESULT: FAIL\n' >>"$SUMMARY"
+fi
+
+cat "$SUMMARY"
 exit $RC

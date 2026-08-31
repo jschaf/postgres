@@ -30,6 +30,17 @@
 # only for a test whose output is known to depend on a GUC the matrix is
 # deliberately setting (see the autovacuum/cluster note in io_matrix.sh).
 #
+# --allow-engine-divergence is the OTHER, much stronger flag, added for Phase 1.
+# It names a test whose results/ file is permitted to differ BETWEEN ENGINES --
+# but only in a way that some rule in divergences.txt explains.  The diff is
+# still computed, still printed in full, and every hunk of it has to be matched
+# by a registered rule (classify_diff.py); a hunk that matches nothing fails the
+# gate exactly as before, and so does an allowance whose test ran without
+# diverging.  It exists because memcow has exactly one known output divergence
+# from md -- pg_relation_size() and friends stat() the runtime PGDATA instead of
+# asking smgr (dbsize.c:326-348) -- and the honest way to carry that is a named
+# allowance with a citation, not a subset that avoids the subject.
+#
 # Portions Copyright (c) 2026, PostgreSQL Global Development Group
 
 # See check_leaks.sh for why there is no `set -u`.
@@ -54,6 +65,10 @@ Shared:
   --build-dir DIR            meson build dir for both sides
   --allow-expected-failure T test allowed to differ from upstream expected
                              output (repeatable).  Never relaxes A-vs-B.
+  --allow-engine-divergence T  test allowed to differ BETWEEN ENGINES, but only
+                             in ways divergences.txt explains (repeatable).
+                             Implies --allow-expected-failure for T on side B.
+  --divergences FILE         rules file (default: harness/divergences.txt)
 
 Per side (A is the reference, B is the engine under test):
   --a-label / --b-label NAME       default: "a-stock" / "b-stock"
@@ -83,6 +98,8 @@ SHARED_GUCS=()
 A_GUCS=()
 B_GUCS=()
 ALLOW=()
+EDIV=()
+DIVERGENCES=
 
 while [ $# -gt 0 ]; do
 	case $1 in
@@ -103,6 +120,11 @@ while [ $# -gt 0 ]; do
 		--a-label)            A_LABEL=$2; shift 2 ;;
 		--b-label)            B_LABEL=$2; shift 2 ;;
 		--allow-expected-failure) ALLOW[${#ALLOW[@]}]=$2; shift 2 ;;
+		--allow-engine-divergence)
+			EDIV[${#EDIV[@]}]=$2
+			ALLOW[${#ALLOW[@]}]=$2
+			shift 2 ;;
+		--divergences)        DIVERGENCES=$2; shift 2 ;;
 		-h|--help)            usage; exit 0 ;;
 		*)                    usage >&2; mc_die "unknown option: $1" ;;
 	esac
@@ -115,6 +137,8 @@ done
 	{ usage >&2; mc_die "--pgdata-template (or both --a-/--b-pgdata-template) is required"; }
 : "${A_BUILD_DIR:=$BUILD_DIR}"
 : "${B_BUILD_DIR:=$BUILD_DIR}"
+: "${DIVERGENCES:=$HERE/divergences.txt}"
+[ -f "$DIVERGENCES" ] || mc_die "no divergence rules file: $DIVERGENCES"
 
 mkdir -p "$OUTPUTDIR" || mc_die "cannot create $OUTPUTDIR"
 OUTPUTDIR=$(mc_abspath "$OUTPUTDIR")
@@ -204,8 +228,47 @@ DIFF_FILE="$OUTPUTDIR/engines.diff"
 diff -ru "$OUTPUTDIR/a.norm" "$OUTPUTDIR/b.norm" >"$DIFF_FILE" 2>&1
 DIFF_RC=$?
 
+# ---------------------------------------------------------------------------
+# classify the difference (G1) -- see classify_diff.py and divergences.txt
+# ---------------------------------------------------------------------------
+
+CLASSIFY_ARGS=(--a "$OUTPUTDIR/a.norm" --b "$OUTPUTDIR/b.norm"
+               --rules "$DIVERGENCES"
+               --report "$OUTPUTDIR/divergences.report")
+for t in ${EDIV[@]+"${EDIV[@]}"}; do
+	CLASSIFY_ARGS[${#CLASSIFY_ARGS[@]}]=--allow
+	CLASSIFY_ARGS[${#CLASSIFY_ARGS[@]}]=$t
+done
+# Tell the classifier which tests actually ran, so that an allowance for a test
+# this subset never executes is reported as skipped rather than as stale.
+while read -r t _; do
+	[ -n "$t" ] || continue
+	CLASSIFY_ARGS[${#CLASSIFY_ARGS[@]}]=--ran
+	CLASSIFY_ARGS[${#CLASSIFY_ARGS[@]}]=$t
+done <"$A_OUT/tap_status.txt"
+
+CLASSIFY_OUT=$(python3 "$HERE/classify_diff.py" "${CLASSIFY_ARGS[@]}" 2>&1)
+CLASSIFY_RC=$?
+
+# ---------------------------------------------------------------------------
+# G2: dispositions.  A test named by --allow-engine-divergence is allowed to
+# flip disposition (its content already diverges by construction), so compare
+# the other tests exactly and report the named ones separately.
+# ---------------------------------------------------------------------------
+
+ediv_re=
+for t in ${EDIV[@]+"${EDIV[@]}"}; do
+	ediv_re="${ediv_re:+$ediv_re|}^$t "
+done
 STATUS_DIFF="$OUTPUTDIR/tap_status.diff"
-diff -u "$A_OUT/tap_status.txt" "$B_OUT/tap_status.txt" >"$STATUS_DIFF" 2>&1
+if [ -n "$ediv_re" ]; then
+	grep -Ev "$ediv_re" "$A_OUT/tap_status.txt" >"$OUTPUTDIR/a.status.cmp"
+	grep -Ev "$ediv_re" "$B_OUT/tap_status.txt" >"$OUTPUTDIR/b.status.cmp"
+else
+	cp "$A_OUT/tap_status.txt" "$OUTPUTDIR/a.status.cmp"
+	cp "$B_OUT/tap_status.txt" "$OUTPUTDIR/b.status.cmp"
+fi
+diff -u "$OUTPUTDIR/a.status.cmp" "$OUTPUTDIR/b.status.cmp" >"$STATUS_DIFF" 2>&1
 STATUS_RC=$?
 
 # ---------------------------------------------------------------------------
@@ -226,17 +289,33 @@ n_tests=$(grep . "$A_OUT/tap_status.txt" 2>/dev/null | wc -l | tr -d ' ')
 if [ "${n_files_a:-0}" -eq 0 ] || [ "${n_tests:-0}" -eq 0 ]; then
 	echo "G1 FAIL  engine A produced no results at all ($n_files_a files, $n_tests tests)"
 	RC=1
-elif [ "$DIFF_RC" -eq 0 ]; then
+elif [ "$DIFF_RC" -eq 0 ] && [ "$CLASSIFY_RC" -eq 0 ]; then
 	echo "G1 PASS  results/ identical between engines ($n_files_a files, $n_tests tests)"
+elif [ "$CLASSIFY_RC" -eq 0 ]; then
+	echo "G1 PASS  results/ differ between engines ONLY in registered, documented"
+	echo "         ways -- every hunk classified.  See $OUTPUTDIR/divergences.report"
+	echo "         ($n_files_a files, $n_tests tests)"
+	printf '%s\n' "$CLASSIFY_OUT" | sed 's/^/         /'
+elif [ "$CLASSIFY_RC" -eq 2 ]; then
+	echo "G1 FAIL  the divergence classifier could not run"
+	printf '%s\n' "$CLASSIFY_OUT" | sed 's/^/         /'
+	RC=1
 else
-	echo "G1 FAIL  results/ differ between engines -- see $DIFF_FILE"
-	head -60 "$DIFF_FILE"
+	echo "G1 FAIL  results/ differ between engines in ways nothing explains --"
+	echo "         see $DIFF_FILE and $OUTPUTDIR/divergences.report"
+	printf '%s\n' "$CLASSIFY_OUT" | sed 's/^/         /'
 	RC=1
 fi
 
 # G2 --------------------------------------------------------------------
+for t in ${EDIV[@]+"${EDIV[@]}"}; do
+	echo "G2 note  $t is named by --allow-engine-divergence:" \
+	     "[$A_LABEL] $(awk -v t="$t" '$1==t{print $2}' "$A_OUT/tap_status.txt")" \
+	     "[$B_LABEL] $(awk -v t="$t" '$1==t{print $2}' "$B_OUT/tap_status.txt")"
+done
 if [ "$STATUS_RC" -eq 0 ]; then
-	echo "G2 PASS  per-test disposition identical between engines"
+	echo "G2 PASS  per-test disposition identical between engines" \
+	     "(${#EDIV[@]} test(s) exempt and reported above)"
 else
 	echo "G2 FAIL  per-test disposition differs -- see $STATUS_DIFF"
 	cat "$STATUS_DIFF"
@@ -291,13 +370,19 @@ fi
 	echo "b_gucs=${B_GUCS[*]-}"
 	echo "a_rc=$A_RC"
 	echo "b_rc=$B_RC"
+	echo "engine_divergence_allowances=${EDIV[*]-}"
 	echo "results_diff_rc=$DIFF_RC"
+	echo "classify_rc=$CLASSIFY_RC"
 	echo "status_diff_rc=$STATUS_RC"
 	echo "gate_rc=$RC"
 } >"$OUTPUTDIR/gate.txt"
 
-if [ $RC -eq 0 ]; then
+if [ $RC -eq 0 ] && [ "$DIFF_RC" -eq 0 ]; then
 	mc_banner "GATE PASS -- zero diffs between [$A_LABEL] and [$B_LABEL]"
+elif [ $RC -eq 0 ]; then
+	mc_banner "GATE PASS -- [$A_LABEL] vs [$B_LABEL] differ ONLY in registered," \
+		"documented divergences; every hunk classified." \
+		"See $OUTPUTDIR/divergences.report"
 else
 	mc_banner "GATE FAIL -- see $OUTPUTDIR/gate.txt"
 fi
