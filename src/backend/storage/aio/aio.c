@@ -479,6 +479,147 @@ pgaio_io_stage(PgAioHandle *ioh, PgAioOp op)
 	RESUME_INTERRUPTS();
 }
 
+/*
+ * Complete an IO whose data has already been placed in the caller's buffers,
+ * without ever handing the IO to an IO method.
+ *
+ * This exists for storage managers that can satisfy a read from memory they
+ * already own (e.g. an mmapped image or an in-memory overlay), and therefore
+ * have nothing for an IO method to execute.  Such an smgr_startreadv()
+ * implementation copies the requested blocks into the target buffers itself
+ * and then calls this function instead of FileStartReadV().
+ *
+ * It is NOT legal for such an smgr to simply call
+ * pgaio_io_process_completion() on the handle it was passed.  At that point
+ * the handle is still in PGAIO_HS_HANDED_OUT, so:
+ *
+ * - pgaio_io_process_completion() asserts PGAIO_HS_SUBMITTED and would trip;
+ * - the ->stage callbacks would never run.  That is not cosmetic: for buffer
+ *   reads, buffer_stage_common() (bufmgr.c) transfers the buffer pin to the
+ *   AIO subsystem and stops tracking it via the resource owner, and the pin
+ *   is dropped again by TerminateBufferIO() from the completion callbacks.
+ *   Skipping ->stage but running ->complete_shared unbalances that;
+ * - pgaio_my_backend->handed_out_io would still point at the handle, so the
+ *   next pgaio_io_acquire() would assert;
+ * - the handle would never be pushed onto pgaio_my_backend->in_flight_ios,
+ *   yet pgaio_io_reclaim() unlinks any handle whose state is not
+ *   PGAIO_HS_HANDED_OUT, corrupting that list.
+ *
+ * So we walk the same state sequence pgaio_io_stage() does, minus the parts
+ * that hand work to an IO method: DEFINED -> ->stage callbacks -> STAGED ->
+ * SUBMITTED (via pgaio_io_prepare_submit(), which also does the in-flight
+ * list bookkeeping) -> pgaio_io_process_completion().  Batch mode is
+ * deliberately ignored: the handle never enters ->staged_ios, so there is
+ * nothing to batch, and completing immediately inside an open batch is
+ * harmless.
+ *
+ * By the time this returns the IO has completed, its shared and local
+ * completion callbacks have run, and (since we are by definition the owning
+ * backend) the handle has been reclaimed.  A subsequent pgaio_wref_wait() by
+ * the caller of smgrstartreadv() sees a bumped generation and returns at once,
+ * exactly as it does for io_method=sync.
+ *
+ * Preconditions:
+ * - ioh is in PGAIO_HS_HANDED_OUT and is this backend's handed-out IO;
+ * - its target has been set (e.g. pgaio_io_set_target_smgr()) and any
+ *   completion callbacks have been registered;
+ * - the data for all result_blocks blocks is *already* in the buffers the
+ *   caller passed to smgr_startreadv();
+ * - any error condition has already been raised with ereport(ERROR) BEFORE
+ *   calling this (mdstartreadv()'s pattern).  We run part of this function in
+ *   a critical section, where an ERROR would be promoted to PANIC.
+ *
+ * result_blocks is the raw ioh->result seen by the completion callbacks, and
+ * is therefore counted in BLOCKS, not bytes: md_readv_complete() is what
+ * converts md's byte count into a block count, and an smgr using this
+ * function registers no callback of its own, so the buffer completion
+ * callbacks receive this value directly.  A short read (result_blocks <
+ * nblocks) is permitted and is handled by those callbacks just as it is for
+ * md; a negative (errno) result is not, per the precondition above.
+ */
+void
+pgaio_io_complete_synthetic(PgAioHandle *ioh, int result_blocks)
+{
+	Assert(ioh->state == PGAIO_HS_HANDED_OUT);
+	Assert(pgaio_my_backend->handed_out_io == ioh);
+	Assert(pgaio_io_has_target(ioh));
+	Assert(ioh->op == PGAIO_OP_INVALID);
+	Assert(result_blocks >= 0);
+
+	/*
+	 * The IO has, in effect, already been executed by the caller. Telling the
+	 * AIO subsystem so is not just a hint here: without it, a *different*
+	 * backend that finds one of the target buffers marked BM_IO_IN_PROGRESS
+	 * between pgaio_io_prepare_submit() and pgaio_io_process_completion()
+	 * below would, in pgaio_io_wait(), hand the handle to
+	 * pgaio_method_ops->wait_one(). For io_method=io_uring that means blocking
+	 * in io_uring_wait_cqes() for a completion event that will never be
+	 * produced, because this IO was never submitted to the ring. With the flag
+	 * set, such a waiter uses the condition variable instead, which we
+	 * broadcast from pgaio_io_process_completion().
+	 */
+	pgaio_io_set_flag(ioh, PGAIO_HF_SYNCHRONOUS);
+
+	/*
+	 * Otherwise an interrupt, in the middle of staging and completing the IO,
+	 * could end up trying to wait for the IO, leading to state confusion. See
+	 * pgaio_io_stage().
+	 */
+	HOLD_INTERRUPTS();
+
+	/*
+	 * There is no operation to perform, but the op has to be valid: both
+	 * pgaio_io_call_stage() and pgaio_io_call_complete_shared() assert on it,
+	 * and pgaio_io_get_op_name() is used in debug logging. READV is the
+	 * truthful choice - this is a read that has already been satisfied.
+	 *
+	 * Because the op is now READV, op_data.read is interpreted by anything
+	 * inspecting the handle. pgaio_io_reclaim() does not reset op_data, so
+	 * leave no stale fd/offset/length from whatever IO last used this handle:
+	 * pg_aios reads op_data.read.{offset,iov_length} out of other backends'
+	 * handles, and pgaio_io_uses_fd() compares op_data.read.fd against fds
+	 * being closed. fd -1 matches nothing and an empty iovec reports zero
+	 * bytes, which is what actually happened at this level.
+	 */
+	ioh->op = PGAIO_OP_READV;
+	ioh->op_data.read.fd = -1;
+	ioh->op_data.read.iov_length = 0;
+	ioh->op_data.read.offset = 0;
+	ioh->result = 0;
+
+	pgaio_io_update_state(ioh, PGAIO_HS_DEFINED);
+
+	/* allow a new IO to be staged */
+	pgaio_my_backend->handed_out_io = NULL;
+
+	pgaio_io_call_stage(ioh);
+
+	pgaio_io_update_state(ioh, PGAIO_HS_STAGED);
+
+	pgaio_debug_io(DEBUG3, ioh,
+				   "completing synthetically (result_blocks: %d)",
+				   result_blocks);
+
+	/* moves to SUBMITTED and adds the handle to the in-flight list */
+	pgaio_io_prepare_submit(ioh);
+
+	/*
+	 * pgaio_io_process_completion() requires a critical section, as IOs have
+	 * to be usable for WAL. We enter it here, as narrowly as possible, rather
+	 * than requiring callers to do so: this mirrors where
+	 * pgaio_io_perform_synchronously() puts its critical section, and it keeps
+	 * the caller's own pre-staging error checks - which are expected to
+	 * ereport(ERROR) - outside of it.
+	 */
+	START_CRIT_SECTION();
+
+	pgaio_io_process_completion(ioh, result_blocks);
+
+	END_CRIT_SECTION();
+
+	RESUME_INTERRUPTS();
+}
+
 bool
 pgaio_io_needs_synchronous_execution(PgAioHandle *ioh)
 {
