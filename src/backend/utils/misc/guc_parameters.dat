@@ -2223,17 +2223,23 @@
   boot_val => 'true',
 },
 
+# Can't be set by ALTER SYSTEM: it must be turned on deliberately, on the
+# command line of a test run.  A persistent auto.conf setting combined with a
+# bad seed yields a cluster that crash-loops at startup and can only be
+# repaired by hand-editing postgresql.auto.conf.
 { name => 'memcow_enabled', type => 'bool', context => 'PGC_POSTMASTER', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Serves relation pages from a read-only seed plus an in-memory overlay.',
   long_desc => 'Test-mode storage manager. When on, all relation I/O is served by memcow instead of md.',
-  flags => 'GUC_NOT_IN_SAMPLE',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_AUTO_FILE',
   variable => 'memcow_enabled',
   boot_val => 'false',
 },
 
+# GUC_SUPERUSER_ONLY as for every other filesystem-path GUC (data_directory,
+# log_directory): the value is a host path and is not for unprivileged eyes.
 { name => 'memcow_seed_directory', type => 'string', context => 'PGC_POSTMASTER', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Directory holding the read-only PGDATA seed that memcow serves relation pages from.',
-  flags => 'GUC_NOT_IN_SAMPLE',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_SUPERUSER_ONLY',
   variable => 'memcow_seed_directory',
   boot_val => '""',
 },

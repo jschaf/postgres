@@ -23,7 +23,16 @@
  * than silently reading or writing the wrong bytes.  The read path arrives in
  * a later commit.
  *
- * Two callbacks are deliberately not stubs:
+ * Several callbacks are deliberately not stubs, because they run on paths where
+ * raising an error is not a loud failure but an unrecoverable one:
+ *
+ * - smgr_open and smgr_close must be INFALLIBLE, permanently, in the real
+ *	 implementation as much as in this stub.  See the comments on
+ *	 memcow_open() and memcow_close() for the reaching paths.
+ *
+ * - smgr_unlink reports at WARNING, never ERROR, because the f_smgr contract
+ *	 above the struct in smgr.c requires it: unlinks run during post-commit and
+ *	 post-abort cleanup, where it is too late to raise an error.
  *
  * - smgr_registersync and smgr_immedsync are permanent no-ops.  memcow has no
  *	 durable storage to fsync, so it never enqueues a sync request, which is
@@ -145,20 +154,70 @@ memcow_check_seed_directory(void)
 
 /*
  * memcow_open() -- Initialize newly-opened relation.
+ *
+ * MUST BE INFALLIBLE.  This is a permanent constraint on memcow, not an
+ * artifact of the stub, and it is a property of how smgropen() is written:
+ * smgropen() does hash_search(..., HASH_ENTER, &found), fully initializes the
+ * entry and pushes it onto unpinned_relns, and only then calls smgr_open()
+ * as the last step.  So if smgr_open() raises,
+ *
+ *	 - the hash entry survives the unwind, and smgrdestroyall() will later call
+ *	   smgr_close() on a relation that was never opened; and
+ *	 - the next smgropen() for the same locator returns found = true and
+ *	   therefore NEVER calls smgr_open() again -- the relation is permanently
+ *	   half-initialized, silently.
+ *
+ * Making this fallible would require a second modified-in-place edit inside
+ * smgropen() to reorder the entry insertion, which the patch budget does not
+ * permit and which would be a change to core semantics for one test-mode smgr.
+ * Being infallible is much the cheaper contract to keep.
+ *
+ * What it actually does is zero md's private per-fork open-segment counters,
+ * exactly as mdopen() does.  This is defence in depth, and it costs nothing.
+ * SMgrRelationData embeds md's private md_num_open_segs[] and md_seg_fds[]
+ * arrays; smgropen() does not zero them and dynahash does not zero the entry
+ * payload, so on a memcow-created relation they hold whatever was in that
+ * memory before.  Every md_seg_fds[] access in md.c is gated on
+ * md_num_open_segs[] being nonzero, so zeroing the counters (and only the
+ * counters, which is precisely what mdopen() zeroes) is sufficient: any future
+ * path that reached md on a memcow relation then finds it cleanly closed
+ * instead of reading a garbage segment count and closing a garbage fd pointer.
+ * A clean "not open" beats memory corruption.
  */
 void
 memcow_open(SMgrRelation reln)
 {
-	MEMCOW_NOT_IMPLEMENTED("smgr_open");
+	/* mark it not open, so md can never trip over uninitialized state */
+	for (int forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+		reln->md_num_open_segs[forknum] = 0;
 }
 
 /*
  * memcow_close() -- Close the specified relation, if it isn't closed already.
+ *
+ * MUST BE INFALLIBLE, for the same reason and then some: every path that
+ * reaches smgr_close() is one on which an error cannot be handled.
+ *
+ *	 - AtEOXact_SMgr() -> smgrdestroyall(), reached from AbortTransaction().
+ *	   An ereport(ERROR) here re-enters abort processing and recurses until
+ *	   PANIC: ERRORDATA_STACK_SIZE exceeded, which the postmaster answers with
+ *	   an unbounded crash-restart loop.
+ *	 - proc_exit() -> ShutdownPostgres() -> AbortOutOfAnyTransaction(), i.e.
+ *	   the same thing during process exit.
+ *	 - ProcessBarrierSmgrRelease() -> smgrreleaseall(), the
+ *	   PROCSIGNAL_BARRIER_SMGRRELEASE barrier.  This is the barrier the reset
+ *	   design depends on: it drives every process in the cluster through
+ *	   smgr_close(), so a failure here is a cluster-wide failure.
+ *	 - InvalidateSystemCaches() -> RelationCacheInvalidate() ->
+ *	   smgrreleaseall(), which is the reset's own adopt call.
+ *
+ * The real implementation must therefore also not allocate in a way that can
+ * fail, and must not block indefinitely.  Detaching a not-yet-published epoch
+ * has to be a pointer swap, not something that can error out.
  */
 void
 memcow_close(SMgrRelation reln, ForkNumber forknum)
 {
-	MEMCOW_NOT_IMPLEMENTED("smgr_close");
 }
 
 /*
@@ -182,11 +241,28 @@ memcow_exists(SMgrRelation reln, ForkNumber forknum)
 
 /*
  * memcow_unlink() -- Unlink a relation.
+ *
+ * Still not implemented, but reported at WARNING and returning normally, which
+ * the f_smgr contract requires of smgr_unlink specifically: "smgr_unlink should
+ * use elog(WARNING), rather than erroring out, because we normally unlink
+ * relations during post-commit/abort cleanup, and so it's too late to raise an
+ * error" (the comment above the f_smgr struct in smgr.c).  mdunlink() honours
+ * this throughout.
+ *
+ * Concretely: smgrDoPendingDeletes() -> smgrdounlinkall() is called from
+ * AbortTransaction() a handful of lines before AtEOXact_SMgr(), so an
+ * ereport(ERROR) here re-enters AbortTransaction() and recurses to
+ * PANIC: ERRORDATA_STACK_SIZE exceeded -- the same failure mode as an error out
+ * of memcow_close(), and just as unrecoverable.  A dropped relation that memcow
+ * cannot yet unlink costs nothing: the overlay is discarded at reset and the
+ * seed is read-only, so there is no file to leak.
  */
 void
 memcow_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
-	MEMCOW_NOT_IMPLEMENTED("smgr_unlink");
+	ereport(WARNING,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("memcow: smgr_unlink not implemented")));
 }
 
 /*
