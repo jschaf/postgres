@@ -2223,6 +2223,21 @@
   boot_val => 'true',
 },
 
+{ name => 'memcow_enabled', type => 'bool', context => 'PGC_POSTMASTER', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Serves relation pages from a read-only seed plus an in-memory overlay.',
+  long_desc => 'Test-mode storage manager. When on, all relation I/O is served by memcow instead of md.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'memcow_enabled',
+  boot_val => 'false',
+},
+
+{ name => 'memcow_seed_directory', type => 'string', context => 'PGC_POSTMASTER', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Directory holding the read-only PGDATA seed that memcow serves relation pages from.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'memcow_seed_directory',
+  boot_val => '""',
+},
+
 { name => 'min_dynamic_shared_memory', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
   short_desc => 'Amount of dynamic shared memory reserved at startup.',
   flags => 'GUC_UNIT_MB',

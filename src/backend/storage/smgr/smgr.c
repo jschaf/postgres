@@ -70,6 +70,7 @@
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
+#include "storage/memcow.h"
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -148,6 +149,29 @@ static const f_smgr smgrsw[] = {
 		.smgr_immedsync = mdimmedsync,
 		.smgr_registersync = mdregistersync,
 		.smgr_fd = mdfd,
+	},
+	/* ephemeral seed + in-memory overlay, for test mode */
+	{
+		.smgr_init = memcow_init,
+		.smgr_shutdown = NULL,
+		.smgr_open = memcow_open,
+		.smgr_close = memcow_close,
+		.smgr_create = memcow_create,
+		.smgr_exists = memcow_exists,
+		.smgr_unlink = memcow_unlink,
+		.smgr_extend = memcow_extend,
+		.smgr_zeroextend = memcow_zeroextend,
+		.smgr_prefetch = memcow_prefetch,
+		.smgr_maxcombine = memcow_maxcombine,
+		.smgr_readv = memcow_readv,
+		.smgr_startreadv = memcow_startreadv,
+		.smgr_writev = memcow_writev,
+		.smgr_writeback = memcow_writeback,
+		.smgr_nblocks = memcow_nblocks,
+		.smgr_truncate = memcow_truncate,
+		.smgr_immedsync = memcow_immedsync,
+		.smgr_registersync = memcow_registersync,
+		.smgr_fd = memcow_fd,
 	}
 };
 
@@ -273,7 +297,8 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 		reln->smgr_targblock = InvalidBlockNumber;
 		for (int i = 0; i <= MAX_FORKNUM; ++i)
 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
-		reln->smgr_which = 0;	/* we only have md.c at present */
+		/* selection is global, fixed at postmaster start by the GUC */
+		reln->smgr_which = memcow_enabled ? 1 : 0;
 
 		/* it is not pinned yet */
 		reln->pincount = 0;
