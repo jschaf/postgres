@@ -16,13 +16,30 @@
  * seed location is a GUC of its own rather than something derived from
  * DataDir the way md.c derives its paths.
  *
- * THIS COMMIT IMPLEMENTS THE READ PATH ONLY.  Reads (smgr_nblocks,
- * smgr_exists, smgr_maxcombine, smgr_readv, smgr_startreadv, smgr_prefetch)
- * are served from the seed; every write callback (create, extend, zeroextend,
- * writev, truncate) still raises an error.  A server started with
- * memcow_enabled on is therefore a working READ-ONLY server: it boots, it
- * serves queries against seed relations, and it fails loudly on the first
- * attempt to modify one.  The copy-on-write overlay arrives in a later commit.
+ * THE OVERLAY.  Writes never touch the seed.  Every page written -- an
+ * extend, a buffer eviction, a hint-bit-dirtied page, a temp-table page --
+ * is copied into a per-database DSA arena and indexed by a dshash keyed on
+ * {tablespace, relfilenumber, backend, fork, block}.  A read resolves each
+ * block independently: overlay first, then the seed, so a relation can be
+ * half seed and half overlay and neither half knows about the other.  Pages
+ * are stored exactly as the caller handed them over, which is after
+ * PageSetChecksum() has run (bufmgr.c, localbuf.c), so the unmodified buffer
+ * completion callbacks verify an overlay page on re-read exactly as they
+ * verify a seed page.
+ *
+ * Relation-level operations that md performs on files are recorded as
+ * overlay metadata instead: smgr_create and smgr_unlink are WHITEOUTS that
+ * hide whatever the seed happens to hold for that relfilenumber, and
+ * smgr_truncate lowers both the fork's size and the number of leading blocks
+ * that may still fall through to the seed.  Nothing here can modify, unlink
+ * or truncate a seed file; the seed tree is opened O_RDONLY, mapped
+ * PROT_READ, and is byte-identical after any workload.
+ *
+ * NO EPOCHS YET.  This commit gives each database exactly one permanent
+ * overlay.  Lanes, epochs, reset and reclamation are the next phase; the
+ * shared directory below is a slot array precisely so that an epoch
+ * dimension can be added to it without changing the key layout or the
+ * lookup paths.
  *
  * SEED LAYOUT.  The seed is an ordinary md-format PGDATA, so the seed file for
  * a fork is memcow_seed_directory concatenated with the *relative* path
@@ -99,14 +116,20 @@
 #include "access/xlogutils.h"
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
+#include "lib/dshash.h"
 #include "miscadmin.h"
+#include "port/atomics.h"
 #include "port/pg_iovec.h"
 #include "storage/aio.h"
 #include "storage/aio_internal.h"
 #include "storage/bufmgr.h"
 #include "storage/checksum.h"
 #include "storage/fd.h"
+#include "storage/lwlock.h"
 #include "storage/memcow.h"
+#include "storage/shmem.h"
+#include "storage/subsystems.h"
+#include "utils/dsa.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 
@@ -170,30 +193,309 @@ typedef struct MemcowRelSeed
 	MemcowForkSeed forks[MAX_FORKNUM + 1];
 } MemcowRelSeed;
 
+/* ----------------------------------------------------------------
+ *		overlay data structures
+ * ----------------------------------------------------------------
+ */
+
 /*
- * Per-process memcow state, established by memcow_init().  Both are NULL when
+ * How many databases may hold an overlay at one time.
+ *
+ * There is no natural bound to take here -- a cluster may have any number of
+ * databases -- so this is a budget, not a limit derived from something.  128
+ * was chosen because it is comfortably above every population this design
+ * actually has: the seed built by src/test/memcow/seed/ has 12 databases, and
+ * the lane count the next phase will want is bounded by max_connections
+ * divided by the per-lane connection count, i.e. tens.  The cost of being
+ * generous is trivial and paid once: the whole directory is
+ * 128 * sizeof(MemcowDbSlot), a few kilobytes of main shared memory, and a
+ * slot costs nothing further until a database is actually written to (the
+ * arena underneath it is created lazily).  Exhaustion is a clean ERROR naming
+ * this constant rather than a corruption, and it can only be reached by a
+ * cluster with more than 128 written-to databases, which test mode does not
+ * have.
+ *
+ * The alternative -- one arena for the whole cluster, no directory, no limit
+ * -- was rejected because reset discards a database's overlay by discarding
+ * its arena.  Per-database arenas are the mechanism, not an optimization.
+ */
+#define MEMCOW_MAX_OVERLAY_DBS		128
+
+/*
+ * Key of the per-fork overlay record.
+ *
+ * dbOid is deliberately absent: it selects the arena, so carrying it in the
+ * key as well would be redundant.  Everything else that distinguishes one
+ * fork's storage from another's is here, including the owning backend, which
+ * is what keeps two sessions' temp relations apart when they collide on a
+ * relfilenumber (they can: temp relfilenumbers come from the same counter but
+ * a temp relation's identity is the pair).
+ *
+ * The static assert is the whole reason the members are laid out as five
+ * same-sized integers: dshash compares and hashes the leading key_size bytes
+ * with memcmp/hash_bytes, so a padding hole would make two equal keys compare
+ * unequal depending on what was in the caller's stack.  This is exactly the
+ * property smgropen() relies on for HASH_BLOBS, made checkable.
+ */
+typedef struct MemcowRelKey
+{
+	Oid			spcOid;			/* tablespace */
+	RelFileNumber relNumber;	/* relation */
+	int32		backend;		/* ProcNumber, or INVALID_PROC_NUMBER */
+	int32		forknum;		/* ForkNumber */
+} MemcowRelKey;
+
+StaticAssertDecl(sizeof(MemcowRelKey) == 4 * sizeof(uint32),
+				 "MemcowRelKey must not contain padding");
+
+/*
+ * Per-fork overlay record.  Its absence is meaningful: a fork with no record
+ * has never been written, so it has no overlay blocks either and is served
+ * entirely from the seed.  That is the fast path, and it is why the read path
+ * can skip the per-block lookups entirely for an untouched relation.
+ *
+ * seed_visible is the number of LEADING blocks that may still fall through to
+ * the seed.  It starts equal to the seed's size for the fork and is only ever
+ * lowered -- by truncate, and to zero by create and unlink.  It cannot be
+ * derived from nblocks: truncating a 100-block seed relation to 10 and then
+ * extending it back to 20 must leave blocks 10-19 served from the overlay,
+ * not from the seed's copy of them.
+ *
+ * INVARIANT, relied on everywhere below: every block entry for this fork has
+ * blocknum < nblocks, and every block in [seed_visible, nblocks) has a block
+ * entry.  Extend and write raise nblocks only after storing the page;
+ * truncate and unlink delete the blocks they drop.  Together these make "a
+ * block inside the relation that memcow cannot serve" unreachable rather than
+ * merely unlikely.
+ */
+typedef struct MemcowRelEntry
+{
+	MemcowRelKey key;			/* hash key -- must be first */
+	bool		exists;			/* false once the fork has been unlinked */
+	BlockNumber nblocks;		/* current size of the fork */
+	BlockNumber seed_visible;	/* blocks [0, seed_visible) may come from seed */
+} MemcowRelEntry;
+
+/*
+ * Key of one overlay page.  Same rules, same reason, one more member.
+ */
+typedef struct MemcowBlockKey
+{
+	Oid			spcOid;
+	RelFileNumber relNumber;
+	int32		backend;
+	int32		forknum;
+	BlockNumber blocknum;
+} MemcowBlockKey;
+
+StaticAssertDecl(sizeof(MemcowBlockKey) == 5 * sizeof(uint32),
+				 "MemcowBlockKey must not contain padding");
+
+/*
+ * One overlay page.
+ *
+ * The page is a separate BLCKSZ allocation rather than an inline array, and
+ * that is a deliberate memory-footprint decision rather than a stylistic one.
+ * dshash allocates an item as entry_size + MAXALIGN(sizeof(dshash_table_item))
+ * (dshash.c), and dsa's largest small-object size class is 8192 bytes
+ * (dsa.c).  An inline page would therefore make every item 8232 bytes, which
+ * spills into dsa's large-object path and is rounded up to three 4 kB pages
+ * -- 12 kB of arena for 8 kB of data, a 50% overhead on the single dominant
+ * consumer of memory in this design.  Split, the page lands exactly on the
+ * 8192 size class and the item lands on the 48-byte class: about 0.6%
+ * overhead instead.
+ */
+typedef struct MemcowBlockEntry
+{
+	MemcowBlockKey key;			/* hash key -- must be first */
+	dsa_pointer page;			/* BLCKSZ bytes of post-checksum page image */
+} MemcowBlockEntry;
+
+/*
+ * One database's overlay, as published in main shared memory.
+ *
+ * in_use is a separate flag rather than "dbOid != InvalidOid" because
+ * InvalidOid IS a legal dbOid here: shared catalogs live in global/ with
+ * dbOid 0, they are written (pg_database's relfrozenxid, pg_shdepend rows),
+ * and so they get an overlay like any other database.
+ *
+ * PHASE 2 will add {epoch, nonce} beside these three handles and make
+ * publication a single versioned store of the whole slot.  The layout is
+ * already a slot array of plain values for that reason.
+ */
+typedef struct MemcowDbSlot
+{
+	bool		in_use;
+	Oid			dbOid;
+	dsa_handle	area;
+	dshash_table_handle rels;
+	dshash_table_handle blocks;
+} MemcowDbSlot;
+
+typedef struct MemcowShmemState
+{
+	LWLock		lock;			/* serializes slot creation */
+
+	/*
+	 * Bumped whenever a slot is created.  A backend that looked for a
+	 * database's overlay and did not find one caches that negative answer
+	 * against this counter, so the common case -- a read of a relation in a
+	 * database nobody has written to -- costs one unlocked atomic read rather
+	 * than a locked scan of the slot array on every smgr_nblocks().
+	 */
+	pg_atomic_uint32 generation;
+
+	int			dsa_tranche;	/* LWLock tranches, assigned in init_fn so */
+	int			rel_tranche;	/* that every process agrees on them without */
+	int			block_tranche;	/* re-registering names per backend */
+
+	int			nslots;			/* slots[0 .. nslots) have been handed out */
+	MemcowDbSlot slots[MEMCOW_MAX_OVERLAY_DBS];
+} MemcowShmemState;
+
+static MemcowShmemState *MemcowShmem = NULL;
+
+/*
+ * This process's attachment to one database's overlay.
+ *
+ * area == NULL means "as of generation absent_gen, this database had no
+ * overlay".  Attachments are never dropped once made: see memcow_close().
+ */
+typedef struct MemcowDbLocal
+{
+	Oid			dbOid;			/* hash key -- must be first */
+	dsa_area   *area;			/* NULL if there is no overlay (yet) */
+	dshash_table *rels;
+	dshash_table *blocks;
+	uint32		absent_gen;		/* only meaningful while area == NULL */
+} MemcowDbLocal;
+
+/*
+ * dshash needs the comparison, hash and copy functions supplied even when
+ * attaching, because function pointers are not portable between processes.
+ * The tranche id is the one field that is not known at compile time, so these
+ * are templates that memcow_overlay_params() completes.
+ */
+static const dshash_parameters memcow_rel_params = {
+	sizeof(MemcowRelKey),
+	sizeof(MemcowRelEntry),
+	dshash_memcmp,
+	dshash_memhash,
+	dshash_memcpy,
+	-1							/* tranche id, filled in at run time */
+};
+
+static const dshash_parameters memcow_block_params = {
+	sizeof(MemcowBlockKey),
+	sizeof(MemcowBlockEntry),
+	dshash_memcmp,
+	dshash_memhash,
+	dshash_memcpy,
+	-1							/* tranche id, filled in at run time */
+};
+
+/*
+ * Everything the read and write paths need to know about one fork, gathered
+ * in one place by memcow_lookup_fork() so that no shared lock is held across
+ * more than a single lookup.
+ */
+typedef struct MemcowFork
+{
+	MemcowDbLocal *db;			/* overlay, or NULL if the db has none */
+	MemcowRelKey relkey;
+	bool		have_overlay;	/* is there an overlay record for this fork? */
+	bool		exists;
+	BlockNumber nblocks;
+	BlockNumber seed_visible;
+	MemcowForkSeed *seed;		/* NULL if nothing can come from the seed */
+} MemcowFork;
+
+/*
+ * Per-process memcow state, established by memcow_init().  All are NULL when
  * memcow is off, and memcow_open() asserts they are not NULL when it is: with
  * real state here, an smgropen() that beat smgrinit() would be a null deref
  * rather than the harmless no-op it used to be.
  */
 static MemoryContext MemcowCxt = NULL;
 static HTAB *MemcowSeedHash = NULL;
+static HTAB *MemcowDbHash = NULL;
 
 static void memcow_check_seed_directory(void);
 static void memcow_check_fingerprint(void);
 static MemcowForkSeed *memcow_resolve_fork(SMgrRelation reln, ForkNumber forknum,
 										   bool missing_ok);
 static const char *memcow_seed_block(MemcowForkSeed *fs, BlockNumber blocknum);
+static MemcowDbLocal *memcow_overlay(Oid dbOid, bool create);
+static void memcow_lookup_fork(SMgrRelation reln, ForkNumber forknum,
+							   bool missing_ok, MemcowFork *f);
+static MemcowRelEntry *memcow_relentry_lock(SMgrRelation reln,
+											ForkNumber forknum,
+											MemcowDbLocal **dbp,
+											bool *created);
+static void memcow_store_block(MemcowDbLocal *db, MemcowBlockKey *key,
+							   const void *page);
+static void memcow_discard_blocks(MemcowDbLocal *db, const MemcowRelKey *relkey,
+								  BlockNumber from, BlockNumber to);
+static const char *memcow_resolve_block(MemcowFork *f, MemcowBlockKey *key,
+										BlockNumber blocknum);
+pg_noreturn static void memcow_fork_missing(const RelFileLocatorBackend *rlocator,
+											ForkNumber forknum);
+pg_noreturn static void memcow_out_of_memory(BlockNumber blocknum, Oid spcOid,
+											 RelFileNumber relNumber);
+
+static void MemcowShmemRequest(void *arg);
+static void MemcowShmemInit(void *arg);
 
 /*
- * Every storage-touching callback in this commit reports this.  ERROR (not
- * FATAL) matches md.c's habit of reporting storage failures as ordinary
- * errors, and matches mdstartreadv(), which raises before it stages anything.
+ * Registered from src/include/storage/subsystemlist.h.  memcow takes no main
+ * shared memory at all when the GUC is off, so an unpatched-looking server is
+ * unpatched down to the byte count in shared_memory_size.
  */
-#define MEMCOW_NOT_IMPLEMENTED(cbname) \
-	ereport(ERROR, \
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), \
-			 errmsg("memcow: %s not implemented", cbname)))
+const ShmemCallbacks MemcowShmemCallbacks = {
+	.request_fn = MemcowShmemRequest,
+	.init_fn = MemcowShmemInit,
+};
+
+static void
+MemcowShmemRequest(void *arg)
+{
+	if (!memcow_enabled)
+		return;
+
+	ShmemRequestStruct(.name = "memcow overlay directory",
+					   .size = sizeof(MemcowShmemState),
+					   .ptr = (void **) &MemcowShmem,
+		);
+}
+
+/*
+ * The tranche ids are allocated here, once, in the postmaster, and stored in
+ * shared memory rather than in a static: LWLockNewTrancheId() allocates from
+ * a shared counter, so calling it per backend would burn a tranche slot per
+ * backend and give different processes different ids for the same lock.  This
+ * runs after LWLockShmemInit() because LWLockCallbacks is the first entry in
+ * subsystemlist.h and init callbacks run in registration order (shmem.c).
+ *
+ * DSM is NOT available yet -- dsm_postmaster_startup() runs after
+ * ShmemInitRequested() (ipci.c) -- which is one of the reasons arenas are
+ * created lazily, on first write, rather than here.
+ */
+static void
+MemcowShmemInit(void *arg)
+{
+	if (!memcow_enabled)
+		return;
+
+	memset(MemcowShmem, 0, sizeof(*MemcowShmem));
+
+	MemcowShmem->dsa_tranche = LWLockNewTrancheId("MemcowOverlayArena");
+	MemcowShmem->rel_tranche = LWLockNewTrancheId("MemcowOverlayRelation");
+	MemcowShmem->block_tranche = LWLockNewTrancheId("MemcowOverlayBlock");
+
+	LWLockInitialize(&MemcowShmem->lock,
+					 LWLockNewTrancheId("MemcowOverlayDirectory"));
+	pg_atomic_init_u32(&MemcowShmem->generation, 1);
+}
 
 /*
  * memcow_init() -- Initialize private state for the memcow storage manager.
@@ -245,6 +547,22 @@ memcow_init(void)
 	ctl.hcxt = MemcowCxt;
 	MemcowSeedHash = hash_create("memcow seed relation table", 400, &ctl,
 								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	/*
+	 * This process's overlay attachments, keyed by dbOid.  An ordinary
+	 * backend has at most two live entries (its own database and dbOid 0 for
+	 * the shared catalogs); the checkpointer and bgwriter flush buffers for
+	 * every database and so accumulate one per database they have written.
+	 * 8 is therefore already generous as an initial size, and dynahash grows
+	 * it if a process proves otherwise.
+	 */
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(MemcowDbLocal);
+	ctl.hcxt = MemcowCxt;
+	MemcowDbHash = hash_create("memcow overlay attachment table", 8, &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	Assert(MemcowShmem != NULL);
 }
 
 /*
@@ -818,6 +1136,510 @@ memcow_seed_block(MemcowForkSeed *fs, BlockNumber blocknum)
 	return fs->segs[segno].base + (size_t) segoff * BLCKSZ;
 }
 
+/* ----------------------------------------------------------------
+ *		overlay: attaching
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * Complete one of the dshash_parameters templates with the tranche id that
+ * was assigned in MemcowShmemInit().
+ */
+static dshash_parameters
+memcow_overlay_params(const dshash_parameters *template, int tranche_id)
+{
+	dshash_parameters params = *template;
+
+	params.tranche_id = tranche_id;
+	return params;
+}
+
+/*
+ * Attach this process to one database's overlay, creating the overlay if this
+ * is the first write anywhere in that database and create is true.
+ *
+ * Returns NULL, without creating anything, when create is false and the
+ * database has no overlay.  That is the answer the read paths want: a
+ * database nobody has written to is served entirely from the seed, and asking
+ * for it must not cause a DSM segment to be created in, say, a read-only
+ * backend or the checkpointer.
+ *
+ * THE ATTACHMENT IS SESSION-SCOPED, NOT RESOURCE-OWNER-SCOPED, and that is
+ * required rather than convenient.  A dsa_area is owned by CurrentResourceOwner
+ * by default, and on the abort path all three ResourceOwnerRelease() phases
+ * run BEFORE AtEOXact_SMgr() (xact.c), so a resowner-tracked mapping is
+ * already gone by the time smgr_close() runs -- and gone again after every
+ * aborted transaction, which would make the next statement re-attach.
+ * dsa_pin_mapping() clears area->resowner, which also makes every segment
+ * this area maps LATER be attached with a NULL resource owner (dsa.c sets
+ * CurrentResourceOwner = area->resowner around its dsm_attach()), so the
+ * property holds for segments that do not exist yet.  The area is also
+ * dsa_pin()ned, so it survives every process detaching from it.
+ *
+ * Attachments are made in MemcowCxt, never in the caller's context: dsa_attach
+ * and dshash_attach palloc their per-process bookkeeping in
+ * CurrentMemoryContext, and a per-transaction context would leave dangling
+ * pointers in the table below at the end of the statement.
+ */
+static MemcowDbLocal *
+memcow_overlay(Oid dbOid, bool create)
+{
+	MemcowDbLocal *db;
+	MemcowDbSlot *slot = NULL;
+	MemoryContext oldcxt;
+	uint32		gen;
+	bool		found;
+	dsa_area   *area;
+	dshash_table *rels;
+	dshash_table *blocks;
+	dshash_parameters params;
+
+	Assert(MemcowDbHash != NULL);
+	Assert(MemcowShmem != NULL);
+
+	db = (MemcowDbLocal *) hash_search(MemcowDbHash, &dbOid, HASH_FIND, NULL);
+	if (db != NULL && db->area != NULL)
+		return db;
+
+	/*
+	 * Either we have never looked, or we looked and found nothing.  A cached
+	 * "nothing" is good until somebody creates a slot, which bumps the
+	 * generation; the unlocked read is safe because the only way this process
+	 * can observe a page written through a newly created overlay is via
+	 * bufmgr, whose own locking has already ordered that write ahead of this
+	 * read.
+	 */
+	gen = pg_atomic_read_u32(&MemcowShmem->generation);
+	if (db != NULL && db->absent_gen == gen && !create)
+		return NULL;
+
+	LWLockAcquire(&MemcowShmem->lock, create ? LW_EXCLUSIVE : LW_SHARED);
+
+	for (int i = 0; i < MemcowShmem->nslots; i++)
+	{
+		if (MemcowShmem->slots[i].in_use && MemcowShmem->slots[i].dbOid == dbOid)
+		{
+			slot = &MemcowShmem->slots[i];
+			break;
+		}
+	}
+
+	if (slot == NULL && !create)
+	{
+		/*
+		 * Remember the absence against the generation we read before taking
+		 * the lock, never against a fresher one: a slot created between the
+		 * read and here must invalidate this cache entry.
+		 */
+		LWLockRelease(&MemcowShmem->lock);
+
+		db = (MemcowDbLocal *) hash_search(MemcowDbHash, &dbOid,
+										   HASH_ENTER, &found);
+		if (!found)
+		{
+			db->area = NULL;
+			db->rels = NULL;
+			db->blocks = NULL;
+		}
+		db->absent_gen = gen;
+		return NULL;
+	}
+
+	oldcxt = MemoryContextSwitchTo(MemcowCxt);
+
+	if (slot == NULL)
+	{
+		if (MemcowShmem->nslots >= MEMCOW_MAX_OVERLAY_DBS)
+		{
+			MemoryContextSwitchTo(oldcxt);
+			LWLockRelease(&MemcowShmem->lock);
+			ereport(ERROR,
+					(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+					 errmsg("memcow cannot hold overlays for more than %d databases",
+							MEMCOW_MAX_OVERLAY_DBS)));
+		}
+
+		/*
+		 * Create, then publish.  Everything up to the store into slots[] is
+		 * fallible, and an ERROR out of it must leave the directory exactly
+		 * as it was -- LWLockReleaseAll() during abort drops the lock, and
+		 * nslots has not moved, so the next attempt starts clean.  The only
+		 * casualty is the arena we may have created and not published, and
+		 * only if dshash_create() failed after dsa_create() succeeded.
+		 */
+		area = dsa_create(MemcowShmem->dsa_tranche);
+		dsa_pin(area);
+		dsa_pin_mapping(area);
+
+		params = memcow_overlay_params(&memcow_rel_params,
+									   MemcowShmem->rel_tranche);
+		rels = dshash_create(area, &params, NULL);
+
+		params = memcow_overlay_params(&memcow_block_params,
+									   MemcowShmem->block_tranche);
+		blocks = dshash_create(area, &params, NULL);
+
+		slot = &MemcowShmem->slots[MemcowShmem->nslots];
+		slot->dbOid = dbOid;
+		slot->area = dsa_get_handle(area);
+		slot->rels = dshash_get_hash_table_handle(rels);
+		slot->blocks = dshash_get_hash_table_handle(blocks);
+		slot->in_use = true;
+
+		pg_write_barrier();
+		MemcowShmem->nslots++;
+		pg_atomic_fetch_add_u32(&MemcowShmem->generation, 1);
+	}
+	else
+	{
+		area = dsa_attach(slot->area);
+		dsa_pin_mapping(area);
+
+		params = memcow_overlay_params(&memcow_rel_params,
+									   MemcowShmem->rel_tranche);
+		rels = dshash_attach(area, &params, slot->rels, NULL);
+
+		params = memcow_overlay_params(&memcow_block_params,
+									   MemcowShmem->block_tranche);
+		blocks = dshash_attach(area, &params, slot->blocks, NULL);
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+	LWLockRelease(&MemcowShmem->lock);
+
+	db = (MemcowDbLocal *) hash_search(MemcowDbHash, &dbOid, HASH_ENTER, NULL);
+	db->area = area;
+	db->rels = rels;
+	db->blocks = blocks;
+	db->absent_gen = 0;
+
+	return db;
+}
+
+/* ----------------------------------------------------------------
+ *		overlay: lookup and mutation
+ * ----------------------------------------------------------------
+ */
+
+static inline void
+memcow_rel_key(MemcowRelKey *key, const RelFileLocatorBackend *rlocator,
+			   ForkNumber forknum)
+{
+	key->spcOid = rlocator->locator.spcOid;
+	key->relNumber = rlocator->locator.relNumber;
+	key->backend = (int32) rlocator->backend;
+	key->forknum = (int32) forknum;
+}
+
+static inline void
+memcow_block_key(MemcowBlockKey *key, const MemcowRelKey *relkey,
+				 BlockNumber blocknum)
+{
+	key->spcOid = relkey->spcOid;
+	key->relNumber = relkey->relNumber;
+	key->backend = relkey->backend;
+	key->forknum = relkey->forknum;
+	key->blocknum = blocknum;
+}
+
+/*
+ * The error md would have produced for a fork that is not there.  Callers of
+ * smgrnblocks()/smgrreadv() are already written to expect exactly this.
+ */
+pg_noreturn static void
+memcow_fork_missing(const RelFileLocatorBackend *rlocator, ForkNumber forknum)
+{
+	char		path[MAXPGPATH];
+
+	memcow_seed_path(rlocator, forknum, 0, path, sizeof(path));
+	ereport(ERROR,
+			(errcode_for_file_access(),
+			 errmsg("could not open memcow seed file \"%s\": No such file or directory",
+					path)));
+}
+
+/*
+ * Gather everything the caller needs to resolve blocks of one fork.
+ *
+ * The overlay record is read once, into f, and the partition lock is dropped
+ * before returning.  Holding it across the caller's loop would be both
+ * unnecessary (the values are stable for as long as this backend holds the
+ * relation lock that let it get here) and a deadlock hazard, because dshash
+ * resize takes every partition lock in index order and a caller that held two
+ * of them in the other order would close the cycle.
+ */
+static void
+memcow_lookup_fork(SMgrRelation reln, ForkNumber forknum, bool missing_ok,
+				   MemcowFork *f)
+{
+	MemcowRelEntry *re;
+
+	memset(f, 0, sizeof(*f));
+	memcow_rel_key(&f->relkey, &reln->smgr_rlocator, forknum);
+	f->db = memcow_overlay(reln->smgr_rlocator.locator.dbOid, false);
+
+	if (f->db != NULL)
+		re = (MemcowRelEntry *) dshash_find(f->db->rels, &f->relkey, false);
+	else
+		re = NULL;
+
+	if (re == NULL)
+	{
+		/*
+		 * No overlay record means no overlay blocks either (see the invariant
+		 * on MemcowRelEntry), so this fork is pure seed and the per-block
+		 * lookups below can be skipped entirely.
+		 */
+		f->have_overlay = false;
+		f->seed = memcow_resolve_fork(reln, forknum, missing_ok);
+		f->exists = f->seed->exists;
+		f->nblocks = f->seed->nblocks;
+		f->seed_visible = f->seed->nblocks;
+		return;
+	}
+
+	f->have_overlay = true;
+	f->exists = re->exists;
+	f->nblocks = re->nblocks;
+	f->seed_visible = re->seed_visible;
+	dshash_release_lock(f->db->rels, re);
+
+	if (!f->exists && !missing_ok)
+		memcow_fork_missing(&reln->smgr_rlocator, forknum);
+
+	/*
+	 * The seed is still needed for the leading blocks the overlay has not
+	 * displaced.  missing_ok is true here unconditionally: the fork's
+	 * existence has already been settled by the overlay record, so a seed
+	 * file that is simply not there (a relation created since the seed was
+	 * built) is the normal case, not an error.
+	 */
+	if (f->seed_visible > 0)
+		f->seed = memcow_resolve_fork(reln, forknum, true);
+}
+
+/*
+ * The one message for "the overlay could not grow".
+ *
+ * SURVIVABLE, on every path that can reach it.  extend and zeroextend run
+ * inside a transaction and fail the statement.  writev runs from
+ * FlushBuffer(), where AbortBufferIO() puts the buffer back dirty and valid,
+ * so the page is not lost -- the eviction or the checkpoint fails, not the
+ * data.  The checkpointer's own sigsetjmp handler logs and retries.  What is
+ * NOT survivable is the arena filling up and memcow noticing later: hence
+ * NO_OOM everywhere and one clear message instead of dsa's generic one, which
+ * would read as ordinary backend memory pressure.
+ */
+pg_noreturn static void
+memcow_out_of_memory(BlockNumber blocknum, Oid spcOid, RelFileNumber relNumber)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_OUT_OF_MEMORY),
+			 errmsg("memcow overlay could not allocate shared memory"),
+			 errdetail("Failed while storing block %u of relation %u/%u.",
+					   blocknum, spcOid, relNumber),
+			 errhint("The overlay holds every page written since the server started; it is reclaimed only by DROP and TRUNCATE until lane reset exists.")));
+}
+
+/*
+ * Find, or create, the overlay record for one fork, returning it with its
+ * partition lock held exclusively.  The caller must release it.
+ *
+ * *created says whether the record was made by this call, which is what
+ * memcow_create() needs in order to tell "the fork is new" from "the fork was
+ * already here".
+ *
+ * The seed is resolved BEFORE the record is inserted, and deliberately so: a
+ * new record's baseline is the seed's size for the fork, and resolving the
+ * seed both allocates and can raise, neither of which may happen under a
+ * dshash partition lock.
+ */
+static MemcowRelEntry *
+memcow_relentry_lock(SMgrRelation reln, ForkNumber forknum,
+					 MemcowDbLocal **dbp, bool *created)
+{
+	MemcowDbLocal *db;
+	MemcowRelEntry *re;
+	MemcowRelKey key;
+	MemcowForkSeed *fs;
+	bool		found;
+
+	db = memcow_overlay(reln->smgr_rlocator.locator.dbOid, true);
+	*dbp = db;
+	memcow_rel_key(&key, &reln->smgr_rlocator, forknum);
+
+	re = (MemcowRelEntry *) dshash_find(db->rels, &key, true);
+	if (re != NULL)
+	{
+		*created = false;
+		return re;
+	}
+
+	fs = memcow_resolve_fork(reln, forknum, true);
+
+	re = (MemcowRelEntry *) dshash_find_or_insert_extended(db->rels, &key,
+														  &found,
+														  DSHASH_INSERT_NO_OOM);
+	if (re == NULL)
+		memcow_out_of_memory(InvalidBlockNumber, key.spcOid, key.relNumber);
+
+	if (!found)
+	{
+		re->exists = fs->exists;
+		re->nblocks = fs->nblocks;
+		re->seed_visible = fs->nblocks;
+	}
+	*created = !found;
+	return re;
+}
+
+/*
+ * Store one page into the overlay, replacing whatever was there.
+ *
+ * page == NULL means a page of zeroes, which is what smgr_zeroextend wants
+ * and which the allocator can produce for free.
+ *
+ * Out of arena memory is an ordinary ERROR with a message that names memcow,
+ * not dsa's generic "out of memory".  Every caller is on a path where ERROR
+ * is legal: extend and zeroextend run inside a transaction, and writev runs
+ * from FlushBuffer(), where the failure is absorbed by AbortBufferIO() and
+ * costs the statement rather than the cluster.
+ */
+static void
+memcow_store_block(MemcowDbLocal *db, MemcowBlockKey *key, const void *page)
+{
+	MemcowBlockEntry *be;
+	bool		found;
+
+	/*
+	 * DSHASH_INSERT_NO_OOM, and DSA_ALLOC_NO_OOM below, so that BOTH ways the
+	 * arena can be exhausted -- the item and the page -- report the same
+	 * memcow-specific error rather than dsa's generic "out of memory", which
+	 * would be indistinguishable from backend memory pressure.
+	 */
+	be = (MemcowBlockEntry *) dshash_find_or_insert_extended(db->blocks, key,
+															 &found,
+															 DSHASH_INSERT_NO_OOM);
+	if (be == NULL)
+		memcow_out_of_memory(key->blocknum, key->spcOid, key->relNumber);
+
+	if (!found)
+	{
+		be->page = dsa_allocate_extended(db->area, BLCKSZ,
+										 DSA_ALLOC_NO_OOM |
+										 (page == NULL ? DSA_ALLOC_ZERO : 0));
+		if (!DsaPointerIsValid(be->page))
+		{
+			dshash_delete_entry(db->blocks, be);	/* also releases the lock */
+			memcow_out_of_memory(key->blocknum, key->spcOid, key->relNumber);
+		}
+		if (page == NULL)
+		{
+			dshash_release_lock(db->blocks, be);
+			return;				/* DSA_ALLOC_ZERO already did the work */
+		}
+	}
+
+	if (page != NULL)
+		memcpy(dsa_get_address(db->area, be->page), page, BLCKSZ);
+	else
+		memset(dsa_get_address(db->area, be->page), 0, BLCKSZ);
+
+	dshash_release_lock(db->blocks, be);
+}
+
+/*
+ * Drop overlay pages for blocks [from, to) of one fork.
+ *
+ * INFALLIBLE AND ALLOCATION-FREE, which is what lets memcow_unlink() call it:
+ * dshash_find only traverses, dshash_delete_entry only unlinks and frees, and
+ * dsa_free has no failure mode.  It does take partition locks, so it can
+ * wait -- that is acceptable here (unlink and truncate are not on the
+ * SMGRRELEASE barrier path) and is the reason this is NOT called from
+ * memcow_close().
+ *
+ * The cost is one lookup per block in the range rather than one pass over the
+ * table, which is the right trade: a seq scan would be O(every page in the
+ * database) per dropped relation, and a regression run drops a lot of small
+ * relations.  It does mean dropping a very large relation costs a lookup per
+ * block; that is bounded by the relation's own size and is paid once.
+ */
+static void
+memcow_discard_blocks(MemcowDbLocal *db, const MemcowRelKey *relkey,
+					  BlockNumber from, BlockNumber to)
+{
+	MemcowBlockKey key;
+
+	if (db == NULL)
+		return;
+
+	memcow_block_key(&key, relkey, from);
+
+	for (BlockNumber b = from; b < to; b++)
+	{
+		MemcowBlockEntry *be;
+		dsa_pointer page;
+
+		key.blocknum = b;
+		be = (MemcowBlockEntry *) dshash_find(db->blocks, &key, true);
+		if (be == NULL)
+			continue;
+
+		/* read the payload pointer before the entry is freed under us */
+		page = be->page;
+		dshash_delete_entry(db->blocks, be);	/* also releases the lock */
+
+		if (DsaPointerIsValid(page))
+			dsa_free(db->area, page);
+	}
+}
+
+/*
+ * Resolve one block to the address of its page image, or NULL if memcow
+ * cannot serve it.  `key` is scratch owned by the caller so that the constant
+ * part of the key is built once per request rather than once per block.
+ *
+ * OVERLAY FIRST, THEN SEED, and the order is not interchangeable: a written
+ * block below seed_visible exists in both places, and the overlay copy is the
+ * current one.  NULL is "cannot serve" and every caller has to turn it into
+ * an ereport(ERROR) or a deliberate zero-fill; it is never a short read.
+ *
+ * The returned address stays valid after the partition lock is dropped.  The
+ * page is a dsa allocation that only memcow_discard_blocks() frees, i.e. only
+ * truncate and unlink, both of which hold AccessExclusiveLock on a relation
+ * this caller holds a lock on; and a dshash resize moves the bucket array,
+ * never the items.  Holding the locks instead would be a genuine deadlock
+ * hazard, because dshash resize takes all 128 partition locks in index order
+ * and a reader holding two of them in the other order closes the cycle.
+ */
+static const char *
+memcow_resolve_block(MemcowFork *f, MemcowBlockKey *key, BlockNumber blocknum)
+{
+	if (f->have_overlay)
+	{
+		MemcowBlockEntry *be;
+
+		key->blocknum = blocknum;
+		be = (MemcowBlockEntry *) dshash_find(f->db->blocks, key, false);
+		if (be != NULL)
+		{
+			const char *page;
+
+			page = (const char *) dsa_get_address(f->db->area, be->page);
+			dshash_release_lock(f->db->blocks, be);
+			return page;
+		}
+	}
+
+	if (blocknum < f->seed_visible)
+	{
+		Assert(f->seed != NULL);
+		return memcow_seed_block(f->seed, blocknum);
+	}
+
+	return NULL;
+}
+
 /*
  * memcow_open() -- Initialize newly-opened relation.
  *
@@ -892,9 +1714,38 @@ memcow_open(SMgrRelation reln)
  * fail, and must not block indefinitely.  Detaching a not-yet-published epoch
  * has to be a pointer swap, not something that can error out.
  *
- * STILL A NO-OP AFTER THE READ PATH LANDED, and deliberately so.  The obvious
- * reading of "close" is "drop this fork's seed mappings", and this function
- * does not do that.  Seed state is not close-scoped state:
+ * STILL A NO-OP AFTER THE OVERLAY LANDED.  This deserves an argument rather
+ * than an assumption, because the expectation was that the overlay would give
+ * this function work to do.  It does not, and the reason is a property that
+ * was designed in rather than noticed afterwards: MEMCOW KEEPS NO
+ * BACKEND-LOCAL CACHE OF MUTABLE OVERLAY STATE.  Every overlay fact -- does
+ * this fork exist, how big is it, how much of the seed still shows through,
+ * where is block N -- is read out of shared memory under a partition lock at
+ * the point of use and is never held past the callback that read it.  There
+ * is therefore nothing that can go stale and nothing to invalidate.  The one
+ * piece of overlay state that IS process-local, the dsa_area attachment, is
+ * pinned (dsa_pin_mapping) precisely so that it is NOT resource-owner scoped,
+ * because on the abort path all three ResourceOwnerRelease() phases run
+ * before AtEOXact_SMgr(); dropping it here would mean re-attaching, and
+ * re-mapping every segment, on the next query.
+ *
+ * WHAT PHASE 2 WILL PUT HERE, so that it is not rediscovered: with lanes and
+ * epochs, a process may hold an attachment to an arena that is no longer the
+ * published one for its database, and the old arena's memory cannot be
+ * reclaimed until every such attachment is dropped.  The loop is over
+ * MemcowDbHash -- bounded by the number of databases this process has
+ * touched, and allocation-free -- detaching any entry whose epoch is not the
+ * published epoch.  TWO WARNINGS FOR WHOEVER WRITES IT.  First, dsa_detach()
+ * takes the area's control lock, so that loop is not wait-free in the strict
+ * sense that this comment's contract asks for; it is only ever a short,
+ * uncontended lock, but §4.6's barrier must not be able to reach it while
+ * anything holds that lock and blocks.  Second, detaching invalidates every
+ * dshash_table attached to that arena, so the dshash handles in the same
+ * entry must be dropped in the same step.
+ *
+ * The seed half stays out of this entirely.  The obvious reading of "close"
+ * is "drop this fork's seed mappings", and this function does not do that.
+ * Seed state is not close-scoped state:
  *
  *	 - It cannot go stale.  memcow_enabled and memcow_seed_directory are both
  *	   PGC_POSTMASTER and the mapping is PROT_READ over a tree nothing in the
@@ -914,11 +1765,8 @@ memcow_open(SMgrRelation reln)
  *	   idempotency smgrdestroy() requires (it calls this for all MAX_FORKNUM+1
  *	   forks) trivially true.
  *
- * What memcow_close() WILL have to do is release epoch-scoped overlay state,
- * which is the thing plan §4.6's barrier exists to flush and the thing that
- * genuinely does go stale at a reset.  Entries whose relation is really gone
- * are reclaimed by memcow_unlink() instead, which is where "really gone" is
- * actually known.
+ * Storage whose relation is really gone is reclaimed by memcow_unlink()
+ * instead, which is where "really gone" is actually known.
  */
 void
 memcow_close(SMgrRelation reln, ForkNumber forknum)
@@ -927,42 +1775,81 @@ memcow_close(SMgrRelation reln, ForkNumber forknum)
 
 /*
  * memcow_create() -- Create a new relation on memcow.
+ *
+ * A WHITEOUT, not a file creation.  The new fork is empty and, crucially,
+ * seed_visible drops to zero, so nothing the seed happens to hold under this
+ * relfilenumber can show through.  Today that cannot arise -- relfilenumbers
+ * come from a cluster-wide counter persisted in pg_control and are never
+ * reused, so a freshly created relation never collides with a seed file -- but
+ * the alternative to whiting out is "a brand new relation is born containing
+ * somebody else's rows", and the cost of not depending on the counter is one
+ * assignment.
+ *
+ * mdcreate() errors when the file already exists and !isRedo.  This does not,
+ * for two reasons.  Every in-tree caller checks smgrexists() first
+ * (fsm_extend, vm_extend) or is creating a fresh relfilenumber, so a create
+ * on an existing fork is either a redo or a retry; and there is no file to
+ * be surprised by, so the failure that error protects md against -- silently
+ * adopting an unrelated file -- has no memcow analogue.
  */
 void
 memcow_create(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
-	MEMCOW_NOT_IMPLEMENTED("smgr_create");
+	MemcowDbLocal *db;
+	MemcowRelEntry *re;
+	bool		created;
+
+	re = memcow_relentry_lock(reln, forknum, &db, &created);
+
+	if (created || !re->exists)
+	{
+		re->exists = true;
+		re->nblocks = 0;
+		re->seed_visible = 0;
+	}
+
+	dshash_release_lock(db->rels, re);
 }
 
 /*
  * memcow_unlink() -- Unlink a relation.
  *
- * Still not implemented, but reported at WARNING and returning normally, which
- * the f_smgr contract requires of smgr_unlink specifically: "smgr_unlink should
- * use elog(WARNING), rather than erroring out, because we normally unlink
- * relations during post-commit/abort cleanup, and so it's too late to raise an
- * error" (the comment above the f_smgr struct in smgr.c).  mdunlink() honours
- * this throughout.
- *
- * Concretely: smgrDoPendingDeletes() -> smgrdounlinkall() is called from
- * AbortTransaction() a handful of lines before AtEOXact_SMgr(), so an
+ * CANNOT FAIL, AT ALL.  Not "reports at WARNING instead of ERROR" -- that is
+ * the letter of the f_smgr contract ("smgr_unlink should use elog(WARNING),
+ * rather than erroring out, because we normally unlink relations during
+ * post-commit/abort cleanup, and so it's too late to raise an error", the
+ * comment above the f_smgr struct in smgr.c) but not its consequence.  Nothing
+ * reads that WARNING: smgrDoPendingDeletes() -> smgrdounlinkall() is called
+ * from AbortTransaction() a handful of lines before AtEOXact_SMgr(), so an
  * ereport(ERROR) here re-enters AbortTransaction() and recurses to
- * PANIC: ERRORDATA_STACK_SIZE exceeded -- the same failure mode as an error out
- * of memcow_close(), and just as unrecoverable.  A dropped relation that memcow
- * cannot yet unlink costs nothing: the overlay is discarded at reset and the
- * seed is read-only, so there is no file to leak.
+ * PANIC: ERRORDATA_STACK_SIZE exceeded, and a WARNING is simply lost.  So
+ * every step below is one that cannot fail, and anything that could fail is
+ * omitted rather than attempted-and-reported.  A dropped relation whose
+ * overlay memcow declines to reclaim costs bounded memory that the next
+ * phase's reset discards; there is never a file to leak, because the overlay
+ * is memory and the seed is read-only.
  *
- * There is one thing to do, though, and it is the counterpart of
- * memcow_close() doing nothing: because seed mappings are process-lifetime,
+ * NOTE, because it is easy to misread the loop below: smgrdounlinkall()
+ * (smgr.c) calls this once per fork, 0 .. MAX_FORKNUM, and never with
+ * InvalidForkNumber.  The InvalidForkNumber branches are mdunlink()'s
+ * convention, kept for contract parity, but unreached in this tree.
+ *
+ * On the seed side, this is the counterpart of memcow_close() doing nothing:
+ * because seed mappings are process-lifetime,
  * unlink is the only point at which memcow ever learns that a relation is
  * genuinely gone and its mappings can never be wanted again.  Dropping the
  * entry here is what keeps the table from growing without bound in a process
  * that creates and drops many relations.  Every step is infallible --
  * hash_search(HASH_FIND / HASH_REMOVE) only ever traverses and unlinks, never
  * allocates; munmap() of a base/length pair this process got from mmap() has
- * no failure mode worth a message nobody reads; pfree() cannot fail.  The
- * whole thing is also wait-free, which matters because §4.6's barrier reaches
- * smgr_close() and this function shares its constraints.
+ * no failure mode worth a message nobody reads; pfree() cannot fail.
+ *
+ * The overlay reclamation below is infallible too, but it is NOT wait-free --
+ * it takes dshash partition locks.  That is the one property this function
+ * does not share with memcow_close(), and it is fine here and only here:
+ * smgr_unlink is not one of the callbacks the SMGRRELEASE barrier drives, so
+ * a short wait costs a transaction's cleanup rather than stalling a
+ * cluster-wide barrier.  Do not copy this code into memcow_close().
  *
  * Note what is deliberately NOT done here: no RegisterSyncRequest().  memcow
  * never enqueues a sync or unlink request, and that -- not the smgr_which
@@ -974,9 +1861,56 @@ void
 memcow_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
 	MemcowRelSeed *rel;
+	MemcowDbLocal *db;
 
 	Assert(MemcowSeedHash != NULL);
 
+	/*
+	 * Reclaim the overlay first.
+	 *
+	 * The lookup is deliberately the non-creating one, and this function
+	 * NEVER attaches to an overlay it is not already attached to.  Attaching
+	 * allocates and can fail, and smgr_unlink cannot report failure at all --
+	 * it is called from AbortTransaction() a few lines before AtEOXact_SMgr(),
+	 * where even a WARNING has no reader, so anything that can fail here has
+	 * to be omitted rather than reported.  A process that has written to a
+	 * relation has necessarily attached to its database's overlay already, so
+	 * in practice the attachment is there; when it is not, the overlay pages
+	 * are simply left for the next phase's reset to discard, which is the
+	 * sanctioned answer for an infallible DROP path.
+	 */
+	db = memcow_overlay(rlocator.locator.dbOid, false);
+
+	for (int f = 0; f <= MAX_FORKNUM; f++)
+	{
+		MemcowRelKey relkey;
+		MemcowRelEntry *re;
+		BlockNumber n;
+
+		/* mdunlink()'s convention: InvalidForkNumber means every fork */
+		if (forknum != InvalidForkNumber && forknum != f)
+			continue;
+		if (db == NULL)
+			break;
+
+		memcow_rel_key(&relkey, &rlocator, f);
+		re = (MemcowRelEntry *) dshash_find(db->rels, &relkey, true);
+		if (re == NULL)
+			continue;
+
+		n = re->nblocks;
+		dshash_delete_entry(db->rels, re);	/* also releases the lock */
+
+		memcow_discard_blocks(db, &relkey, 0, n);
+	}
+
+	/*
+	 * Now the seed side.  Because seed mappings are process-lifetime, unlink
+	 * is the only point at which memcow ever learns that a relation is
+	 * genuinely gone and its mappings can never be wanted again.  Dropping
+	 * the entry here is what keeps the table from growing without bound in a
+	 * process that creates and drops many relations.
+	 */
 	rel = (MemcowRelSeed *) hash_search(MemcowSeedHash, &rlocator,
 										HASH_FIND, NULL);
 	if (rel == NULL)
@@ -986,7 +1920,6 @@ memcow_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 	{
 		MemcowForkSeed *fs = &rel->forks[f];
 
-		/* mdunlink()'s convention: InvalidForkNumber means every fork */
 		if (forknum != InvalidForkNumber && forknum != f)
 			continue;
 
@@ -1014,13 +1947,76 @@ memcow_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 }
 
 /*
+ * Grow a fork to at least `nblocks`, filling any gap below `blocknum` with
+ * zero pages and then storing the caller's pages.
+ *
+ * The gap fill is what makes the MemcowRelEntry invariant airtight rather
+ * than merely usually true.  md would leave a hole in a sparse file and read
+ * zeroes back out of it; memcow has no sparseness to lean on, so a hole would
+ * be a block inside the relation with no overlay entry and no seed coverage,
+ * i.e. exactly the "cannot serve" case the read path has no way to report.
+ * bufmgr never extends discontiguously, so in practice this loop runs zero
+ * times; it costs one comparison to be certain.
+ *
+ * Order matters: pages are stored first, the size is published second.  A
+ * failure part way through therefore leaves a fork that is smaller than
+ * intended, never one that claims blocks it cannot produce.
+ */
+static void
+memcow_do_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+				 const void *const *buffers, int nblocks)
+{
+	MemcowDbLocal *db;
+	MemcowRelEntry *re;
+	MemcowRelKey relkey;
+	MemcowBlockKey key;
+	BlockNumber start;
+	BlockNumber end = blocknum + (BlockNumber) nblocks;
+	bool		created;
+
+	re = memcow_relentry_lock(reln, forknum, &db, &created);
+	re->exists = true;			/* md would create the file here */
+	start = Min(re->nblocks, blocknum);
+	dshash_release_lock(db->rels, re);
+
+	memcow_rel_key(&relkey, &reln->smgr_rlocator, forknum);
+	memcow_block_key(&key, &relkey, start);
+
+	for (BlockNumber b = start; b < end; b++)
+	{
+		key.blocknum = b;
+		if (buffers == NULL || b < blocknum)
+			memcow_store_block(db, &key, NULL);
+		else
+			memcow_store_block(db, &key, buffers[b - blocknum]);
+	}
+
+	re = memcow_relentry_lock(reln, forknum, &db, &created);
+	if (re->nblocks < end)
+		re->nblocks = end;
+	dshash_release_lock(db->rels, re);
+}
+
+/*
  * memcow_extend() -- Add a block to the specified relation.
  */
 void
 memcow_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			  const void *buffer, bool skipFsync)
 {
-	MEMCOW_NOT_IMPLEMENTED("smgr_extend");
+	/*
+	 * Refuse to create block number InvalidBlockNumber, exactly as mdextend()
+	 * does; upstream checks in bufmgr.c make this unreachable, but the number
+	 * is a sentinel everywhere else in the system.
+	 */
+	if (blocknum == InvalidBlockNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("cannot extend file \"%s\" beyond %u blocks",
+						relpath(reln->smgr_rlocator, forknum).str,
+						InvalidBlockNumber)));
+
+	memcow_do_extend(reln, forknum, blocknum, &buffer, 1);
 }
 
 /*
@@ -1030,24 +2026,41 @@ void
 memcow_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				  int nblocks, bool skipFsync)
 {
-	MEMCOW_NOT_IMPLEMENTED("smgr_zeroextend");
+	Assert(nblocks > 0);
+
+	if ((uint64) blocknum + nblocks >= (uint64) InvalidBlockNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("cannot extend file \"%s\" beyond %u blocks",
+						relpath(reln->smgr_rlocator, forknum).str,
+						InvalidBlockNumber)));
+
+	memcow_do_extend(reln, forknum, blocknum, NULL, nblocks);
 }
 
 /*
- * memcow_exists() -- Does the fork exist in the seed?
+ * memcow_exists() -- Does the fork exist?
+ *
+ * The overlay is asked first and its answer is final: it is the only place
+ * that knows about forks created since the seed was built and about forks
+ * that have been unlinked since.  Only when the overlay has never heard of
+ * the fork does the seed decide.
  *
  * Unlike mdexists(), this does not close the fork first.  mdexists() has to,
  * because an md fd can outlive the file it names; a memcow seed mapping
  * cannot, because the seed is immutable while the postmaster runs.  The
- * negative answer is cached for the same reason -- a fork absent from the seed
- * is absent from it permanently.
+ * seed's negative answer stays cached for the same reason -- a fork absent
+ * from the seed is absent from it permanently -- and is now a statement about
+ * the seed alone rather than about the relation.
  */
 bool
 memcow_exists(SMgrRelation reln, ForkNumber forknum)
 {
-	MemcowForkSeed *fs = memcow_resolve_fork(reln, forknum, true);
+	MemcowFork	f;
 
-	return fs->exists;
+	memcow_lookup_fork(reln, forknum, true, &f);
+
+	return f.exists;
 }
 
 /*
@@ -1118,11 +2131,15 @@ void
 memcow_readv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			 void **buffers, BlockNumber nblocks)
 {
-	MemcowForkSeed *fs = memcow_resolve_fork(reln, forknum, false);
+	MemcowFork	f;
+	MemcowBlockKey key;
+
+	memcow_lookup_fork(reln, forknum, false, &f);
+	memcow_block_key(&key, &f.relkey, blocknum);
 
 	for (BlockNumber i = 0; i < nblocks; i++)
 	{
-		const char *src = memcow_seed_block(fs, blocknum + i);
+		const char *src = memcow_resolve_block(&f, &key, blocknum + i);
 
 		if (src == NULL)
 		{
@@ -1139,10 +2156,10 @@ memcow_readv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("memcow could not read block %u of relation %s: block is past the end of the seed",
+					 errmsg("memcow could not read block %u of relation %s: block is outside the seed and the overlay",
 							blocknum + i, rel.str),
-					 errdetail("The seed has %u block(s) in this fork.",
-							   fs->nblocks)));
+					 errdetail("The fork has %u block(s), of which the first %u may come from the seed.",
+							   f.nblocks, f.seed_visible)));
 		}
 
 		memcpy(buffers[i], src, BLCKSZ);
@@ -1185,7 +2202,8 @@ memcow_startreadv(PgAioHandle *ioh,
 				  void **buffers, BlockNumber nblocks)
 {
 	const char *srcs[PG_IOV_MAX];
-	MemcowForkSeed *fs;
+	MemcowFork	f;
+	MemcowBlockKey key;
 
 	Assert(nblocks > 0);
 
@@ -1208,12 +2226,20 @@ memcow_startreadv(PgAioHandle *ioh,
 		elog(ERROR, "memcow read of %u blocks exceeds the %zu block limit",
 			 nblocks, lengthof(srcs));
 
-	fs = memcow_resolve_fork(reln, forknum, false);
+	memcow_lookup_fork(reln, forknum, false, &f);
+	memcow_block_key(&key, &f.relkey, blocknum);
 
-	/* Phase 1: resolve every block.  Raises here or not at all. */
+	/*
+	 * Phase 1: resolve every block.  Raises here or not at all.
+	 *
+	 * The overlay lookup belongs HERE, in the fallible phase, and nowhere
+	 * else: it is the only remaining step that can wait on a lock or fail to
+	 * find what it is looking for.  Everything from the first memcpy() below
+	 * is pointer arithmetic that has already been proven to work.
+	 */
 	for (BlockNumber i = 0; i < nblocks; i++)
 	{
-		srcs[i] = memcow_seed_block(fs, blocknum + i);
+		srcs[i] = memcow_resolve_block(&f, &key, blocknum + i);
 
 		if (srcs[i] == NULL)
 		{
@@ -1221,10 +2247,10 @@ memcow_startreadv(PgAioHandle *ioh,
 
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("memcow could not read block %u of relation %s: block is past the end of the seed",
+					 errmsg("memcow could not read block %u of relation %s: block is outside the seed and the overlay",
 							blocknum + i, rel.str),
-					 errdetail("The seed has %u block(s) in this fork.",
-							   fs->nblocks)));
+					 errdetail("The fork has %u block(s), of which the first %u may come from the seed.",
+							   f.nblocks, f.seed_visible)));
 		}
 	}
 
@@ -1257,22 +2283,84 @@ memcow_startreadv(PgAioHandle *ioh,
 
 /*
  * memcow_writev() -- Write the supplied blocks at the appropriate location.
+ *
+ * This is the callback the whole commit exists for.  Every dirty shared or
+ * local buffer that is evicted or checkpointed arrives here, including the
+ * hint-bit-dirtied pages of otherwise read-only seed relations -- which is
+ * why a clean shutdown was impossible before this function did something.
+ *
+ * The pages are stored EXACTLY as handed over.  bufmgr and localbuf compute
+ * the checksum into the very buffer passed here, so what lands in the overlay
+ * is a complete, self-verifying page image and PageIsVerified() passes on
+ * re-read without memcow being involved in verification at all.  Anything
+ * "helpful" done to the bytes here -- re-checksumming, zeroing a field,
+ * normalizing -- would break that, so nothing is.
+ *
+ * A write past the current end of the fork extends it.  mdwritev() would
+ * refuse (its _mdfd_getseg() uses EXTENSION_FAIL outside recovery) and no
+ * in-tree caller does it, but growing is both cheap and impossible to get
+ * wrong here: the caller's page is the authoritative content of that block
+ * either way.
  */
 void
 memcow_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			  const void **buffers, BlockNumber nblocks, bool skipFsync)
 {
-	MEMCOW_NOT_IMPLEMENTED("smgr_writev");
+	MemcowDbLocal *db;
+	MemcowRelEntry *re;
+	MemcowRelKey relkey;
+	MemcowBlockKey key;
+	BlockNumber end = blocknum + nblocks;
+	BlockNumber cur;
+	bool		created;
+
+	Assert(nblocks > 0);
+
+	re = memcow_relentry_lock(reln, forknum, &db, &created);
+	if (!re->exists)
+	{
+		dshash_release_lock(db->rels, re);
+		memcow_fork_missing(&reln->smgr_rlocator, forknum);
+	}
+	cur = re->nblocks;
+	dshash_release_lock(db->rels, re);
+
+	memcow_rel_key(&relkey, &reln->smgr_rlocator, forknum);
+	memcow_block_key(&key, &relkey, blocknum);
+
+	for (BlockNumber i = 0; i < nblocks; i++)
+	{
+		key.blocknum = blocknum + i;
+		memcow_store_block(db, &key, buffers[i]);
+	}
+
+	/*
+	 * Only re-take the record's lock when the write actually grew the fork,
+	 * which for the write path means almost never.
+	 */
+	if (cur < end)
+	{
+		re = memcow_relentry_lock(reln, forknum, &db, &created);
+		if (re->nblocks < end)
+			re->nblocks = end;
+		dshash_release_lock(db->rels, re);
+	}
 }
 
 /*
  * memcow_writeback() -- Tell the kernel to write pages back to storage.
+ *
+ * Permanent no-op.  mdwriteback() exists to give the kernel a hint about
+ * pages that are already in its page cache and will have to reach a disk
+ * eventually; the overlay has no disk behind it and the seed is never
+ * written, so there is nothing to write back and nothing to hint about.
+ * Raising here would break the checkpointer, which calls this unconditionally
+ * for every batch it flushes.
  */
 void
 memcow_writeback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				 BlockNumber nblocks)
 {
-	MEMCOW_NOT_IMPLEMENTED("smgr_writeback");
 }
 
 /*
@@ -1282,28 +2370,83 @@ memcow_writeback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
  * reaches mdopenfork() with EXTENSION_FAIL.  Callers that are not sure the
  * fork exists are already written to ask smgrexists() first.
  *
- * The count is the seed's, and the seed's size never changes, so unlike md
- * this needs no re-stat: the value computed when the fork was first resolved
- * stays correct for the life of the process.  Once the overlay exists, the
- * answer becomes seed size extended by whatever the overlay added, and that
- * part will have to be recomputed per call -- the seed half will not.
+ * The two halves of the answer have opposite caching rules, which is the
+ * whole subtlety here.  The SEED half is immutable -- the seed is a frozen
+ * tree behind two PGC_POSTMASTER GUCs -- so it is computed once, when the
+ * fork is first resolved, and never recomputed.  The OVERLAY half is shared,
+ * mutable state that another backend can grow between two calls, so it is
+ * read from shared memory on every call and is never cached anywhere.  Once a
+ * fork has an overlay record the record's nblocks IS the answer; the seed
+ * contributed its size to that record when the record was created.
+ *
+ * This is still cheaper than mdnblocks(), which lseeks.
  */
 BlockNumber
 memcow_nblocks(SMgrRelation reln, ForkNumber forknum)
 {
-	MemcowForkSeed *fs = memcow_resolve_fork(reln, forknum, false);
+	MemcowFork	f;
 
-	return fs->nblocks;
+	memcow_lookup_fork(reln, forknum, false, &f);
+
+	return f.nblocks;
 }
 
 /*
  * memcow_truncate() -- Truncate relation to specified number of blocks.
+ *
+ * A WHITEOUT plus a reclaim, never a file truncation: the seed is PROT_READ
+ * and immutable, so the discarded tail is expressed by lowering how much of
+ * the seed remains visible.  Lowering seed_visible is not the same as
+ * lowering nblocks and both are needed -- see the invariant on
+ * MemcowRelEntry: truncating a seed relation to N and then extending it back
+ * past N must serve the re-extended blocks from the overlay, not from the
+ * seed's stale copy of them.
+ *
+ * The overlay pages above the new size are freed here rather than left for
+ * reset to collect, because a TRUNCATE-heavy workload would otherwise grow
+ * the arena without bound.  The reclaim runs after the size has been
+ * published, so no reader can be looking at a block this is about to free:
+ * truncate holds AccessExclusiveLock on the relation, and blocks at or above
+ * the new nblocks are unreachable through the buffer manager.
  */
 void
 memcow_truncate(SMgrRelation reln, ForkNumber forknum,
-				BlockNumber old_blocks, BlockNumber nblocks)
+				BlockNumber curnblk, BlockNumber nblocks)
 {
-	MEMCOW_NOT_IMPLEMENTED("smgr_truncate");
+	MemcowDbLocal *db;
+	MemcowRelEntry *re;
+	MemcowRelKey relkey;
+	BlockNumber oldn;
+	bool		created;
+
+	/* mdtruncate()'s guards, verbatim in effect */
+	if (nblocks > curnblk)
+	{
+		if (InRecovery)
+			return;
+		ereport(ERROR,
+				(errmsg("could not truncate file \"%s\" to %u blocks: it's only %u blocks now",
+						relpath(reln->smgr_rlocator, forknum).str,
+						nblocks, curnblk)));
+	}
+	if (nblocks == curnblk)
+		return;					/* no work */
+
+	re = memcow_relentry_lock(reln, forknum, &db, &created);
+	if (!re->exists)
+	{
+		dshash_release_lock(db->rels, re);
+		memcow_fork_missing(&reln->smgr_rlocator, forknum);
+	}
+
+	oldn = Max(re->nblocks, curnblk);
+	re->nblocks = nblocks;
+	if (re->seed_visible > nblocks)
+		re->seed_visible = nblocks;
+	dshash_release_lock(db->rels, re);
+
+	memcow_rel_key(&relkey, &reln->smgr_rlocator, forknum);
+	memcow_discard_blocks(db, &relkey, nblocks, oldn);
 }
 
 /*
