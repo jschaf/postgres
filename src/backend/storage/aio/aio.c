@@ -528,14 +528,49 @@ pgaio_io_stage(PgAioHandle *ioh, PgAioOp op)
  * - any error condition has already been raised with ereport(ERROR) BEFORE
  *   calling this (mdstartreadv()'s pattern).  We run part of this function in
  *   a critical section, where an ERROR would be promoted to PANIC.
+ * - interrupts were already held across the data movement that filled those
+ *   buffers, not just across this call.  We hold interrupts ourselves, but
+ *   only from here on, which is too late: for a memory-backed smgr a
+ *   CHECK_FOR_INTERRUPTS() in the middle of the copy can absorb
+ *   PROCSIGNAL_BARRIER_SMGRRELEASE, which runs smgr_close() and may unmap or
+ *   detach the very memory being copied out of - a use-after-free mid-copy.
+ *   Callers reached through smgrstartreadv() get this for free, as it wraps
+ *   the smgr_startreadv callback in HOLD_INTERRUPTS() (smgr.c), but the
+ *   requirement is on the caller, not on that wrapper.
  *
  * result_blocks is the raw ioh->result seen by the completion callbacks, and
  * is therefore counted in BLOCKS, not bytes: md_readv_complete() is what
  * converts md's byte count into a block count, and an smgr using this
  * function registers no callback of its own, so the buffer completion
- * callbacks receive this value directly.  A short read (result_blocks <
- * nblocks) is permitted and is handled by those callbacks just as it is for
- * md; a negative (errno) result is not, per the precondition above.
+ * callbacks receive this value directly.
+ *
+ * That directness is also why result_blocks must ALWAYS be the full nblocks
+ * of the request.  Everything md's callback does with a short or failed read
+ * - converting 0 blocks to PGAIO_RS_ERROR, converting a partial read to
+ * PGAIO_RS_PARTIAL (md.c) - is done *by that callback*, so an smgr that
+ * registers none of its own gets none of it.  Concretely:
+ *
+ * - result_blocks == 0 leaves the status at PGAIO_RS_OK while
+ *   buffer_readv_complete() marks every buffer failed ("failed = ... ||
+ *   prior_result.result <= buf_off", bufmgr.c).  ProcessReadBuffersResult()
+ *   then trips Assert(newly_read_blocks > 0); without assertions
+ *   nblocks_done never advances and WaitReadBuffers() re-issues the same read
+ *   forever.
+ * - result_blocks greater than the number of blocks in the request overshoots
+ *   operation->nblocks_done and, without assertions, reads
+ *   operation->buffers[] out of bounds.
+ * - A short but non-zero result is not an error report at all.  It terminates
+ *   the tail buffers not-valid so that the caller re-issues them, and an smgr
+ *   re-reading the same memory returns the same short result: an endless
+ *   retry loop rather than a visible failure.
+ *
+ * There is, in fact, no way to report a hard read failure through this
+ * function's result at all.  PGAIO_RS_ERROR can only originate in a
+ * ->complete_shared callback, and the buffer callbacks raise it only from a
+ * PageIsVerified() failure (bufmgr.c), never from the result value itself.
+ * Any block the caller cannot serve must therefore be reported with
+ * ereport(ERROR) BEFORE this function is called, following mdstartreadv()
+ * (md.c).  A short or zero result is never a legal error signal.
  */
 void
 pgaio_io_complete_synthetic(PgAioHandle *ioh, int result_blocks)
@@ -544,7 +579,41 @@ pgaio_io_complete_synthetic(PgAioHandle *ioh, int result_blocks)
 	Assert(pgaio_my_backend->handed_out_io == ioh);
 	Assert(pgaio_io_has_target(ioh));
 	Assert(ioh->op == PGAIO_OP_INVALID);
-	Assert(result_blocks >= 0);
+
+	/*
+	 * Without a completion callback nothing ever terminates the IO at the
+	 * level above: for a buffer read that leaves every target buffer
+	 * BM_IO_IN_PROGRESS forever, with its pin transferred away by ->stage and
+	 * never given back. bufmgr always registers one before smgrstartreadv();
+	 * this is the chokepoint where that is worth checking.
+	 */
+	Assert(ioh->num_callbacks > 0);
+
+	/*
+	 * See the header comment: because no callback of ours reinterprets the
+	 * result, neither a zero nor an over-long result_blocks can be turned into
+	 * a diagnosable failure further up. Zero means an unkillable retry loop in
+	 * WaitReadBuffers(); too large means an out-of-bounds read of
+	 * ReadBuffersOperation->buffers[]. Both are caller bugs, and this is the
+	 * only place that can still see them.
+	 *
+	 * handle_data_len is the right bound for the readv case: bufmgr sets it
+	 * from io_buffers_len, the very count it then passes to smgrstartreadv()
+	 * as nblocks, and buffer_readv_complete() iterates buf_off over exactly
+	 * that range while comparing it against the result. It is 0 only if the
+	 * caller registered callbacks that take no handle data, in which case we
+	 * have no bound to check against.
+	 */
+	Assert(result_blocks > 0);
+	Assert(ioh->handle_data_len == 0 ||
+		   result_blocks <= ioh->handle_data_len);
+
+	/*
+	 * Otherwise an interrupt, in the middle of staging and completing the IO,
+	 * could end up trying to wait for the IO, leading to state confusion. See
+	 * pgaio_io_stage().
+	 */
+	HOLD_INTERRUPTS();
 
 	/*
 	 * The IO has, in effect, already been executed by the caller. Telling the
@@ -561,13 +630,6 @@ pgaio_io_complete_synthetic(PgAioHandle *ioh, int result_blocks)
 	pgaio_io_set_flag(ioh, PGAIO_HF_SYNCHRONOUS);
 
 	/*
-	 * Otherwise an interrupt, in the middle of staging and completing the IO,
-	 * could end up trying to wait for the IO, leading to state confusion. See
-	 * pgaio_io_stage().
-	 */
-	HOLD_INTERRUPTS();
-
-	/*
 	 * There is no operation to perform, but the op has to be valid: both
 	 * pgaio_io_call_stage() and pgaio_io_call_complete_shared() assert on it,
 	 * and pgaio_io_get_op_name() is used in debug logging. READV is the
@@ -576,10 +638,19 @@ pgaio_io_complete_synthetic(PgAioHandle *ioh, int result_blocks)
 	 * Because the op is now READV, op_data.read is interpreted by anything
 	 * inspecting the handle. pgaio_io_reclaim() does not reset op_data, so
 	 * leave no stale fd/offset/length from whatever IO last used this handle:
-	 * pg_aios reads op_data.read.{offset,iov_length} out of other backends'
-	 * handles, and pgaio_io_uses_fd() compares op_data.read.fd against fds
-	 * being closed. fd -1 matches nothing and an empty iovec reports zero
+	 * pg_aios reads op_data.read.{offset,iov_length} out of *other* backends'
+	 * handles at any moment they are past HANDED_OUT, which includes the whole
+	 * window below. fd -1 matches nothing and an empty iovec reports zero
 	 * bytes, which is what actually happened at this level.
+	 *
+	 * The other consumer of op_data.read, pgaio_io_uses_fd(), is not a hazard
+	 * here: it is reachable only from pgaio_closing_fd(), which walks this
+	 * backend's own in_flight_ios, and the handle is on that list only between
+	 * pgaio_io_prepare_submit() and the pgaio_io_reclaim() inside
+	 * pgaio_io_process_completion() - entirely within the interrupt holdoff
+	 * entered above, with nothing re-entrant in between. Resetting the fd is
+	 * still worth doing so that no stale value is ever observable, but it is
+	 * not what makes this safe.
 	 */
 	ioh->op = PGAIO_OP_READV;
 	ioh->op_data.read.fd = -1;
