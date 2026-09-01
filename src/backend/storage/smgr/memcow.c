@@ -99,6 +99,28 @@
  *	 without ever submitting it to the IO method layer, so no other process
  *	 ever has a memcow handle to re-open.
  *
+ * CRITICAL SECTIONS.  Exactly ONE memcow callback runs inside one, and it is
+ * not the one you would guess: smgr_truncate.  RelationTruncate() (storage.c)
+ * wraps smgrtruncate() in START_CRIT_SECTION() because the truncation is
+ * WAL-logged first and must not be abandoned; smgr_redo repeats the shape.
+ * So memcow_truncate() must be ALLOCATION-FREE -- every MemoryContextAlloc
+ * asserts CritSectionCount == 0, and dsa/dshash reach one whenever they have
+ * to map a segment this backend has not seen (dsa_get_address -> dsm_attach).
+ * See memcow_truncate() for what that costs and why the rest of what it does
+ * is safe.
+ *
+ * The others are NOT in a critical section, checked one by one at this commit
+ * rather than assumed: smgr_create (RelationCreateStorage storage.c:151,
+ * heapam_relation_set_new_filelocator, index_build, fill_seq_with_data --
+ * whose START_CRIT_SECTION comes after the smgrcreate, not around it,
+ * ExtendBufferedRelTo bufmgr.c:1064, index_copy_data),
+ * smgr_extend / smgr_zeroextend (ExtendBufferedRelShared bufmgr.c:3032,
+ * ExtendBufferedRelLocal localbuf.c:470, smgr_bulk_flush, _hash_alloc_buckets,
+ * RelationCopyStorageUsingBuffer), smgr_writev (FlushBuffer bufmgr.c:4526,
+ * FlushLocalBuffer localbuf.c:183) and smgr_unlink (smgrDoPendingDeletes
+ * storage.c:673, RelationSetNewRelfilenumber relcache.c:3855, which hold
+ * HOLD_INTERRUPTS but no critical section).  They may allocate, and do.
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -263,12 +285,30 @@ StaticAssertDecl(sizeof(MemcowRelKey) == 4 * sizeof(uint32),
  * extending it back to 20 must leave blocks 10-19 served from the overlay,
  * not from the seed's copy of them.
  *
- * INVARIANT, relied on everywhere below: every block entry for this fork has
- * blocknum < nblocks, and every block in [seed_visible, nblocks) has a block
- * entry.  Extend and write raise nblocks only after storing the page;
- * truncate and unlink delete the blocks they drop.  Together these make "a
- * block inside the relation that memcow cannot serve" unreachable rather than
- * merely unlikely.
+ * INVARIANT, relied on everywhere below: every block in [seed_visible,
+ * nblocks) has a block entry.  Extend and write raise nblocks only after
+ * storing the page.  This is what makes "a block inside the relation that
+ * memcow cannot serve" unreachable rather than merely unlikely.
+ *
+ * blocks_high is a SEPARATE high-water mark over the block table: block
+ * entries exist for [0, blocks_high) and nowhere above it.  It says nothing
+ * about nblocks in either direction and must not be confused with it -- a
+ * record created for a pure-seed fork starts with nblocks equal to the seed's
+ * size and blocks_high zero, because the fork has a size but owns no pages.
+ * It is only ever raised, by memcow_publish_nblocks(), and only ever zeroed by
+ * unlink, which reclaims exactly this range.
+ *
+ * Two things need it.  Reclamation: truncate does NOT free the pages it drops
+ * (memcow_truncate() runs inside the caller's critical section, where touching
+ * the block table would allocate) and neither does create, which whites the
+ * fork out down to zero blocks -- so nblocks is not a bound on what the fork
+ * owns and unlink would orphan the rest.  Entries above nblocks are invisible
+ * to every reader and are overwritten in place if the fork grows back, so
+ * leaving them costs memory bounded by the fork's peak size and nothing else.
+ * Reads: blocks_high == 0 is what tells memcow_lookup_fork() that a fork with
+ * a record still has no pages of its own, which is what keeps a pure-seed
+ * relation off the per-block lookup path now that memcow_nblocks() creates a
+ * record for everything it sizes.
  */
 typedef struct MemcowRelEntry
 {
@@ -276,6 +316,7 @@ typedef struct MemcowRelEntry
 	bool		exists;			/* false once the fork has been unlinked */
 	BlockNumber nblocks;		/* current size of the fork */
 	BlockNumber seed_visible;	/* blocks [0, seed_visible) may come from seed */
+	BlockNumber blocks_high;	/* block entries exist only below this */
 } MemcowRelEntry;
 
 /*
@@ -406,6 +447,7 @@ typedef struct MemcowFork
 	MemcowDbLocal *db;			/* overlay, or NULL if the db has none */
 	MemcowRelKey relkey;
 	bool		have_overlay;	/* is there an overlay record for this fork? */
+	bool		have_blocks;	/* can this fork have overlay pages at all? */
 	bool		exists;
 	BlockNumber nblocks;
 	BlockNumber seed_visible;
@@ -443,8 +485,9 @@ static bool memcow_copy_block(MemcowFork *f, MemcowBlockKey *key,
 static void memcow_publish_nblocks(MemcowDbLocal *db, const MemcowRelKey *relkey,
 								   BlockNumber nblocks);
 static void memcow_store_range(MemcowDbLocal *db, const MemcowRelKey *relkey,
-							   BlockNumber cur, BlockNumber blocknum,
-							   BlockNumber end, const void *const *buffers);
+							   BlockNumber cur, BlockNumber high,
+							   BlockNumber blocknum, BlockNumber end,
+							   const void *const *buffers);
 pg_noreturn static void memcow_fork_missing(const RelFileLocatorBackend *rlocator,
 											ForkNumber forknum);
 pg_noreturn static void memcow_out_of_memory(BlockNumber blocknum, Oid spcOid,
@@ -1171,6 +1214,11 @@ memcow_overlay_params(const dshash_parameters *template, int tranche_id)
  * for it must not cause a DSM segment to be created in, say, a read-only
  * backend or the checkpointer.
  *
+ * ONE READ PATH DOES CREATE, DELIBERATELY: memcow_nblocks()'s warm-up.  It is
+ * the exception that keeps memcow_truncate() out of dsa_create() inside the
+ * caller's critical section; see the argument there.  Nothing else on a read
+ * path may pass create = true.
+ *
  * THE ATTACHMENT IS SESSION-SCOPED, NOT RESOURCE-OWNER-SCOPED, and that is
  * required rather than convenient.  A dsa_area is owned by CurrentResourceOwner
  * by default, and on the abort path all three ResourceOwnerRelease() phases
@@ -1398,6 +1446,7 @@ memcow_lookup_fork(SMgrRelation reln, ForkNumber forknum, bool missing_ok,
 		 * lookups below can be skipped entirely.
 		 */
 		f->have_overlay = false;
+		f->have_blocks = false;
 		f->seed = memcow_resolve_fork(reln, forknum, missing_ok);
 		f->exists = f->seed->exists;
 		f->nblocks = f->seed->nblocks;
@@ -1406,6 +1455,17 @@ memcow_lookup_fork(SMgrRelation reln, ForkNumber forknum, bool missing_ok,
 	}
 
 	f->have_overlay = true;
+
+	/*
+	 * The record's existence and its OWNING PAGES are two different things,
+	 * and the read path cares about the second.  blocks_high == 0 means this
+	 * fork has never had a page stored, so the per-block lookups are provably
+	 * useless and are skipped exactly as they are for a fork with no record at
+	 * all.  That is what keeps a pure-seed relation on the fast path even
+	 * though memcow_nblocks() now creates a record for it -- see the warm-up
+	 * there, which exists so that memcow_truncate() never has to.
+	 */
+	f->have_blocks = (re->blocks_high > 0);
 	f->exists = re->exists;
 	f->nblocks = re->nblocks;
 	f->seed_visible = re->seed_visible;
@@ -1495,6 +1555,7 @@ memcow_relentry_lock(SMgrRelation reln, ForkNumber forknum,
 		re->exists = fs->exists;
 		re->nblocks = fs->nblocks;
 		re->seed_visible = fs->nblocks;
+		re->blocks_high = 0;	/* a new record owns no block entries yet */
 	}
 	*created = !found;
 	return re;
@@ -1556,8 +1617,9 @@ memcow_store_block(MemcowDbLocal *db, MemcowBlockKey *key, const void *page)
 }
 
 /*
- * Raise a fork's published size to at least nblocks.  Never lowers it; that is
- * memcow_truncate()'s job and it has more to do than this.
+ * Raise a fork's published size to at least nblocks, and its reclamation bound
+ * with it.  Never lowers either; lowering nblocks is memcow_truncate()'s job
+ * and lowering blocks_high is memcow_unlink()'s.
  *
  * INFALLIBLE, and that is why it exists rather than a second
  * memcow_relentry_lock() call: it is used from an error path (see
@@ -1579,6 +1641,8 @@ memcow_publish_nblocks(MemcowDbLocal *db, const MemcowRelKey *relkey,
 
 	if (re->nblocks < nblocks)
 		re->nblocks = nblocks;
+	if (re->blocks_high < nblocks)
+		re->blocks_high = nblocks;
 
 	dshash_release_lock(db->rels, re);
 }
@@ -1617,12 +1681,21 @@ memcow_publish_nblocks(MemcowDbLocal *db, const MemcowRelKey *relkey,
  * invariant (every block below it has an entry) and makes the pages
  * reclaimable.  `b` is volatile because it is read after the longjmp.
  *
- * The record's lock is re-taken only when the fork actually grew, which on the
- * write path means almost never.
+ * `cur` and `high` are the record's nblocks and blocks_high as the caller read
+ * them, under the one lock it already had to take.  BOTH are needed and it is
+ * a correctness bug to guess either from the other: the record's lock is
+ * re-taken only when this call actually moved a high-water mark, and a write
+ * that does not grow the fork (end <= cur, i.e. every ordinary FlushBuffer)
+ * can still be the FIRST page a pure-seed fork ever owned, which moves
+ * blocks_high from 0 and must be published or the read path keeps serving that
+ * block from the seed.  An earlier version guarded only on `end > cur` and did
+ * exactly that; it corrupted heap pages under memory pressure, where the
+ * eviction that produced the write is common.
  */
 static void
 memcow_store_range(MemcowDbLocal *db, const MemcowRelKey *relkey,
-				   BlockNumber cur, BlockNumber blocknum, BlockNumber end,
+				   BlockNumber cur, BlockNumber high,
+				   BlockNumber blocknum, BlockNumber end,
 				   const void *const *buffers)
 {
 	MemcowBlockKey key;
@@ -1644,13 +1717,13 @@ memcow_store_range(MemcowDbLocal *db, const MemcowRelKey *relkey,
 	}
 	PG_CATCH();
 	{
-		if (b > cur)
+		if (b > cur || b > high)
 			memcow_publish_nblocks(db, relkey, b);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
-	if (end > cur)
+	if (end > cur || end > high)
 		memcow_publish_nblocks(db, relkey, end);
 }
 
@@ -1767,7 +1840,7 @@ static bool
 memcow_copy_block(MemcowFork *f, MemcowBlockKey *key, BlockNumber blocknum,
 				  void *dest)
 {
-	if (f->have_overlay)
+	if (f->have_blocks)
 	{
 		MemcowBlockEntry *be;
 
@@ -1984,6 +2057,13 @@ memcow_create(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 		re->exists = true;
 		re->nblocks = 0;
 		re->seed_visible = 0;
+		/*
+		 * blocks_high is deliberately left alone.  Any block entries an
+		 * earlier incarnation of this fork left behind are now above nblocks
+		 * and therefore invisible, but they are still this fork's to free, and
+		 * blocks_high is the only record of how far they reach.  Zeroing it
+		 * would orphan them until reset.
+		 */
 	}
 
 	dshash_release_lock(db->rels, re);
@@ -2127,11 +2207,20 @@ memcow_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 		 * clearing exists -- a record that says the fork does not exist but
 		 * still lets the seed show through would serve stale pages the moment
 		 * anything reached past the exists check.
+		 *
+		 * The reclaim below runs to blocks_high, not nblocks: truncate and
+		 * create both lower nblocks without freeing anything (truncate cannot
+		 * -- it is inside a critical section), so nblocks is not the bound on
+		 * what this fork actually owns.  This is where those pages are
+		 * collected, and it is safe to collect them here because smgr_unlink
+		 * is not in a critical section: smgrDoPendingDeletes() holds no
+		 * critical section on either the commit or the abort path.
 		 */
-		n = re->nblocks;
+		n = re->blocks_high;
 		re->exists = false;
 		re->nblocks = 0;
 		re->seed_visible = 0;
+		re->blocks_high = 0;
 		dshash_release_lock(db->rels, re);
 
 		memcow_discard_blocks(db, &relkey, 0, n);
@@ -2156,16 +2245,18 @@ memcow_do_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	MemcowRelEntry *re;
 	MemcowRelKey relkey;
 	BlockNumber cur;
+	BlockNumber high;
 	BlockNumber end = blocknum + (BlockNumber) nblocks;
 	bool		created;
 
 	re = memcow_relentry_lock(reln, forknum, &db, &created);
 	re->exists = true;			/* md would create the file here */
 	cur = re->nblocks;
+	high = re->blocks_high;
 	dshash_release_lock(db->rels, re);
 
 	memcow_rel_key(&relkey, &reln->smgr_rlocator, forknum);
-	memcow_store_range(db, &relkey, cur, blocknum, end, buffers);
+	memcow_store_range(db, &relkey, cur, high, blocknum, end, buffers);
 }
 
 /*
@@ -2502,6 +2593,7 @@ memcow_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	MemcowRelEntry *re;
 	MemcowRelKey relkey;
 	BlockNumber cur;
+	BlockNumber high;
 	BlockNumber end = blocknum + nblocks;
 	bool		created;
 
@@ -2514,6 +2606,7 @@ memcow_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		memcow_fork_missing(&reln->smgr_rlocator, forknum);
 	}
 	cur = re->nblocks;
+	high = re->blocks_high;
 	dshash_release_lock(db->rels, re);
 
 	/*
@@ -2527,7 +2620,7 @@ memcow_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	Assert(cur >= blocknum);
 
 	memcow_rel_key(&relkey, &reln->smgr_rlocator, forknum);
-	memcow_store_range(db, &relkey, cur, blocknum, end,
+	memcow_store_range(db, &relkey, cur, high, blocknum, end,
 					   (const void *const *) buffers);
 }
 
@@ -2564,6 +2657,41 @@ memcow_writeback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
  * contributed its size to that record when the record was created.
  *
  * This is still cheaper than mdnblocks(), which lseeks.
+ *
+ * IT ALSO WARMS THE OVERLAY RECORD, and that is not an optimization -- it is
+ * what makes memcow_truncate() safe.  smgrtruncate()'s contract (smgr.c) is
+ * that "the current size must be checked outside the critical section, and no
+ * interrupts or smgr functions relating to this relation should be called in
+ * between", so this function is guaranteed to have run on the fork about to be
+ * truncated, outside the critical section that smgr_truncate runs inside.
+ * Creating the record here means memcow_truncate() only ever has to FIND one,
+ * which allocates nothing; creating one from in there allocates, and
+ * deterministically trips AssertNotInCriticalSection through
+ * dshash_find_or_insert -> dsa_allocate -> dsa_get_address -> dsm_attach.
+ * This is the same shape as md: mdnblocks() opens the segments that make
+ * mdtruncate()'s _mdfd_getseg() a pure lookup.
+ *
+ * It costs one dshash insert per fork per CLUSTER lifetime -- the record is
+ * shared, so only the first process to size a fork pays -- and it does not
+ * move a pure-seed relation off the read fast path, because that path keys on
+ * blocks_high rather than on the record existing (see memcow_lookup_fork).
+ *
+ * THE WARM-UP CREATES THE DATABASE'S OVERLAY IF IT HAS NONE, which is a
+ * deliberate softening of memcow_overlay()'s "a read must never cause a DSM
+ * segment to be created".  It has to be: a truncate can be the first write of
+ * any kind in a database -- DELETE from a seed relation and VACUUM it, and
+ * nothing has extended anything -- and then memcow_truncate() would reach
+ * dsa_create() inside the critical section.  Measured; it is not theoretical.
+ * The cost is one arena per database that is merely read rather than written,
+ * which is bounded, is discarded by reset like any other, and only counts
+ * against MEMCOW_MAX_OVERLAY_DBS.  The alternative was a reachable crash.
+ *
+ * Guarded on CritSectionCount so the warm-up can never itself become the
+ * problem it exists to solve: nothing in this tree calls smgr_nblocks from
+ * inside a critical section (DropRelationBuffers, which smgrtruncate() calls
+ * from inside one, uses smgrnblocks_cached and never reaches this callback),
+ * but a future caller that did would get the un-warmed answer rather than an
+ * assert failure.
  */
 BlockNumber
 memcow_nblocks(SMgrRelation reln, ForkNumber forknum)
@@ -2572,26 +2700,89 @@ memcow_nblocks(SMgrRelation reln, ForkNumber forknum)
 
 	memcow_lookup_fork(reln, forknum, false, &f);
 
+	if (!f.have_overlay && f.exists && CritSectionCount == 0)
+	{
+		MemcowDbLocal *db;
+		MemcowRelEntry *re;
+		bool		created;
+
+		re = memcow_relentry_lock(reln, forknum, &db, &created);
+		dshash_release_lock(db->rels, re);
+	}
+
 	return f.nblocks;
 }
 
 /*
  * memcow_truncate() -- Truncate relation to specified number of blocks.
  *
- * A WHITEOUT plus a reclaim, never a file truncation: the seed is PROT_READ
- * and immutable, so the discarded tail is expressed by lowering how much of
- * the seed remains visible.  Lowering seed_visible is not the same as
- * lowering nblocks and both are needed -- see the invariant on
- * MemcowRelEntry: truncating a seed relation to N and then extending it back
- * past N must serve the re-extended blocks from the overlay, not from the
- * seed's stale copy of them.
+ * A PURE WHITEOUT, never a file truncation and -- deliberately -- never a
+ * reclaim: the seed is PROT_READ and immutable, so the discarded tail is
+ * expressed by lowering how much of the seed remains visible.  Lowering
+ * seed_visible is not the same as lowering nblocks and both are needed -- see
+ * the invariant on MemcowRelEntry: truncating a seed relation to N and then
+ * extending it back past N must serve the re-extended blocks from the
+ * overlay, not from the seed's stale copy of them.
  *
- * The overlay pages above the new size are freed here rather than left for
- * reset to collect, because a TRUNCATE-heavy workload would otherwise grow
- * the arena without bound.  The reclaim runs after the size has been
- * published, so no reader can be looking at a block this is about to free:
- * truncate holds AccessExclusiveLock on the relation, and blocks at or above
- * the new nblocks are unreachable through the buffer manager.
+ * THIS RUNS INSIDE THE CALLER'S CRITICAL SECTION, which is the constraint
+ * that shapes everything below.  RelationTruncate() (storage.c) does
+ * START_CRIT_SECTION(), WAL-logs the truncation, calls smgrtruncate() and only
+ * then END_CRIT_SECTION(); the redo path repeats the shape.  So this callback
+ * MUST NOT ALLOCATE: MemoryContextAlloc and friends assert CritSectionCount ==
+ * 0 (mcxt.c), and on an assert-less build the ereport out of a failed
+ * allocation is a PANIC rather than an error.
+ *
+ * That rules out freeing the pages this drops, which is what an earlier
+ * version did and which crashed.  dsa_free() and dshash_delete_entry() both
+ * reach dsa_get_address(), which maps a segment this backend has not seen yet
+ * by calling dsm_attach() -> MemoryContextAllocZero().  It needs two backends
+ * to show up (the segment has to be unmapped *here*), which is exactly why it
+ * presented as an intermittent crash:
+ *
+ *	   TRAP: failed Assert("CritSectionCount == 0 || allowInCritSection")
+ *		 MemoryContextAllocZero <- dsm_attach <- dsa_get_address <- dsa_free
+ *		 <- dshash_delete_entry <- memcow_truncate <- smgrtruncate
+ *
+ * Not freeing costs nothing but memory, and bounded memory at that.  Entries
+ * above nblocks are invisible to every reader (memcow_lookup_fork() hands out
+ * nblocks and nothing asks past it), and if the fork grows back into that
+ * range memcow_store_range() overwrites the pages in place instead of
+ * allocating new ones -- so a truncate/refill cycle reuses the same memory
+ * rather than accumulating.  What is retained is bounded by the fork's peak
+ * size, which is the same bound the design already accepts for written pages.
+ * re->blocks_high carries the range forward so memcow_unlink() still reclaims
+ * it, and it does so from a path that is NOT in a critical section.
+ *
+ * WHAT REMAINS IS SAFE BECAUSE THE CALLER WARMED IT, and that is core's own
+ * documented contract rather than an assumption.  smgrtruncate()'s header
+ * (smgr.c) requires that "the current size must be checked outside the
+ * critical section, and no interrupts or smgr functions relating to this
+ * relation should be called in between" -- i.e. smgr_nblocks has just run on
+ * this exact fork, outside the critical section.  It is the same warming that
+ * makes mdtruncate() safe (its _mdfd_getseg() finds the segments already
+ * open).  For memcow that smgr_nblocks call ran memcow_lookup_fork(), which
+ * attached this backend to the overlay and did this very dshash_find() on
+ * db->rels.  So both lookups below are pure traversals of already-mapped
+ * memory: memcow_overlay(create = false) returns on its first line from
+ * MemcowDbHash, and dshash_find() walks buckets it has already touched.
+ *
+ * The record itself is warmed the same way -- memcow_nblocks() creates it if
+ * it is missing, precisely so that this function only ever has to FIND one.
+ * See the argument there.  Finding allocates nothing; creating allocates and
+ * trips the assert deterministically:
+ *
+ *	   dshash_find_or_insert -> dsa_allocate -> alloc_object
+ *		 -> dsa_get_address -> dsm_attach -> MemoryContextAllocZero
+ *
+ * The fallback below is therefore belt-and-braces rather than a live path, and
+ * it MUST create the record rather than give up, because a fork with no record
+ * reports the SEED's size -- so losing the truncation does not merely lose a
+ * size, it RESURRECTS DATA.  Measured, not reasoned about: an earlier draft of
+ * this fix returned instead, and DELETE 3500 rows from a 4000-row seed
+ * relation followed by VACUUM brought 3460 of them back, because
+ * smgrtruncate() drops the dirty buffers above the new size without writing
+ * them and the reads then fall through to the seed's untouched copy.  Given
+ * the choice between a crash and silent resurrection, take the crash.
  */
 void
 memcow_truncate(SMgrRelation reln, ForkNumber forknum,
@@ -2600,7 +2791,6 @@ memcow_truncate(SMgrRelation reln, ForkNumber forknum,
 	MemcowDbLocal *db;
 	MemcowRelEntry *re;
 	MemcowRelKey relkey;
-	BlockNumber oldn;
 	bool		created;
 
 	/* mdtruncate()'s guards, verbatim in effect */
@@ -2616,21 +2806,30 @@ memcow_truncate(SMgrRelation reln, ForkNumber forknum,
 	if (nblocks == curnblk)
 		return;					/* no work */
 
-	re = memcow_relentry_lock(reln, forknum, &db, &created);
+	db = memcow_overlay(reln->smgr_rlocator.locator.dbOid, false);
+	if (db != NULL)
+	{
+		memcow_rel_key(&relkey, &reln->smgr_rlocator, forknum);
+		re = (MemcowRelEntry *) dshash_find(db->rels, &relkey, true);
+	}
+	else
+		re = NULL;
+
+	/* the allocating fallback; belt-and-braces, see the header comment */
+	if (re == NULL)
+		re = memcow_relentry_lock(reln, forknum, &db, &created);
+
 	if (!re->exists)
 	{
 		dshash_release_lock(db->rels, re);
 		memcow_fork_missing(&reln->smgr_rlocator, forknum);
 	}
 
-	oldn = Max(re->nblocks, curnblk);
 	re->nblocks = nblocks;
 	if (re->seed_visible > nblocks)
 		re->seed_visible = nblocks;
+	/* blocks_high is deliberately NOT lowered: the pages are still there */
 	dshash_release_lock(db->rels, re);
-
-	memcow_rel_key(&relkey, &reln->smgr_rlocator, forknum);
-	memcow_discard_blocks(db, &relkey, nblocks, oldn);
 }
 
 /*
