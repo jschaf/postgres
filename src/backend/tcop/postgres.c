@@ -66,6 +66,7 @@
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/fd.h"
+#include "storage/memcow.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procsignal.h"
@@ -4470,6 +4471,15 @@ PostgresMain(const char *dbname, const char *username)
 				 username, InvalidOid,	/* role to connect as */
 				 (!am_walsender) ? INIT_PG_LOAD_SESSION_LIBS : 0,
 				 NULL);			/* no out_dbname */
+
+	/*
+	 * memcow test mode: lane admission.  This backend is now advertised in
+	 * the ProcArray and has held the database's startup lock, so a lane
+	 * reset either sees it or it sees the closed lane; FATAL is the only
+	 * outcome for the latter.  Must run before the first command is read.
+	 */
+	if (memcow_enabled)
+		memcow_check_admission();
 
 	/*
 	 * If the PostmasterContext is still around, recycle the space; we don't

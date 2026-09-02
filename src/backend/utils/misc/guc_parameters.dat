@@ -2235,6 +2235,20 @@
   boot_val => 'false',
 },
 
+# PGC_BACKEND: presented once, in the startup packet (options='-c
+# memcow_lane_nonce=N'), by a connection the memcow lane pool hands out, and
+# compared against the lane's current nonce by the admission check in
+# PostgresMain() (plan §5 I2).  0 presents no nonce.
+{ name => 'memcow_lane_nonce', type => 'int', context => 'PGC_BACKEND', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Lane nonce presented by a memcow pool connection at startup.',
+  long_desc => 'Checked by the memcow lane admission fence after connection startup; 0 presents no nonce.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'memcow_lane_nonce',
+  boot_val => '0',
+  min => '0',
+  max => 'INT_MAX',
+},
+
 # GUC_SUPERUSER_ONLY as for every other filesystem-path GUC (data_directory,
 # log_directory): the value is a host path and is not for unprivileged eyes.
 { name => 'memcow_seed_directory', type => 'string', context => 'PGC_POSTMASTER', group => 'DEVELOPER_OPTIONS',

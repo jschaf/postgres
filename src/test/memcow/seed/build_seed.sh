@@ -487,6 +487,21 @@ step_apply_schema()
 	log "applying schema.sql to template1"
 	psql_do template1 -f "$SCHEMA_SQL" >>"$BUILD_LOG" 2>&1 \
 		|| die "schema.sql failed; see $BUILD_LOG"
+
+	# Phase 2: the lane half of contrib/memcow_lanes (memcow_backend_reset,
+	# memcow_backend_counters) has to exist in every lane database, and
+	# anything created in a lane at run time is overlay content that the
+	# next reset discards -- the extension's own pg_proc rows included.  So
+	# it goes into the seed, through template1, and it is part of the seed
+	# recipe.  Skipped only when the module is not installed beside this
+	# binary, and loudly, because a seed without it cannot run Phase 2.
+	if [ -f "$("$PG_BINDIR/pg_config" --sharedir)/extension/memcow_lanes.control" ]; then
+		log "creating extension memcow_lanes in template1"
+		psql_do template1 -c "CREATE EXTENSION memcow_lanes;" >>"$BUILD_LOG" 2>&1 \
+			|| die "CREATE EXTENSION memcow_lanes failed; see $BUILD_LOG"
+	else
+		log "WARNING: memcow_lanes.control not found beside $PG_BINDIR; the seed will not support lane reset"
+	fi
 }
 
 # ---------------------------------------------------------------------------

@@ -439,6 +439,17 @@ smgrreleaseall(void)
 	HASH_SEQ_STATUS status;
 	SMgrRelation reln;
 
+	/*
+	 * memcow test mode: this is the PROCSIGNAL_BARRIER_SMGRRELEASE handler,
+	 * and a lane reset relies on it to make every process drop its
+	 * attachment to the epoch being discarded.  The loop below reaches
+	 * memcow's smgr_close only for relations this process has open, which
+	 * can be none (the checkpointer between checkpoints) while an
+	 * attachment is still held; so memcow gets the barrier directly, first.
+	 */
+	if (memcow_enabled)
+		memcow_release_stale_epochs();
+
 	/* Nothing to do if hashtable not set up */
 	if (SMgrRelationHash == NULL)
 		return;

@@ -26,6 +26,7 @@
 /* GUC-backed variables */
 extern PGDLLIMPORT bool memcow_enabled;
 extern PGDLLIMPORT char *memcow_seed_directory;
+extern PGDLLIMPORT int memcow_lane_nonce;
 
 /* memcow storage manager functionality */
 extern void memcow_init(void);
@@ -68,5 +69,53 @@ extern int	memcow_fd(SMgrRelation reln, ForkNumber forknum,
 
 /* not an smgr callback: consulted by DropTableSpace() */
 extern bool memcow_tablespace_in_use(Oid spcOid);
+
+/* not an smgr callback: called by smgrreleaseall(), the SMGRRELEASE barrier */
+extern void memcow_release_stale_epochs(void);
+
+/* not an smgr callback: called by PostgresMain() after InitPostgres() */
+extern void memcow_check_admission(void);
+
+/*
+ * Lanes and reset (plan §4).  The SQL surface is contrib/memcow_lanes.
+ */
+typedef enum MemcowLaneState
+{
+	MEMCOW_LANE_OPEN = 0,		/* zero, so a fresh slot is open */
+	MEMCOW_LANE_RESETTING,
+	MEMCOW_LANE_RETIRED
+} MemcowLaneState;
+
+typedef struct MemcowLaneStatus
+{
+	bool		is_lane;		/* false: the database has no slot at all */
+	MemcowLaneState state;
+	uint32		epoch;
+	uint32		nonce;			/* 0: not armed */
+	int			nregistered;
+	int64		arena_bytes;	/* dsa total size of the published epoch */
+	uint32		attached;		/* attachments to the published epoch */
+	uint32		attached_old;	/* attachments to the previous epoch */
+	bool		reclaim_pending;
+} MemcowLaneStatus;
+
+typedef struct MemcowBackendCounters
+{
+	uint64		attaches;
+	uint64		detaches;
+	uint64		nblocks_pin_refresh;
+	uint64		truncate_pinned;
+	uint64		truncate_traversed;
+	uint64		truncate_allocated;
+	uint64		writes_discarded;
+} MemcowBackendCounters;
+
+extern uint32 memcow_lane_reset(Oid dbOid, Oid spcOid, int timeout_ms);
+extern uint32 memcow_lane_open(Oid dbOid, bool arm);
+extern void memcow_lane_register(Oid dbOid, int pid, bool add);
+extern void memcow_lane_status(Oid dbOid, MemcowLaneStatus *st);
+extern uint32 memcow_backend_adopt(void);
+extern void memcow_get_backend_counters(MemcowBackendCounters *out);
+extern const char *memcow_lane_state_name(MemcowLaneState state);
 
 #endif							/* MEMCOW_H */
