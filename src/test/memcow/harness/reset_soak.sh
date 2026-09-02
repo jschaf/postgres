@@ -125,8 +125,22 @@ psql()     { PGHOST=$SOCKDIR PGPORT=$PORT "$MC_BINDIR/psql" -X -q -A -t -d "$DB"
 psql_ctl() { PGHOST=$SOCKDIR PGPORT=$PORT "$MC_BINDIR/psql" -X -q -A -t -d "$CONTROL_DB" -v ON_ERROR_STOP=0 "$@" 2>&1; }
 
 dsm_files()   { find "$PGDATA/pg_dynshmem" -name 'mmap.*' 2>/dev/null | wc -l | tr -d ' '; }
-pgdata_kb()   { du -sk "$PGDATA" 2>/dev/null | awk '{print $1}'; }
 pgwal_kb()    { du -sk "$PGDATA/pg_wal" 2>/dev/null | awk '{print $1}'; }
+# PGDATA size excluding pg_wal, in ONE traversal.  Measuring the whole PGDATA
+# and pg_wal in two separate du passes and subtracting is racy: a 16 MB WAL
+# segment recycled between the two passes makes the difference jump by a whole
+# segment, which reads as spurious growth.  perl is already required (now_ms).
+data_minus_wal_kb() {
+	perl -MFile::Find -e '
+		my $root = shift; my $wal = "$root/pg_wal"; my $sum = 0;
+		find({ wanted => sub {
+			if ($File::Find::name eq $wal) { $File::Find::prune = 1; return; }
+			$sum += -s $_ if -f $_;
+		}, no_chdir => 1 }, $root);
+		print int($sum / 1024), "
+";
+	' "$PGDATA"
+}
 now_ms()      { perl -MTime::HiRes=time -e 'printf "%d\n", time*1000'; }
 
 FAIL=0
@@ -177,7 +191,7 @@ psql_ctl -c "SELECT memcow_lane_open($DBOID, false)" >/dev/null
 sess_query A 7 "SELECT public.memcow_backend_reset()" >/dev/null
 sess_query B 8 "SELECT public.memcow_backend_reset()" >/dev/null
 DSM_BASE=$(dsm_files)
-DATA_BASE=$(( $(pgdata_kb) - $(pgwal_kb) ))
+DATA_BASE=$(data_minus_wal_kb)
 echo "baseline: dsm segments=$DSM_BASE  pgdata-minus-wal=${DATA_BASE}kB  wal=$(pgwal_kb)kB"
 
 workload()	# workload SESSION FD ITER
@@ -285,7 +299,7 @@ for ((i = 1; i <= ITER; i++)); do
 		sess_query A 7 "SELECT '    A ' || string_agg(name || '=' || value, ' ') FROM public.memcow_backend_counters()"
 		sess_query B 8 "SELECT '    B ' || string_agg(name || '=' || value, ' ') FROM public.memcow_backend_counters()"
 	fi
-	d=$(( $(pgdata_kb) - $(pgwal_kb) ))
+	d=$(data_minus_wal_kb)
 	[ "$d" -le $((DATA_BASE + 2048)) ] || fail "iteration $i: pgdata-minus-wal ${d}kB grew past baseline ${DATA_BASE}kB"
 
 	psql_ctl -c "SELECT memcow_lane_open($DBOID, false)" >/dev/null

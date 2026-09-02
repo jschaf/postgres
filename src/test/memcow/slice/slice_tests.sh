@@ -35,6 +35,16 @@
 #   S13 reset invalidates the cached record pointer  ADDENDUM §P(d)
 #   S14 reset while a truncate is in flight          plan §4.3 fence, Appendix B(i)
 #
+#   Phase 3 (plan §3, §5 I2, §7.3, CONCERN 4a), run by run_gate.sh --phase 3:
+#
+#   S15 the authentication-time fence               plan §5 I2 fence 2 of 3
+#   S16 the per-lane arena limit, a named error     CONCERN 4a
+#   R1  §7.3 (a): connection parked after auth, reset runs past it
+#   R2  §7.3 (b): SIGSTOPped straggler; reset fails closed, never publishes
+#   R3  §7.3 (c): cancel with an IO in flight, release + reset at once
+#   R4  §7.3 (d): checkpointer parked in FlushBuffer across a reset
+#   R5  §7.3 (e): nailed-catalog sinval to parked pool backends mid-reset
+#
 # ---------------------------------------------------------------------------
 # Every case has a negative control, and it is not optional
 # ---------------------------------------------------------------------------
@@ -95,7 +105,8 @@
 #     --outputdir DIR     logs and artifacts (default: <pgdata>/../slice-out)
 #     --db NAME           database to run in (default: memcow_lane_00)
 #     --case NAME         run only this case (repeatable); default: all
-#     --phase 1|2         run only that phase's cases (S1-S10 or S11-S14)
+#     --phase 1|2|3       run only that phase's cases (S1-S10, S11-S14, or
+#                         S15-S16 + R1-R5)
 #     --list              list the cases and exit
 #     --negative-control  run the sabotage variant of each selected case and
 #                         require it to fail
@@ -123,7 +134,9 @@ S4_pg_prewarm S5_past_eof S6_fingerprint S7_seed_immutable S8_crash_refuses \
 S9_documented_divergences S10_truncate_crit_section"
 PHASE2_CASES="S11_reset_reverts S12_reset_reclaims S13_reset_invalidates_pin \
 S14_reset_vs_truncate"
-ALL_CASES="$PHASE1_CASES $PHASE2_CASES"
+PHASE3_CASES="S15_auth_fence S16_arena_limit R1_auth_window R2_stopped_straggler \
+R3_cancel_inflight_io R4_checkpoint_discard R5_sinval_nailed"
+ALL_CASES="$PHASE1_CASES $PHASE2_CASES $PHASE3_CASES"
 
 SEED=
 PGDATA=
@@ -178,7 +191,8 @@ if [ ${#CASES[@]} -eq 0 ]; then
 		'')  read -r -a CASES <<<"$ALL_CASES" ;;
 		1)   read -r -a CASES <<<"$PHASE1_CASES" ;;
 		2)   read -r -a CASES <<<"$PHASE2_CASES" ;;
-		*)   mc_die "unknown --phase $PHASE (expected 1 or 2)" ;;
+		3)   read -r -a CASES <<<"$PHASE3_CASES" ;;
+		*)   mc_die "unknown --phase $PHASE (expected 1, 2 or 3)" ;;
 	esac
 fi
 
@@ -1861,8 +1875,13 @@ SELECT name || '=' || value FROM public.memcow_backend_counters()
 #                retry succeeds and the epoch-0 truncate is discarded.
 #   unregistered a straggler.  The reset SIGTERMs it, it cannot die inside
 #                the critical section, and the reset must FAIL CLOSED on its
-#                timeout -- lane retired, epoch unchanged -- rather than
-#                publish over a live writer.
+#                timeout -- lane still closed, epoch unchanged, nothing
+#                published -- rather than publish over a live writer.  Once
+#                the straggler leaves the critical section it dies of the
+#                pending SIGTERM and a retry succeeds (Phase 3 changed this
+#                from "lane retired": a reset that published nothing leaves
+#                the lane exactly as trustworthy as it found it, and whether
+#                to retire it is the pool's call -- plan Appendix B(i)).
 # ===========================================================================
 
 S14_reset_vs_truncate()
@@ -1942,13 +1961,21 @@ DELETE FROM public.events;
 	ck_match "reset FAILS CLOSED: the straggler did not exit within the timeout" \
 		'ERROR:.*(straggler|did not exit|timed out)' "$out"
 	ck_eq "epoch unchanged after the timeout" 1 "$(lane_status "$dboid" epoch)"
-	ck_eq "lane retired after the timeout" RETIRED "$(lane_status "$dboid" state)"
+	ck_eq "lane stays CLOSED (RESETTING) after the timeout, not retired" RESETTING "$(lane_status "$dboid" state)"
+	ck_eq "nothing was published (no reclaim pending)" f "$(lane_status "$dboid" reclaim_pending)"
 
 	wake_until_done B "$seq" memcow-truncate-before-whiteout 30 || true
 	out=$(sess_query B 8 "SELECT 1" 10 || true)
 	ck_match "the straggler died of the SIGTERM once it left the critical section" \
 		'FATAL:.*terminating connection|server closed the connection|connection to server was lost' \
 		"$(sess_output B "$seq"; printf '%s' "$out")"
+	wait_for_pid_gone "$pid" 20 || ck "the straggler is gone from pg_stat_activity" 1
+
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 5000)")
+	ck_eq "retry succeeds once the straggler is gone -> epoch 2" 2 "$out"
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	out=$(psql -c "SELECT 'rows', count(*) FROM public.events")
+	ck_match "epoch 2: the straggler's epoch-1 truncate is gone" '^rows\|4000$' "$out"
 
 	sess_close B 8
 	ck_no_crash
@@ -1971,6 +1998,859 @@ nc_S14_reset_vs_truncate()
 	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 2000)")
 	ck_eq "sabotage detected: with nothing in flight the reset is NOT refused" 1 "$out"
 	sess_close B 8
+	ck_no_crash
+}
+
+
+# ===========================================================================
+# Phase 3 helpers
+# ===========================================================================
+
+ensure_pg_buffercache()		# in the control database
+{
+	psql_ctl -c "CREATE EXTENSION IF NOT EXISTS pg_buffercache" >/dev/null 2>&1
+}
+
+checkpointer_pid()
+{
+	psql_ctl -c "SELECT pid FROM pg_stat_activity WHERE backend_type = 'checkpointer'"
+}
+
+# attach_point NAME ACTION [CONDITION] --- a GLOBAL injection point, from the
+# control database (no set_local): it fires in whatever process reaches it.
+attach_point()
+{
+	if [ -n "${3:-}" ]; then
+		psql_ctl -c "SELECT injection_points_attach('$1', '$2', '$3')"
+	else
+		psql_ctl -c "SELECT injection_points_attach('$1', '$2')"
+	fi
+}
+detach_point() { psql_ctl -c "SELECT injection_points_detach('$1')" >/dev/null 2>&1; }
+wake_point()   { psql_ctl -c "SELECT injection_points_wakeup('$1')"; }
+
+# wait_for_backend_at EVENT [TIMEOUT] --- print the PID of a backend whose
+# wait_event is EVENT, waiting for one to appear; rc 1 on timeout.
+wait_for_backend_at()
+{
+	local ev=$1 timeout=${2:-20} i=0 got
+	while :; do
+		got=$(psql_ctl -c "SELECT pid FROM pg_stat_activity WHERE wait_event = '$ev' LIMIT 1")
+		[ -n "$got" ] && { printf '%s\n' "$got"; return 0; }
+		i=$((i + 1))
+		[ $i -lt $((timeout * 10)) ] || return 1
+		sleep 0.1
+	done
+}
+
+# wait_for_pid_gone PID [TIMEOUT] --- until pg_stat_activity no longer lists PID
+wait_for_pid_gone()
+{
+	local pid=$1 timeout=${2:-20} i=0
+	while [ "$(psql_ctl -c "SELECT count(*) FROM pg_stat_activity WHERE pid = $pid")" != 0 ]; do
+		i=$((i + 1))
+		[ $i -lt $((timeout * 10)) ] || return 1
+		sleep 0.1
+	done
+}
+
+# log_for_pid PID --- every postmaster.log line for that backend
+log_for_pid() { grep -E "\[$1\] " "$LOGFILE" 2>/dev/null; }
+
+# lane_buffers OID [EXTRA-WHERE] --- shared buffers tagged with database OID
+lane_buffers()
+{
+	psql_ctl -c "SELECT count(*) FROM pg_buffercache WHERE reldatabase = $1 ${2:-}"
+}
+
+# ===========================================================================
+# S15 -- the authentication-time fence (plan §5 I2, fence 2 of 3)
+#
+# With contrib/memcow_lanes in shared_preload_libraries, its
+# ClientAuthentication_hook reads the database name out of the startup packet,
+# finds the lane by that name, and refuses an ARMED lane's stale or absent
+# nonce at authentication -- before "connection authorized" is logged, before
+# the database startup lock, before the backend advertises its database in
+# the ProcArray.  An unarmed lane admits anyone.  The log has to say which
+# fence fired: the DETAIL names it, and the refused PID has a "connection
+# authenticated" line but no "connection authorized" line, because the FATAL
+# came from inside PerformAuthentication().
+# ===========================================================================
+
+S15_auth_fence()
+{
+	EXTRA_GUCS=(shared_preload_libraries=memcow_lanes log_connections=authentication,authorization)
+	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
+	EXTRA_GUCS=()
+	ensure_memcow_lanes
+	local dboid out nonce pid lines
+	dboid=$(lane_oid)
+
+	# --- unarmed: anyone ---------------------------------------------------
+	out=$(psql_ctl -c "SELECT memcow_lane_open($dboid, false)")
+	ck_eq "lane opened unarmed" 0 "$out"
+	out=$(psql -c "SELECT 1")
+	ck_match "unarmed lane: a connection with no nonce is admitted" '^1$' "$out"
+
+	# --- armed: the nonce, at auth -------------------------------------------
+	nonce=$(psql_ctl -c "SELECT memcow_lane_open($dboid, true)")
+	ck_match "lane opened armed with a nonce" '^[1-9][0-9]*$' "$nonce"
+
+	out=$(PGOPTIONS="-c memcow_lane_nonce=$((nonce + 1))" psql -c "SELECT 1")
+	ck_match "armed lane: a stale nonce is refused" 'FATAL:.*nonce mismatch' "$out"
+	pid=$(grep -E 'FATAL:.*nonce mismatch' "$LOGFILE" | tail -1 | sed -n 's/.*\[\([0-9][0-9]*\)\].*/\1/p')
+	ck_match "the refusal is in the log with a PID" '^[0-9]+$' "$pid"
+	lines=$(log_for_pid "$pid")
+	ck_match "the log names the fence: the memcow_lanes authentication fence" \
+		'authentication fence' "$lines"
+	ck_match "the PID was authenticated (auth proper completed first)" \
+		'connection authenticated' "$lines"
+	ck_nomatch "the PID was NEVER authorized: refused before PerformAuthentication returned, hence before the database lock and the ProcArray advertisement" \
+		'connection authorized' "$lines"
+	ck_nomatch "the admission fence (fence 3) never saw this connection" \
+		'admission fence' "$lines"
+
+	out=$(psql -c "SELECT 1")
+	ck_match "armed lane: an absent nonce is refused" 'FATAL:.*nonce mismatch' "$out"
+	pid=$(grep -E 'FATAL:.*nonce mismatch' "$LOGFILE" | tail -1 | sed -n 's/.*\[\([0-9][0-9]*\)\].*/\1/p')
+	ck_match "absent nonce: refused by the authentication fence too" \
+		'authentication fence' "$(log_for_pid "$pid")"
+
+	out=$(PGOPTIONS="-c memcow_lane_nonce=$nonce" psql -c "SELECT 1")
+	ck_match "armed lane: the current nonce passes both fences" '^1$' "$out"
+
+	# --- armed and closed: refused at auth as well (plan §4.1) -----------------
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
+	ck_eq "reset -> epoch 1 (lane now RESETTING, still armed)" 1 "$out"
+	out=$(PGOPTIONS="-c memcow_lane_nonce=$nonce" psql -c "SELECT 1")
+	ck_match "armed RESETTING lane: refused even with the current nonce" 'FATAL:.*not open' "$out"
+	pid=$(grep -E 'FATAL:.*not open' "$LOGFILE" | tail -1 | sed -n 's/.*\[\([0-9][0-9]*\)\].*/\1/p')
+	ck_match "... by the authentication fence" 'authentication fence' "$(log_for_pid "$pid")"
+
+	# --- the control database is not a lane: never fenced ---------------------
+	out=$(psql_ctl -c "SELECT 1")
+	ck_match "the control database is not a lane and is never fenced" '^1$' "$out"
+
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	ck_no_crash
+}
+
+# The sabotage: the library is NOT preloaded.  Every SQL function still works
+# (that is a requirement), but the stale nonce is now caught by the admission
+# fence in PostgresMain, i.e. AFTER "connection authorized", and the log says
+# so.  The case's "authentication fence, never authorized" assertions must
+# therefore fail here.
+nc_S15_auth_fence()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow_lanes
+	local dboid out nonce pid lines
+	dboid=$(lane_oid)
+	nonce=$(psql_ctl -c "SELECT memcow_lane_open($dboid, true)")
+	ck_match "every SQL function works without the preload (open returned a nonce)" '^[1-9][0-9]*$' "$nonce"
+	out=$(PGOPTIONS="-c memcow_lane_nonce=$((nonce + 1))" psql -c "SELECT 1")
+	ck_match "a stale nonce is still refused" 'FATAL:.*nonce mismatch' "$out"
+	pid=$(grep -E 'FATAL:.*nonce mismatch' "$LOGFILE" | tail -1 | sed -n 's/.*\[\([0-9][0-9]*\)\].*/\1/p')
+	lines=$(log_for_pid "$pid")
+	ck_match "sabotage detected: without the preload the refusal comes from the admission fence" \
+		'admission fence' "$lines"
+	ck_nomatch "... and not from the authentication fence" 'authentication fence' "$lines"
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	ck_no_crash
+}
+
+# ===========================================================================
+# S16 -- the per-lane arena limit (CONCERN 4a): exhaustion is a named error
+#
+# memcow_lane_arena_limit bounds one lane-epoch's arena through
+# dsa_set_size_limit(), bound when the lane is opened and at every reset.
+# Filling it fails the WRITING STATEMENT with SQLSTATE 53MC1
+# (ERRCODE_MEMCOW_ARENA_FULL) and a message that names memcow -- not dsa's
+# generic "out of memory", which reads as backend memory pressure.  The lane
+# survives the error, a reset gives it a fresh arena under the same limit,
+# and the arena never exceeds the limit.
+# ===========================================================================
+
+S16_arena_limit()
+{
+	EXTRA_GUCS=(memcow_lane_arena_limit=4MB)
+	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
+	EXTRA_GUCS=()
+	ensure_memcow_lanes
+	local dboid out bytes
+	dboid=$(lane_oid)
+
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	ck_eq "the lane reports the limit in force (4 MB)" 4194304 "$(lane_status "$dboid" arena_limit)"
+
+	out=$(psql -c '\set VERBOSITY verbose' \
+		-c "CREATE TABLE s16_big AS SELECT i, repeat('x', 400) AS pad FROM generate_series(1, 60000) i")
+	ck_match "a 25 MB write into a 4 MB arena fails with SQLSTATE 53MC1" '53MC1' "$out"
+	ck_match "... with memcow's own message, not dsa's" 'memcow overlay for database [0-9]+ is full' "$out"
+	ck_match "... naming the limit" 'memcow_lane_arena_limit is 4 MB' "$out"
+	bytes=$(lane_status "$dboid" arena_bytes)
+	if [ "${bytes:-0}" -le 4194304 ]; then
+		ck "the arena never exceeded the limit ($bytes bytes)" 0
+	else
+		ck "the arena never exceeded the limit ($bytes bytes)" 1
+	fi
+
+	out=$(psql -c "SELECT 'rows', count(*) FROM public.events" \
+		-c "UPDATE public.events SET kind = 's16' WHERE event_id = 1" \
+		-c "SELECT 'kind', kind FROM public.events WHERE event_id = 1" \
+		-c "SELECT 'big', count(*) FROM pg_class WHERE relname = 's16_big'")
+	ck_match "the lane survives: reads work"            '^rows\|4000$' "$out"
+	ck_match "the lane survives: a small write works"   '^kind\|s16$'  "$out"
+	ck_match "the failed statement left no relation"    '^big\|0$'     "$out"
+
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
+	ck_eq "reset -> epoch 1" 1 "$out"
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	ck_eq "the fresh arena carries the limit" 4194304 "$(lane_status "$dboid" arena_limit)"
+	out=$(psql -c '\set VERBOSITY verbose' \
+		-c "CREATE TABLE s16_small AS SELECT i FROM generate_series(1, 20000) i" \
+		-c "SELECT 'small', count(*) FROM s16_small" \
+		-c "CREATE TABLE s16_big AS SELECT i, repeat('x', 400) AS pad FROM generate_series(1, 60000) i")
+	ck_match "epoch 1: a write that fits succeeds" '^small\|20000$' "$out"
+	ck_match "epoch 1: a write that does not fit fails with 53MC1 again" '53MC1' "$out"
+	ck_no_crash
+}
+
+# The sabotage: no limit.  The 25 MB write must then SUCCEED, i.e. the named
+# error is what the limit produces, not what the write produces.
+nc_S16_arena_limit()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow_lanes
+	local dboid out
+	dboid=$(lane_oid)
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	ck_eq "no limit in force" 0 "$(lane_status "$dboid" arena_limit)"
+	out=$(psql -c "CREATE TABLE s16_big AS SELECT i, repeat('x', 400) AS pad FROM generate_series(1, 60000) i" \
+		-c "SELECT 'big', count(*) FROM s16_big")
+	ck_match "sabotage detected: without a limit the 25 MB write succeeds" '^big\|60000$' "$out"
+	ck_nomatch "... and no 53MC1 is raised" '53MC1|is full' "$out"
+	ck_no_crash
+}
+
+# ===========================================================================
+# R1 -- §7.3 (a): a connection parked after authentication while a reset runs
+#
+# The window plan A.1.3 describes: ClientAuthentication has admitted the
+# connection (it presented the current nonce), but the backend has not yet
+# taken the database startup lock nor advertised its database in the
+# ProcArray, so the reset's fence cannot see it.  The reset must complete
+# past it, and when the backend resumes it must die at the admission fence
+# in PostgresMain -- fence 3 of 3, the only one that can still catch it --
+# before its first command is dispatched.  Parked at the memcow-lanes-post-auth
+# injection point, which the preloaded auth hook fires for lane databases.
+# ===========================================================================
+
+R1_auth_window()
+{
+	EXTRA_GUCS=(shared_preload_libraries=memcow_lanes log_connections=authentication,authorization)
+	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
+	EXTRA_GUCS=()
+	ensure_memcow_lanes
+	ensure_injection_points "$CONTROL_DB"
+	local dboid out nonce nonce2 pid_a parked bg lines
+	dboid=$(lane_oid)
+
+	sess_open A 7
+	pid_a=$(sess_query A 7 "SELECT pg_backend_pid()")
+	psql_ctl -c "SELECT memcow_lane_register($dboid, $pid_a)" >/dev/null
+	sess_query A 7 "UPDATE public.events SET kind = 'r1' WHERE event_id = 1" >/dev/null
+	nonce=$(psql_ctl -c "SELECT memcow_lane_open($dboid, true)")
+	ck_match "lane armed" '^[1-9][0-9]*$' "$nonce"
+
+	attach_point memcow-lanes-post-auth wait >/dev/null
+	# the escaped connection string: current nonce, so the auth fence admits it
+	( PGOPTIONS="-c memcow_lane_nonce=$nonce" PGHOST=$SOCKDIR PGPORT=$PORT \
+	  "$MC_BINDIR/psql" -X -q -A -t -d "$DB" -c "SELECT 'r1-cmd-ran'" \
+	  >"$OUTPUTDIR/r1.out" 2>&1; echo "rc=$?" >>"$OUTPUTDIR/r1.out" ) &
+	bg=$!
+	parked=$(wait_for_backend_at memcow-lanes-post-auth 20)
+	ck_match "a connecting backend is parked after authentication" '^[0-9]+$' "$parked"
+	out=$(psql_ctl -c "SELECT coalesce(datname, '<none>') FROM pg_stat_activity WHERE pid = ${parked:-0}")
+	ck_eq "... and has no database yet, so the fence cannot see it" '<none>' "$out"
+
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 5000)")
+	ck_eq "a full reset completes past the parked backend -> epoch 1" 1 "$out"
+	nonce2=$(psql_ctl -c "SELECT memcow_lane_open($dboid, true)")
+	ck_match "lane reopened armed with a new nonce" '^[1-9][0-9]*$' "$nonce2"
+	[ "$nonce2" != "$nonce" ] && ck "the new nonce differs from the one the parked backend presented" 0 \
+		|| ck "the new nonce differs from the one the parked backend presented" 1
+	out=$(sess_query A 7 "SELECT public.memcow_backend_reset()")
+	ck_eq "the retained backend adopted epoch 1" 1 "$out"
+
+	wake_point memcow-lanes-post-auth >/dev/null
+	wait "$bg" 2>/dev/null
+	out=$(cat "$OUTPUTDIR/r1.out")
+	ck_match "resumed backend: FATAL before its first command" 'FATAL:.*nonce mismatch' "$out"
+	ck_nomatch "resumed backend: the command never ran" 'r1-cmd-ran' "$out"
+	lines=$(log_for_pid "$parked")
+	ck_match "which fence: it had been AUTHORIZED (the auth fence admitted it)" 'connection authorized' "$lines"
+	ck_match "which fence: the PostgresMain admission fence (3 of 3) caught it" 'admission fence' "$lines"
+	ck_nomatch "which fence: not the authentication fence" 'authentication fence' "$lines"
+
+	# the park point stays attached until here: a later lane connection would
+	# park too, and authentication_timeout would kill it after 60 s
+	detach_point memcow-lanes-post-auth
+	out=$(psql -c "SELECT 1")
+	ck_match "afterwards a connection without the nonce is still refused" 'FATAL' "$out"
+	out=$(PGOPTIONS="-c memcow_lane_nonce=$nonce2" psql -c "SELECT 'kind', kind FROM public.events WHERE event_id = 1")
+	ck_match "and one with the new nonce sees the seed" '^kind\|logout$' "$out"
+
+	sess_close A 7
+	ck_no_crash
+}
+
+# The sabotage: fence 3 switched off (memcow-skip-admission).  The parked
+# backend then resumes INTO epoch 1 with a stale nonce and its command runs
+# -- the exact hazard, made visible: the case's "FATAL before first command"
+# assertion fails.
+nc_R1_auth_window()
+{
+	EXTRA_GUCS=(shared_preload_libraries=memcow_lanes)
+	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
+	EXTRA_GUCS=()
+	ensure_memcow_lanes
+	ensure_injection_points "$CONTROL_DB"
+	local dboid out nonce parked bg
+	dboid=$(lane_oid)
+	nonce=$(psql_ctl -c "SELECT memcow_lane_open($dboid, true)")
+	attach_point memcow-skip-admission notice >/dev/null
+	attach_point memcow-lanes-post-auth wait >/dev/null
+	( PGOPTIONS="-c memcow_lane_nonce=$nonce" PGHOST=$SOCKDIR PGPORT=$PORT \
+	  "$MC_BINDIR/psql" -X -q -A -t -d "$DB" -c "SELECT 'r1-cmd-ran'" \
+	  >"$OUTPUTDIR/r1nc.out" 2>&1 ) &
+	bg=$!
+	parked=$(wait_for_backend_at memcow-lanes-post-auth 20)
+	ck_match "backend parked" '^[0-9]+$' "$parked"
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 5000)")
+	ck_eq "reset -> epoch 1" 1 "$out"
+	psql_ctl -c "SELECT memcow_lane_open($dboid, true)" >/dev/null
+	wake_point memcow-lanes-post-auth >/dev/null
+	wait "$bg" 2>/dev/null
+	out=$(cat "$OUTPUTDIR/r1nc.out")
+	ck_match "sabotage detected: with fence 3 off the stale-nonce backend is admitted into epoch 1 and its command runs" \
+		'r1-cmd-ran' "$out"
+	detach_point memcow-skip-admission
+	detach_point memcow-lanes-post-auth
+	ck_no_crash
+}
+
+# ===========================================================================
+# R2 -- §7.3 (b): a straggler that is SIGSTOPped after the SIGTERM
+#
+# The fence terminates every unregistered backend in the lane and waits to
+# OBSERVE each one dead.  A stopped process cannot die: the SIGTERM stays
+# pending.  The reset must fail closed on its timeout -- lane still closed,
+# epoch unchanged, NOTHING published (no reclaim pending, no old attachment)
+# -- and once the straggler is continued the pending SIGTERM kills it and a
+# retry succeeds.
+# ===========================================================================
+
+R2_stopped_straggler()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow_lanes
+	local dboid out pid_a pid_s seq
+	dboid=$(lane_oid)
+
+	sess_open A 7
+	pid_a=$(sess_query A 7 "SELECT pg_backend_pid()")
+	psql_ctl -c "SELECT memcow_lane_register($dboid, $pid_a)" >/dev/null
+	sess_query A 7 "UPDATE public.events SET kind = 'r2' WHERE event_id = 1" >/dev/null
+
+	sess_open S 9
+	pid_s=$(sess_query S 9 "SELECT pg_backend_pid()")
+	seq=$(sess_send S 9 "BEGIN; UPDATE public.accounts SET balance = 0 WHERE account_id = 1; SELECT pg_sleep(60);")
+	wait_for_wait_event "$pid_s" PgSleep 20 || ck "straggler is inside its query" 1
+	kill -STOP "$pid_s" && ck "straggler SIGSTOPped" 0 || ck "straggler SIGSTOPped" 1
+
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 1500)")
+	ck_match "reset FAILS CLOSED on its timeout: the straggler did not exit" \
+		'ERROR:.*straggler backend [0-9]+ did not exit within' "$out"
+	ck_match "... and says the epoch is unchanged and nothing was published" 'nothing was published' "$out"
+	ck_eq "epoch unchanged" 0 "$(lane_status "$dboid" epoch)"
+	ck_eq "lane is closed (RESETTING), not retired" RESETTING "$(lane_status "$dboid" state)"
+	ck_eq "no reclaim pending (never published)" f "$(lane_status "$dboid" reclaim_pending)"
+	ck_eq "no old-epoch attachment" 0 "$(lane_status "$dboid" attached_old)"
+	out=$(psql_ctl -c "SELECT count(*) FROM pg_stat_activity WHERE pid = $pid_s")
+	ck_eq "the stopped straggler is still there" 1 "$out"
+
+	kill -CONT "$pid_s"
+	if wait_for_pid_gone "$pid_s" 20; then
+		ck "continued: the pending SIGTERM killed the straggler" 0
+	else
+		ck "continued: the pending SIGTERM killed the straggler" 1
+	fi
+	sess_wait S "$seq" 5 || true
+	ck_match "the straggler's client saw the termination" \
+		'FATAL:.*terminating connection|server closed the connection|connection to server was lost' \
+		"$(sess_output S "$seq")"
+
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 5000)")
+	ck_eq "retry succeeds -> epoch 1" 1 "$out"
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	out=$(sess_query A 7 "SELECT public.memcow_backend_reset(); SELECT 'kind', kind FROM public.events WHERE event_id = 1; SELECT 'bal', balance FROM public.accounts WHERE account_id = 1")
+	ck_match "retained backend adopted epoch 1" '^1$' "$out"
+	ck_match "epoch 1: the committed epoch-0 write is reverted" '^kind\|logout$' "$out"
+	ck_nomatch "epoch 1: the straggler's uncommitted write is not there" '^bal\|0$' "$out"
+
+	sess_close S 9
+	sess_close A 7
+	ck_no_crash
+}
+
+# The sabotage: no SIGSTOP.  The straggler then dies of the SIGTERM at once
+# and the very first reset SUCCEEDS -- if the case's "fails closed" assertion
+# held here too, the fence would be timing out on live-and-killable
+# stragglers, i.e. measuring the timeout rather than the stop.
+nc_R2_stopped_straggler()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow_lanes
+	local dboid out pid_s seq
+	dboid=$(lane_oid)
+	sess_open S 9
+	pid_s=$(sess_query S 9 "SELECT pg_backend_pid()")
+	seq=$(sess_send S 9 "BEGIN; UPDATE public.accounts SET balance = 0 WHERE account_id = 1; SELECT pg_sleep(60);")
+	wait_for_wait_event "$pid_s" PgSleep 20 || ck "straggler is inside its query" 1
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 1500)")
+	ck_eq "sabotage detected: without the SIGSTOP the same reset succeeds at once" 1 "$out"
+	sess_close S 9
+	ck_no_crash
+}
+
+# ===========================================================================
+# R3 -- §7.3 (c): cancel a query with an IO in flight; release + reset at once
+#
+# What "AIO in flight" can mean under memcow, stated exactly: memcow
+# completes every read synthetically in the issuing backend, so no memcow
+# IO ever reaches an IO worker (that is Phase 1's result).  The widest
+# in-flight window that exists is the one inside pgaio_io_process_completion()
+# -- handle COMPLETED_IO, target buffer BM_IO_IN_PROGRESS, owner holding the
+# pin -- with io_method=worker configured, and that is where this parks the
+# lane backend, on test_aio's completion-wait hook (the recipe test 005
+# validated for synthetic completion).  A cancel arriving there is DEFERRED:
+# the completion runs with interrupts held, so the backend stays parked, the
+# IO completes when released, and only then does the statement error out.
+# The pool then releases and resets immediately: the reset must not wait on
+# anything (the backend is idle, the IO is done), the old arena that held the
+# pages the cancelled query read is POISONED at reclaim (assert builds), and
+# the retained backend's re-read at the new epoch is clean seed content --
+# nothing reads the poisoned memory, which is what "no use-after-free" means
+# here.  DropDatabaseBuffers()' wait on in-progress IO is exercised by R4,
+# where a non-lane process (the checkpointer) really does hold a lane buffer's
+# IO across the reset.
+# ===========================================================================
+
+R3_cancel_inflight_io()
+{
+	EXTRA_GUCS=(io_method=worker shared_preload_libraries=test_aio)
+	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
+	EXTRA_GUCS=()
+	ensure_memcow_lanes
+	ensure_pg_buffercache
+	local dboid out pid_l seq relfilenode st
+	dboid=$(lane_oid)
+	psql_ctl -c "CREATE EXTENSION IF NOT EXISTS test_aio" >/dev/null 2>&1
+
+	sess_open L 7
+	pid_l=$(sess_query L 7 "SELECT pg_backend_pid()")
+	psql_ctl -c "SELECT memcow_lane_register($dboid, $pid_l)" >/dev/null
+	out=$(sess_query L 7 "UPDATE public.events SET kind = 'r3' WHERE event_id = 1; CHECKPOINT; SELECT pg_relation_filenode('public.events')")
+	relfilenode=$(printf '%s' "$out" | tail -1)
+	ck_match "epoch 0: events page written, relfilenode known" '^[0-9]+$' "$relfilenode"
+	# evict the lane's buffers so the next read is a real (synthetic) IO
+	out=$(psql_ctl -c "SELECT count(*) FROM (SELECT pg_buffercache_evict(bufferid) FROM pg_buffercache WHERE reldatabase = $dboid) s")
+	ck_match "lane buffers evicted" '^[0-9]+$' "$out"
+
+	psql_ctl -c "SELECT inj_io_completion_wait(pid => $pid_l, relfilenode => $relfilenode, blockno => 0)" >/dev/null
+	seq=$(sess_send L 7 "SELECT count(*) FROM public.events")
+	if wait_for_wait_event "$pid_l" completion_wait 20; then
+		ck "lane backend parked inside pgaio_io_process_completion(): IO in flight" 0
+	else
+		ck "lane backend parked inside pgaio_io_process_completion(): IO in flight" 1
+	fi
+	out=$(psql_ctl -c "SELECT pg_cancel_backend($pid_l)")
+	ck_eq "cancel sent" t "$out"
+	sleep 0.5
+	ck_eq "the cancel is deferred while the IO is in flight (still parked)" completion_wait \
+		"$(psql_ctl -c "SELECT wait_event FROM pg_stat_activity WHERE pid = $pid_l")"
+
+	psql_ctl -c "SELECT inj_io_completion_continue()" >/dev/null
+	sess_wait L "$seq" 20 || ck "the statement finished after the IO completed" 1
+	out=$(sess_output L "$seq")
+	ck_match "the IO completed, then the cancel was processed: statement cancelled" \
+		'ERROR:.*canceling statement' "$out"
+	ck_nomatch "no crash, no invalid page" 'invalid page|server closed|PANIC' "$out"
+
+	# release + reset immediately: the pool's drain, then the reset
+	out=$(sess_query L 7 "ROLLBACK; DISCARD ALL;")
+	ck_eq "released: backend idle" idle "$(psql_ctl -c "SELECT state FROM pg_stat_activity WHERE pid = $pid_l")"
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 5000)")
+	ck_eq "reset does not wait on anything and succeeds -> epoch 1" 1 "$out"
+	st=$(psql_ctl -c "SELECT attached_old || '|' || reclaim_pending || '|' || poisoned_pages FROM memcow_lane_status($dboid)")
+	ck_match "no old-arena attachment, reclaim done" '^0\|false\|' "$st"
+	ck_match "the old arena was POISONED at reclaim (>= 1 page, assert build)" '\|[1-9][0-9]*$' "$st"
+
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	out=$(sess_query L 7 "SELECT public.memcow_backend_reset(); SELECT 'kind', kind FROM public.events WHERE event_id = 1; SELECT 'rows', count(*) FROM public.events")
+	ck_match "retained backend adopted epoch 1" '^1$' "$out"
+	ck_match "epoch 1: the re-read is seed content, not the poisoned old page" '^kind\|logout$' "$out"
+	ck_match "epoch 1: the whole relation reads clean" '^rows\|4000$' "$out"
+	ck_nomatch "no invalid page anywhere" 'invalid page|ERROR' "$out"
+
+	sess_close L 7
+	ck_no_crash
+}
+
+# The sabotage: the retained backend KEEPS its stale attachment
+# (memcow-skip-stale-detach: it neither drops it at the barrier nor
+# re-attaches on its next lookup).  That is a process with a live mapping of
+# epoch 0's arena -- the use-after-free candidate -- and the reset's RECLAIM
+# gate must refuse to free the arena under it: ERROR "still attached", epoch
+# published but reclaim pending.  The case's "reset succeeds, poisoned" path
+# is therefore what carries it.  Once the backend exits, a retry finishes.
+nc_R3_cancel_inflight_io()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow_lanes
+	ensure_injection_points "$CONTROL_DB"
+	local dboid out pid_l
+	dboid=$(lane_oid)
+	sess_open L 7
+	pid_l=$(sess_query L 7 "SELECT pg_backend_pid()")
+	psql_ctl -c "SELECT memcow_lane_register($dboid, $pid_l)" >/dev/null
+	sess_query L 7 "UPDATE public.events SET kind = 'r3' WHERE event_id = 1; CHECKPOINT;" >/dev/null
+	attach_point memcow-skip-stale-detach notice >/dev/null
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 2000)")
+	ck_match "sabotage detected: a backend that keeps its stale attachment makes RECLAIM refuse" \
+		'ERROR:.*still attached to epoch 0' "$out"
+	ck_eq "epoch was published" 1 "$(lane_status "$dboid" epoch)"
+	ck_eq "reclaim pending" t "$(lane_status "$dboid" reclaim_pending)"
+	# The knob is global (IS_INJECTION_POINT_ATTACHED evaluates no PID
+	# condition), so while it is set EVERY process -- the checkpointer too --
+	# skips the barrier's detach, and a retry cannot recover the lane while it
+	# is still attached: recovery is the POSITIVE case's job (R3 proper), not
+	# this control's.  Detaching the knob and dropping the backend is enough
+	# to leave nothing running; the next case restarts the postmaster.
+	detach_point memcow-skip-stale-detach
+	sess_close L 7
+	wait_for_pid_gone "$pid_l" 20 || true
+	ck_no_crash
+}
+
+# ===========================================================================
+# R4 -- §7.3 (d): a checkpoint concurrent with a reset, the checkpointer
+#      parked inside FlushBuffer before the write lands
+#
+# The checkpointer is the one process the fence cannot stop and that writes
+# lane buffers.  Parked at memcow-checkpointer-writev -- inside FlushBuffer(),
+# holding the buffer's pin, its content lock and BM_IO_IN_PROGRESS, with
+# interrupts held (so it cannot absorb the barrier) -- while a reset runs:
+# the reset PUBLISHES epoch 1 and then WAITS at the barrier (wait event
+# ProcSignalBarrier) for the checkpointer.  Released, the checkpointer's
+# write is of an epoch-0 buffer by a process now attached to epoch 1: the
+# DISCARD WINDOW (finding 2 of 2026-09-01) drops it, counted in the lane's
+# writes_discarded, and the sweep then removes the buffer.  Variant 2 releases
+# the checkpointer BEFORE the reset: the write lands in the old arena and the
+# reset discards the arena.  Either way the page is never in the new arena:
+# after adopt every backend sees the seed's row.
+# ===========================================================================
+
+R4_checkpoint_discard()
+{
+	EXTRA_GUCS=(bgwriter_lru_maxpages=0)
+	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
+	EXTRA_GUCS=()
+	ensure_memcow_lanes
+	ensure_injection_points "$CONTROL_DB"
+	ensure_pg_buffercache
+	local dboid out pid_l pid_c seq seq2 ckpt st
+	dboid=$(lane_oid)
+	ckpt=$(checkpointer_pid)
+	ck_match "checkpointer pid known" '^[0-9]+$' "$ckpt"
+
+	sess_open L 7
+	pid_l=$(sess_query L 7 "SELECT pg_backend_pid()")
+	psql_ctl -c "SELECT memcow_lane_register($dboid, $pid_l)" >/dev/null
+	sess_open C 9 "$CONTROL_DB"
+	pid_c=$(sess_query C 9 "SELECT pg_backend_pid()")
+	sess_open C2 10 "$CONTROL_DB"
+
+	# --- variant 1: released AFTER publish -> discarded ----------------------
+	# Two dirty lane relations, so the checkpointer has at least two lane
+	# writes to make and parks on each in turn: the first one while the reset
+	# waits at the BARRIER, the second one -- after the checkpointer has
+	# absorbed the barrier between writes -- while the reset waits in the
+	# SWEEP (DropDatabaseBuffers -> InvalidateBuffer -> WaitIO, wait event
+	# BufferIo: plan Appendix B(a), "§4.7 waits").  Every write released
+	# after PUBLISH is discarded; the count must match.
+	psql_ctl -c "CHECKPOINT" >/dev/null
+	sess_query L 7 "UPDATE public.events SET kind = 'r4' WHERE event_id = 1; UPDATE public.accounts SET balance = 0 WHERE account_id = 1" >/dev/null
+	attach_point memcow-checkpointer-writev wait "$dboid" >/dev/null
+	seq2=$(sess_send C2 10 "CHECKPOINT")
+	if wait_for_wait_event "$ckpt" memcow-checkpointer-writev 30; then
+		ck "checkpointer parked inside FlushBuffer on a lane buffer" 0
+	else
+		ck "checkpointer parked inside FlushBuffer on a lane buffer" 1
+	fi
+	out=$(lane_buffers "$dboid" "AND pinning_backends > 0 AND isdirty")
+	ck_match "... holding a pinned dirty lane buffer (IO in progress)" '^[1-9]' "$out"
+
+	seq=$(sess_send C 9 "SELECT memcow_lane_reset($dboid, 60000)")
+	if wait_for_wait_event "$pid_c" ProcSignalBarrier 20; then
+		ck "the reset waits at the BARRIER for the parked checkpointer" 0
+	else
+		ck "the reset waits at the BARRIER for the parked checkpointer" 1
+	fi
+	st=$(psql_ctl -c "SELECT epoch || '|' || reclaim_pending || '|' || writes_discarded FROM memcow_lane_status($dboid)")
+	ck_eq "... having already PUBLISHED epoch 1, nothing discarded yet" '1|true|0' "$st"
+
+	# release the checkpointer, one parked write at a time, until the reset
+	# has returned; watch what the reset is waiting on meanwhile
+	local wakes=0 sweep_waited=0 i=0 ev
+	while ! sess_wait C "$seq" 1; do
+		ev=$(psql_ctl -c "SELECT wait_event FROM pg_stat_activity WHERE pid = $ckpt")
+		if [ "$ev" = memcow-checkpointer-writev ]; then
+			ev=$(psql_ctl -c "SELECT wait_event FROM pg_stat_activity WHERE pid = $pid_c")
+			[ "$ev" = BufferIo ] && sweep_waited=1
+			wake_point memcow-checkpointer-writev >/dev/null
+			wakes=$((wakes + 1))
+		fi
+		i=$((i + 1))
+		[ $i -lt 60 ] || break
+	done
+	ck_eq "reset returned epoch 1 once the checkpointer's writes were all released" 1 "$(sess_output C "$seq")"
+	sess_wait C2 "$seq2" 30 || ck "the checkpoint completed" 1
+	if [ $wakes -ge 2 ]; then
+		ck "the checkpointer parked on $wakes lane writes, one after absorbing the barrier" 0
+	else
+		ck "the checkpointer parked on at least two lane writes, got $wakes" 1
+	fi
+	ck_eq "the reset was seen waiting in the SWEEP (BufferIo) on a write the checkpointer held: DropDatabaseBuffers waits" 1 "$sweep_waited"
+	st=$(psql_ctl -c "SELECT reclaim_pending || '|' || attached_old || '|' || writes_discarded FROM memcow_lane_status($dboid)")
+	ck_eq "every write released after PUBLISH was DISCARDED (writes_discarded = $wakes), reclaim done" "false|0|$wakes" "$st"
+	ck_eq "no lane buffer survives the sweep" 0 "$(lane_buffers "$dboid")"
+	detach_point memcow-checkpointer-writev
+
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	out=$(sess_query L 7 "SELECT public.memcow_backend_reset(); SELECT 'kind', kind FROM public.events WHERE event_id = 1; SELECT 'bal', balance FROM public.accounts WHERE account_id = 1")
+	ck_match "retained backend adopted epoch 1" '^1$' "$out"
+	ck_match "epoch 1: the flushed events page is NOT in the new arena (seed row)" '^kind\|logout$' "$out"
+	ck_nomatch "epoch 1: nor the accounts page" '^bal\|0$' "$out"
+	out=$(psql -c "SELECT 'kind', kind FROM public.events WHERE event_id = 1")
+	ck_match "fresh backend agrees" '^kind\|logout$' "$out"
+
+	# --- variant 2: released BEFORE the reset -> lands in the old arena --------
+	sess_query L 7 "UPDATE public.events SET kind = 'r4b' WHERE event_id = 1" >/dev/null
+	attach_point memcow-checkpointer-writev wait "$dboid" >/dev/null
+	seq2=$(sess_send C2 10 "CHECKPOINT")
+	wait_for_wait_event "$ckpt" memcow-checkpointer-writev 30 || ck "variant 2: checkpointer parked" 1
+	wake_until_done C2 "$seq2" memcow-checkpointer-writev 30 || ck "variant 2: checkpoint completed" 1
+	detach_point memcow-checkpointer-writev
+	st=$(psql_ctl -c "SELECT writes_discarded FROM memcow_lane_status($dboid)")
+	ck_eq "variant 2: nothing more discarded (the write landed in epoch 1's arena)" "$wakes" "$st"
+	sess_query L 7 "DISCARD ALL" >/dev/null
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 5000)")
+	ck_eq "variant 2: reset -> epoch 2 discards the arena" 2 "$out"
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	out=$(sess_query L 7 "SELECT public.memcow_backend_reset(); SELECT 'kind', kind FROM public.events WHERE event_id = 1")
+	ck_match "variant 2: epoch 2 sees the seed row" '^kind\|logout$' "$out"
+
+	sess_close C2 10
+	sess_close C 9
+	sess_close L 7
+	ck_no_crash
+}
+
+# The sabotage: the discard window switched off (memcow-writev-skip-discard).
+# The checkpointer, released after PUBLISH and attached to epoch 1, then
+# stores the epoch-0 page INTO THE NEW ARENA, and after adopt every backend
+# reads 'r4' at epoch 1 -- the cross-epoch artifact finding 2 closed.  The
+# case's "seed row after reset" assertion must fail here.
+nc_R4_checkpoint_discard()
+{
+	EXTRA_GUCS=(bgwriter_lru_maxpages=0)
+	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
+	EXTRA_GUCS=()
+	ensure_memcow_lanes
+	ensure_injection_points "$CONTROL_DB"
+	local dboid out pid_l pid_c seq seq2 ckpt
+	dboid=$(lane_oid)
+	ckpt=$(checkpointer_pid)
+	sess_open L 7
+	pid_l=$(sess_query L 7 "SELECT pg_backend_pid()")
+	psql_ctl -c "SELECT memcow_lane_register($dboid, $pid_l)" >/dev/null
+	sess_open C 9 "$CONTROL_DB"
+	pid_c=$(sess_query C 9 "SELECT pg_backend_pid()")
+	sess_open C2 10 "$CONTROL_DB"
+	psql_ctl -c "CHECKPOINT" >/dev/null
+	sess_query L 7 "UPDATE public.events SET kind = 'r4' WHERE event_id = 1" >/dev/null
+	attach_point memcow-writev-skip-discard notice >/dev/null
+	attach_point memcow-checkpointer-writev wait "$dboid" >/dev/null
+	seq2=$(sess_send C2 10 "CHECKPOINT")
+	wait_for_wait_event "$ckpt" memcow-checkpointer-writev 30 || ck "checkpointer parked" 1
+	seq=$(sess_send C 9 "SELECT memcow_lane_reset($dboid, 60000)")
+	wait_for_wait_event "$pid_c" ProcSignalBarrier 20 || ck "reset at the barrier" 1
+	wake_until_done C "$seq" memcow-checkpointer-writev 60 || ck "reset completed" 1
+	sess_wait C2 "$seq2" 30 || true
+	detach_point memcow-checkpointer-writev
+	detach_point memcow-writev-skip-discard
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	out=$(sess_query L 7 "SELECT public.memcow_backend_reset(); SELECT 'kind', kind FROM public.events WHERE event_id = 1")
+	ck_match "sabotage detected: without the discard window the flush landed in the NEW arena (cross-epoch artifact 'r4' at epoch 1)" \
+		'^kind\|r4$' "$out"
+	sess_close C2 10; sess_close C 9; sess_close L 7
+	ck_no_crash
+}
+
+# ===========================================================================
+# R5 -- §7.3 (e): sinval for a nailed catalog delivered to parked pool
+#      backends between PUBLISH and the barrier (plan Appendix B(h))
+#
+# Two registered backends sit idle through a reset parked right after PUBLISH
+# (memcow-lane-reset-after-publish).  A relcache invalidation for a nailed
+# SHARED catalog is queued -- CREATE ROLE then VACUUM (ANALYZE) pg_authid
+# changes its reltuples, an in-place pg_class update whose relcache inval
+# carries dbId 0 (inval.c: relisshared -> InvalidOid), delivered to every
+# database -- and a catchup interrupt is sent to both backends so they
+# process it while idle.
+#
+# ONE FACT ABOUT THE ENGINE, LOAD-BEARING FOR THIS TEST: catchup MARKS the
+# nailed entry invalid but does NOT read pg_class for it.  An UNUSED nailed
+# relation (refcnt == 1) takes RelationInvalidateRelation() in
+# RelationFlushRelation(), which only sets rd_isvalid = false; the pg_class
+# read (RelationReloadNailed) is DEFERRED to the entry's next open.  So the
+# sinval arms the reload and the backend's next catalog touch performs it.
+# This test makes that touch happen deterministically, still inside the
+# publish->barrier window, by asking each parked backend for the pg_authid
+# count: that reopens pg_authid, RelationReloadNailed() reads the LANE's
+# pg_class, and -- because the barrier has not run, the backend has not
+# adopted -- it creates buffers tagged with the lane after PUBLISH.  Those
+# buffers are the hazard.  Every lane buffer is evicted first, so their
+# reappearance is unambiguous; then the reset is released (barrier, SWEEP)
+# and NONE may survive the buffer-pool scan.  The negative control shows the
+# CONTENT half: a pre-publish epoch-0 page left resident is read stale by a
+# fresh backend when the sweep is skipped.
+# ===========================================================================
+
+R5_sinval_nailed()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow_lanes
+	ensure_injection_points "$CONTROL_DB"
+	ensure_pg_buffercache
+	local dboid out pid_a pid_b pid_c seq n i
+	dboid=$(lane_oid)
+
+	sess_open A 7; sess_open B 8
+	pid_a=$(sess_query A 7 "SELECT pg_backend_pid()")
+	pid_b=$(sess_query B 8 "SELECT pg_backend_pid()")
+	psql_ctl -c "SELECT memcow_lane_register($dboid, $pid_a), memcow_lane_register($dboid, $pid_b)" >/dev/null
+	out=$(sess_query A 7 "UPDATE public.events SET kind = 'r5' WHERE event_id = 1; CREATE TABLE r5_tbl(x int); INSERT INTO r5_tbl VALUES (1); SELECT count(*) FROM pg_authid; CHECKPOINT; SELECT 'ok'")
+	ck_match "epoch 0: catalog and data pages written and flushed" '^ok$' "$out"
+	# both backends open pg_authid (a nailed SHARED catalog) so the sinval below
+	# reaches them; reading pg_class warms their nailed pg_class too
+	sess_query B 8 "SELECT count(*) FROM pg_authid; SELECT count(*) FROM pg_class; SELECT count(*) FROM public.events" >/dev/null
+	sess_open C 9 "$CONTROL_DB"
+	pid_c=$(sess_query C 9 "SELECT pg_backend_pid()")
+
+	attach_point memcow-lane-reset-after-publish wait >/dev/null
+	seq=$(sess_send C 9 "SELECT memcow_lane_reset($dboid, 60000)")
+	if wait_for_wait_event "$pid_c" memcow-lane-reset-after-publish 20; then
+		ck "reset parked after PUBLISH, before the barrier" 0
+	else
+		ck "reset parked after PUBLISH, before the barrier" 1
+	fi
+	ck_eq "epoch 1 is published, reclaim pending" '1|true' \
+		"$(psql_ctl -c "SELECT epoch || '|' || reclaim_pending FROM memcow_lane_status($dboid)")"
+
+	# Make the rebuild observable: evict EVERY lane buffer.  (pg_class is a
+	# MAPPED catalog, so its buffer tag carries a relmap filenode, not its OID
+	# 1259 -- filtering on 1259 would evict nothing and see nothing; the count
+	# of all buffers tagged with the lane is the honest instrument.)  Any lane
+	# buffer that appears after this, while the reset is parked, was created
+	# after PUBLISH.
+	psql_ctl -c "SELECT count(*) FROM (SELECT pg_buffercache_evict(bufferid) FROM pg_buffercache WHERE reldatabase = $dboid) s" >/dev/null
+	ck_eq "every lane buffer evicted while the reset is parked" 0 "$(lane_buffers "$dboid")"
+
+	# the sinval: change a nailed SHARED catalog's stats so a relcache inval
+	# (dbId 0, delivered to every database) is queued for pg_authid
+	out=$(psql_ctl -c "CREATE ROLE r5_role_a" -c "CREATE ROLE r5_role_b" -c "CREATE ROLE r5_role_c" \
+		-c "VACUUM (ANALYZE) pg_authid" -c "SELECT 'sent'")
+	ck_match "nailed-catalog invalidation queued" '^sent$' "$out"
+	out=$(psql_ctl -c "SELECT memcow_lane_catchup($pid_a), memcow_lane_catchup($pid_b)")
+	ck_nomatch "catchup interrupts delivered to both parked backends" 'ERROR' "$out"
+	# catchup marks the nailed pg_authid invalid but defers the pg_class read
+	# (unused nailed rel); still no lane buffers yet
+	sleep 0.5
+	ck_eq "catchup alone reads nothing (the nailed reload is deferred)" 0 "$(lane_buffers "$dboid")"
+	# the parked backends' next catalog touch performs the deferred reload,
+	# reading the LANE's pg_class in the publish->barrier window
+	sess_query A 7 "SELECT count(*) FROM pg_authid" >/dev/null
+	sess_query B 8 "SELECT count(*) FROM pg_authid" >/dev/null
+	n=$(lane_buffers "$dboid")
+	if [ "${n:-0}" -gt 0 ]; then
+		ck "the nailed reload read the lane's pg_class: $n lane buffer(s) created after PUBLISH, before the barrier" 0
+	else
+		ck "the nailed reload read the lane's pg_class: lane buffers created after PUBLISH" 1
+	fi
+
+	wake_point memcow-lane-reset-after-publish >/dev/null
+	sess_wait C "$seq" 60 || ck "the reset completed" 1
+	ck_eq "reset returned epoch 1" 1 "$(sess_output C "$seq")"
+	detach_point memcow-lane-reset-after-publish
+	ck_eq "BUFFER-POOL SCAN: no buffer tagged with the lane survives the post-barrier sweep" 0 "$(lane_buffers "$dboid")"
+	ck_eq "no old-arena attachment after the reset returned" 0 "$(lane_status "$dboid" attached_old)"
+
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	out=$(sess_query A 7 "SELECT public.memcow_backend_reset(); SELECT 'kind', kind FROM public.events WHERE event_id = 1; SELECT 'tbl', count(*) FROM pg_class WHERE relname = 'r5_tbl'")
+	ck_match "A adopted epoch 1" '^1$' "$out"
+	ck_match "A: the seed row is back" '^kind\|logout$' "$out"
+	ck_match "A: the epoch-0 relation is gone" '^tbl\|0$' "$out"
+	out=$(sess_query B 8 "SELECT public.memcow_backend_reset(); SELECT 'kind', kind FROM public.events WHERE event_id = 1")
+	ck_match "B adopted epoch 1 and sees the seed row" '^kind\|logout$' "$out"
+	out=$(psql -c "SELECT 'kind', kind FROM public.events WHERE event_id = 1; SELECT 'tbl', count(*) FROM pg_class WHERE relname = 'r5_tbl'")
+	ck_match "fresh backend: the seed row" '^kind\|logout$' "$out"
+	ck_match "fresh backend: no epoch-0 relation" '^tbl\|0$' "$out"
+
+	psql_ctl -c "DROP ROLE IF EXISTS r5_role_a, r5_role_b, r5_role_c" >/dev/null
+	sess_close C 9; sess_close B 8; sess_close A 7
+	ck_no_crash
+}
+
+# The sabotage: the SWEEP switched off (memcow-lane-skip-sweep).  Every
+# buffer tagged with the lane survives the reset, the scan finds them, and
+# the epoch-0 'events' page -- flushed clean by the CHECKPOINT and never
+# evicted -- is a buffer hit for a fresh backend at epoch 1: it reads 'r5'.
+# The case's scan assertion must fail here, and the artifact is visible.
+nc_R5_sinval_nailed()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow_lanes
+	ensure_injection_points "$CONTROL_DB"
+	ensure_pg_buffercache
+	local dboid out pid_a
+	dboid=$(lane_oid)
+	sess_open A 7
+	pid_a=$(sess_query A 7 "SELECT pg_backend_pid()")
+	psql_ctl -c "SELECT memcow_lane_register($dboid, $pid_a)" >/dev/null
+	sess_query A 7 "UPDATE public.events SET kind = 'r5' WHERE event_id = 1; CHECKPOINT;" >/dev/null
+	attach_point memcow-lane-skip-sweep notice >/dev/null
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 5000)")
+	ck_eq "reset -> epoch 1 (sweep skipped)" 1 "$out"
+	detach_point memcow-lane-skip-sweep
+	ck_match "sabotage detected: lane buffers survived the reset" '^[1-9]' "$(lane_buffers "$dboid")"
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	out=$(psql -c "SELECT 'kind', kind FROM public.events WHERE event_id = 1")
+	ck_match "sabotage detected: a fresh backend reads the epoch-0 page from a surviving buffer (cross-epoch artifact)" \
+		'^kind\|r5$' "$out"
+	sess_close A 7
 	ck_no_crash
 }
 

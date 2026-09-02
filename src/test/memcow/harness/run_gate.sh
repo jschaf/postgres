@@ -16,9 +16,32 @@
 # differential run that must produce zero diffs.
 #
 # Phase 1 is the plan's falsification slice.  Phase 2 is the lane reset
-# (plan §7.2).  Phases 3-4 are NOT implemented: their subjects (the pool and
-# the race tests, the benchmarks) do not exist yet.  They exit 3 with a clear
-# message.  They must never be made to pass by stubbing.
+# (plan §7.2).  Phase 3 is the pool, the races and the pool-driven soak
+# (plan §3, §7.3).  Phase 4 is NOT implemented: its subject (the benchmarks)
+# does not exist yet.  It exits 3 with a clear message and must never be
+# made to pass by stubbing.
+#
+# ---------------------------------------------------------------------------
+# PHASE 3, and what it does and does not prove
+# ---------------------------------------------------------------------------
+#
+# §7.3's gate is the five deterministic races (a)-(e), each with a negative
+# control, plus -- because the pool now exists -- §7.2's soak driven through
+# it.  So phase 3 runs, and requires all of:
+#
+#   (1) slice/slice_tests.sh --phase 3: S15 (the authentication-time fence,
+#       plan §5 I2 fence 2 of 3), S16 (the per-lane arena limit, CONCERN 4a)
+#       and R1-R5, the §7.3 races (a)-(e) made deterministic with injection
+#       points and SIGSTOP;
+#   (2) the same seven under --negative-control;
+#   (3) harness/pool_soak.sh, the §7.2 loop through pool/memcow_pool.py with
+#       the same per-reset verifications as reset_soak.sh, MEMCOW_SOAK_ITERATIONS
+#       resets (default 10000; fewer is a smoke run and the summary says so).
+#
+# It does NOT run phases 1-2 again.  Phase 3 changed the engine (auth fence,
+# fence timeout leaves the lane closed, poison on reclaim, arena limit, the
+# checkpointer injection point in writev), so both must be re-run after it;
+# separate invocations on purpose, so that each verdict is attributable.
 #
 # ---------------------------------------------------------------------------
 # PHASE 2, and what it does and does not prove
@@ -430,12 +453,103 @@ MSG
 	fi
 	exit $rc
 	;;
-3|4)
-	cat >&2 <<MSG
-run_gate.sh: phase $phase is NOT IMPLEMENTED.
+3)
+	echo "run_gate.sh: phase 3 -- pool, races (plan §7.3), pool-driven soak"
+	need_seed_and_pgdata
 
-    Its subject does not exist yet in this tree.  Phase 3 needs the client
-    pool and the race tests; phase 4 needs the benchmarks.
+	work="$MEMCOW_GATE_WORKDIR/phase3"
+	mkdir -p "$work"
+	rc=0
+
+	# --- (1) the auth fence, the arena limit, the five races ---------------
+	if "$slice/slice_tests.sh" \
+		--seed "$seed" --pgdata "$pgdata" --ram-mount "$ram_mount" \
+		--build-dir "$build_dir" --outputdir "$work/slice" --phase 3
+	then
+		slice_result=PASS
+	else
+		slice_result=FAIL
+		rc=1
+	fi
+
+	# --- (2) their negative controls -------------------------------------
+	if "$slice/slice_tests.sh" \
+		--seed "$seed" --pgdata "$pgdata" --ram-mount "$ram_mount" \
+		--build-dir "$build_dir" --outputdir "$work/slice-nc" --phase 3 \
+		--negative-control
+	then
+		nc_result=PASS
+	else
+		nc_result=FAIL
+		rc=1
+	fi
+
+	# --- (3) the soak, through the pool ------------------------------------
+	iterations=${MEMCOW_SOAK_ITERATIONS:-10000}
+	if "$here/pool_soak.sh" \
+		--seed "$seed" --pgdata "$pgdata" --ram-mount "$ram_mount" \
+		--build-dir "$build_dir" --outputdir "$work/pool-soak" \
+		--iterations "$iterations"
+	then
+		soak_result=PASS
+	else
+		soak_result=FAIL
+		rc=1
+	fi
+	if [ "$iterations" -lt 10000 ]; then
+		soak_note="  NOTE: MEMCOW_SOAK_ITERATIONS=$iterations is below §7.2's 10,000.
+             This run is a smoke run, not the §7.2 gate."
+	else
+		soak_note=
+	fi
+	latency=$(grep '^resets:' "$work/pool-soak/"*.log 2>/dev/null | tail -1)
+	[ -n "$latency" ] || latency=$(python3 -c "
+import json,sys
+try:
+    r=json.load(open('$work/pool-soak/report.json'))
+    print('reset p50=%.1fms p99=%.1fms; cycle p50=%.1fms p99=%.1fms; lease->first query p50=%.2fms p99=%.2fms' % (
+        r['reset_ms']['p50'], r['reset_ms']['p99'], r['cycle_ms']['p50'], r['cycle_ms']['p99'],
+        r['lease_first_query_ms']['p50'], r['lease_first_query_ms']['p99']))
+except Exception as e:
+    print('(no report: %s)' % e)
+" 2>/dev/null)
+
+	cat <<MSG
+
+========================================================================
+PHASE 3 GATE
+------------------------------------------------------------------------
+  auth fence, arena limit, races R1-R5 (slice --phase 3)          : $slice_result
+  their negative controls (each case must FAIL when sabotaged)     : $nc_result
+  reset soak through the pool, $iterations resets (plan §7.2 via §3)  : $soak_result
+------------------------------------------------------------------------
+${soak_note:+$soak_note
+}  latency (informational; §7.4 owns the thresholds, and this is the
+             cassert build): $latency
+  not re-run here: phases 1 and 2.  Phase 3 changed the engine, so run
+             both again after it; a green phase 3 alone is not a green
+             phase 1 or 2.
+  artifacts: $work
+========================================================================
+MSG
+
+	if [ $rc -eq 0 ]; then
+		if [ "$iterations" -lt 10000 ]; then
+			echo "GATE PASS (phase 3, SMOKE: $iterations resets, not the §7.2 gate)"
+		else
+			echo "GATE PASS (phase 3, $iterations resets through the pool)"
+		fi
+	else
+		echo "GATE FAIL (phase 3)"
+	fi
+	exit $rc
+	;;
+4)
+	cat >&2 <<MSG
+run_gate.sh: phase 4 is NOT IMPLEMENTED.
+
+    Its subject does not exist yet in this tree: the benchmarks (plan §7.4)
+    wait on the cassert-vs-thresholds decision (progress.md open problem 2).
 
     This is reported as a FAILURE on purpose.  Do not stub it, do not make
     it exit 0, and do not treat a green CI line for this phase as coverage.
