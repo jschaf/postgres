@@ -15,9 +15,36 @@
 # postgres passes the harness against itself", i.e. a stock-vs-stock
 # differential run that must produce zero diffs.
 #
-# Phase 1 is the plan's falsification slice.  Phases 2-4 are NOT implemented:
-# their subjects (lane reset, the pool, the benchmarks) do not exist yet.  They
-# exit 3 with a clear message.  They must never be made to pass by stubbing.
+# Phase 1 is the plan's falsification slice.  Phase 2 is the lane reset
+# (plan §7.2).  Phases 3-4 are NOT implemented: their subjects (the pool and
+# the race tests, the benchmarks) do not exist yet.  They exit 3 with a clear
+# message.  They must never be made to pass by stubbing.
+#
+# ---------------------------------------------------------------------------
+# PHASE 2, and what it does and does not prove
+# ---------------------------------------------------------------------------
+#
+# §7.2's gate is: "memcow_lane_reset + memcow_backend_reset + minimal pool on
+# one lane.  Loop 10,000 x {DDL+DML workload -> reset -> seed-hash verify +
+# differential query}.  Verify per reset: attach-count(old epoch) == 0, DSM
+# slot count and RAM-dir size flat, pg_filenode.map byte-stable,
+# CountDBBackends gate exercised.  Fail = any cross-epoch artifact, any
+# monotonic DSM/slot growth, any leaked AIO resource."  So phase 2 runs, and
+# requires all of:
+#
+#   (1) slice/slice_tests.sh --phase 2: S11-S14, the reset's falsification
+#       slice, written before the reset was;
+#   (2) the same four under --negative-control, because a reset test that
+#       has never failed is not known to measure anything;
+#   (3) harness/reset_soak.sh, the §7.2 loop itself, with
+#       MEMCOW_SOAK_ITERATIONS resets (default 10000; lower it for a smoke
+#       run, but a gate result recorded with fewer than 10000 is not the
+#       §7.2 gate and the summary says so).
+#
+# It does NOT run the phase 1 matrix again.  Phase 2 changed the engine
+# (memcow_close detaches, smgrreleaseall calls memcow, writev has a discard
+# window), so phase 1 must be re-run after it too; that is a separate gate
+# invocation on purpose, so that each verdict is attributable.
 #
 # ---------------------------------------------------------------------------
 # PHASE 1, and what it does and does not prove
@@ -105,25 +132,11 @@ done
 
 : "${MEMCOW_GATE_WORKDIR:=${TMPDIR:-/tmp}/memcow-gate}"
 
-case $phase in
-0)
-	# Plan Phase 0 gate: the harness must show stock md agreeing with itself.
-	echo "run_gate.sh: phase 0 -- stock-vs-stock differential (must be zero diffs)"
-	mkdir -p "$MEMCOW_GATE_WORKDIR"
-	# shellcheck disable=SC2086
-	exec "$here/diff_engines.sh" \
-		--outputdir "$MEMCOW_GATE_WORKDIR/phase0" \
-		--pgdata-template "$MEMCOW_GATE_WORKDIR/phase0-template" --init \
-		--build-dir "$build_dir" \
-		--subset phase0 \
-		$extra_args
-	;;
-1)
-	echo "run_gate.sh: phase 1 -- the plan's falsification slice"
-
+need_seed_and_pgdata()
+{
 	[ -n "$seed" ] || {
 		cat >&2 <<'MSG'
-run_gate.sh: phase 1 needs a seed.
+run_gate.sh: phase $phase needs a seed.
 
     Pass --seed DIR (or set MEMCOW_SEED_DIR).  Build it with the SAME binary
     the gate will run -- the seed fingerprint pins the postgres binary's size
@@ -153,7 +166,7 @@ MSG
 	if [ -z "$pgdata" ]; then
 		[ -n "$ram_mount" ] || {
 			cat >&2 <<'MSG'
-run_gate.sh: phase 1 needs an assembled runtime PGDATA.
+run_gate.sh: phase $phase needs an assembled runtime PGDATA.
 
     Pass --pgdata DIR, or --ram-mount DIR (or set MEMCOW_RAM_MOUNT) and the
     PGDATA is taken to be <mount>/pgdata.  Assemble it with:
@@ -167,6 +180,26 @@ MSG
 	[ -n "$ram_mount" ] || ram_mount=$(dirname -- "$pgdata")
 	[ -f "$pgdata/PG_VERSION" ] ||
 		{ echo "run_gate.sh: not a data directory: $pgdata" >&2; exit 2; }
+
+}
+
+case $phase in
+0)
+	# Plan Phase 0 gate: the harness must show stock md agreeing with itself.
+	echo "run_gate.sh: phase 0 -- stock-vs-stock differential (must be zero diffs)"
+	mkdir -p "$MEMCOW_GATE_WORKDIR"
+	# shellcheck disable=SC2086
+	exec "$here/diff_engines.sh" \
+		--outputdir "$MEMCOW_GATE_WORKDIR/phase0" \
+		--pgdata-template "$MEMCOW_GATE_WORKDIR/phase0-template" --init \
+		--build-dir "$build_dir" \
+		--subset phase0 \
+		$extra_args
+	;;
+1)
+	echo "run_gate.sh: phase 1 -- the plan's falsification slice"
+
+	need_seed_and_pgdata
 
 	work="$MEMCOW_GATE_WORKDIR/phase1"
 	mkdir -p "$work"
@@ -319,13 +352,90 @@ MSG
 	fi
 	exit $rc
 	;;
-2|3|4)
+2)
+	echo "run_gate.sh: phase 2 -- lane reset (plan §7.2)"
+	need_seed_and_pgdata
+
+	work="$MEMCOW_GATE_WORKDIR/phase2"
+	mkdir -p "$work"
+	rc=0
+
+	# --- (1) the reset slice cases -------------------------------------
+	if "$slice/slice_tests.sh" \
+		--seed "$seed" --pgdata "$pgdata" --ram-mount "$ram_mount" \
+		--build-dir "$build_dir" --outputdir "$work/slice" --phase 2
+	then
+		slice_result=PASS
+	else
+		slice_result=FAIL
+		rc=1
+	fi
+
+	# --- (2) their negative controls -----------------------------------
+	if "$slice/slice_tests.sh" \
+		--seed "$seed" --pgdata "$pgdata" --ram-mount "$ram_mount" \
+		--build-dir "$build_dir" --outputdir "$work/slice-nc" --phase 2 \
+		--negative-control
+	then
+		nc_result=PASS
+	else
+		nc_result=FAIL
+		rc=1
+	fi
+
+	# --- (3) the soak --------------------------------------------------
+	iterations=${MEMCOW_SOAK_ITERATIONS:-10000}
+	if "$here/reset_soak.sh" \
+		--seed "$seed" --pgdata "$pgdata" --ram-mount "$ram_mount" \
+		--build-dir "$build_dir" --outputdir "$work/soak" \
+		--iterations "$iterations"
+	then
+		soak_result=PASS
+	else
+		soak_result=FAIL
+		rc=1
+	fi
+	if [ "$iterations" -lt 10000 ]; then
+		soak_note="  NOTE: MEMCOW_SOAK_ITERATIONS=$iterations is below §7.2's 10,000.
+             This run is a smoke run, not the §7.2 gate."
+	else
+		soak_note=
+	fi
+
+	cat <<MSG
+
+========================================================================
+PHASE 2 GATE
+------------------------------------------------------------------------
+  reset slice cases S11-S14                                        : $slice_result
+  their negative controls (each case must FAIL when sabotaged)     : $nc_result
+  reset soak, $iterations resets (plan §7.2)                          : $soak_result
+------------------------------------------------------------------------
+${soak_note:+$soak_note
+}  not re-run here: the phase 1 matrix.  Phase 2 changed the engine, so
+             run --phase 1 again after it; a green phase 2 alone is not a
+             green phase 1.
+  artifacts: $work
+========================================================================
+MSG
+
+	if [ $rc -eq 0 ]; then
+		if [ "$iterations" -lt 10000 ]; then
+			echo "GATE PASS (phase 2, SMOKE: $iterations resets, not the §7.2 gate)"
+		else
+			echo "GATE PASS (phase 2, $iterations resets)"
+		fi
+	else
+		echo "GATE FAIL (phase 2)"
+	fi
+	exit $rc
+	;;
+3|4)
 	cat >&2 <<MSG
 run_gate.sh: phase $phase is NOT IMPLEMENTED.
 
-    Its subject does not exist yet in this tree.  Phase 2 needs
-    memcow_lane_reset; phase 3 needs the client pool and the race tests;
-    phase 4 needs the benchmarks.
+    Its subject does not exist yet in this tree.  Phase 3 needs the client
+    pool and the race tests; phase 4 needs the benchmarks.
 
     This is reported as a FAILURE on purpose.  Do not stub it, do not make
     it exit 0, and do not treat a green CI line for this phase as coverage.

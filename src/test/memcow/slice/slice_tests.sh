@@ -26,6 +26,15 @@
 #   S9  documented divergences         findings: pg_relation_size returns 0
 #   S10 truncate runs in a critical section        findings: fixed; the acceptance test
 #
+#   Phase 2 (plan §4 / §7.2), written BEFORE the reset existed, per the
+#   2026-09-01 brief -- these four are the falsification slice for
+#   memcow_lane_reset and are run by run_gate.sh --phase 2:
+#
+#   S11 reset reverts a written page                 plan §4, I1
+#   S12 reset reclaims blocks_high pages             ADDENDUM §P(c), §7.2 "DSM flat"
+#   S13 reset invalidates the cached record pointer  ADDENDUM §P(d)
+#   S14 reset while a truncate is in flight          plan §4.3 fence, Appendix B(i)
+#
 # ---------------------------------------------------------------------------
 # Every case has a negative control, and it is not optional
 # ---------------------------------------------------------------------------
@@ -86,6 +95,7 @@
 #     --outputdir DIR     logs and artifacts (default: <pgdata>/../slice-out)
 #     --db NAME           database to run in (default: memcow_lane_00)
 #     --case NAME         run only this case (repeatable); default: all
+#     --phase 1|2         run only that phase's cases (S1-S10 or S11-S14)
 #     --list              list the cases and exit
 #     --negative-control  run the sabotage variant of each selected case and
 #                         require it to fail
@@ -105,10 +115,15 @@ HARNESS=$(cd -- "$HERE/../harness" && pwd)
 SEEDDIR_SCRIPTS=$(cd -- "$HERE/../seed" && pwd)
 # shellcheck source=../harness/common.sh
 . "$HARNESS/common.sh"
+# shellcheck source=../harness/sessions.sh
+. "$HARNESS/sessions.sh"
 
-ALL_CASES="S1_mixed_vectors S2_overlay_corruption S3_set_tablespace \
+PHASE1_CASES="S1_mixed_vectors S2_overlay_corruption S3_set_tablespace \
 S4_pg_prewarm S5_past_eof S6_fingerprint S7_seed_immutable S8_crash_refuses \
 S9_documented_divergences S10_truncate_crit_section"
+PHASE2_CASES="S11_reset_reverts S12_reset_reclaims S13_reset_invalidates_pin \
+S14_reset_vs_truncate"
+ALL_CASES="$PHASE1_CASES $PHASE2_CASES"
 
 SEED=
 PGDATA=
@@ -117,6 +132,7 @@ BUILD_DIR=
 OUTPUTDIR=
 DB=memcow_lane_00
 CASES=()
+PHASE=
 NEGATIVE=0
 STOP_ON_FAIL=0
 
@@ -129,6 +145,7 @@ while [ $# -gt 0 ]; do
 		--outputdir)   OUTPUTDIR=$2; shift 2 ;;
 		--db)          DB=$2; shift 2 ;;
 		--case)        CASES[${#CASES[@]}]=$2; shift 2 ;;
+		--phase)       PHASE=$2; shift 2 ;;
 		--list)        printf '%s\n' $ALL_CASES; exit 0 ;;
 		--negative-control) NEGATIVE=1; shift ;;
 		--keep-going)  STOP_ON_FAIL=0; shift ;;
@@ -156,7 +173,14 @@ mc_resolve_build "$BUILD_DIR"
 mkdir -p "$OUTPUTDIR" || mc_die "cannot create $OUTPUTDIR"
 OUTPUTDIR=$(mc_abspath "$OUTPUTDIR")
 
-[ ${#CASES[@]} -gt 0 ] || read -r -a CASES <<<"$ALL_CASES"
+if [ ${#CASES[@]} -eq 0 ]; then
+	case $PHASE in
+		'')  read -r -a CASES <<<"$ALL_CASES" ;;
+		1)   read -r -a CASES <<<"$PHASE1_CASES" ;;
+		2)   read -r -a CASES <<<"$PHASE2_CASES" ;;
+		*)   mc_die "unknown --phase $PHASE (expected 1 or 2)" ;;
+	esac
+fi
 
 for c in "${CASES[@]}"; do
 	case " $ALL_CASES " in
@@ -1384,6 +1408,570 @@ nc_S10_truncate_crit_section()
 	ck_match "sabotage detected: same work in a single backend does not crash" \
 		'^alive\|0$' "$out"
 	pg_running || { : >"$LOGFILE"; pg_start; }
+}
+
+
+# ===========================================================================
+# Phase 2 fixtures: the control connection, lane bookkeeping, and persistent
+# sessions.
+#
+# memcow_lane_reset(D) runs on a CONTROL connection that is never connected
+# to D (plan §4).  The seed builds a control database for exactly this
+# (build_seed.sh, $CONTROL_DB, cloned from template0); the memcow_lanes
+# extension is created there at test time -- the control database's overlay
+# is permanent (plan §6), so that survives every reset, but not a restart,
+# hence ensure_memcow_lanes per case.  The lane-side half of the extension
+# (memcow_backend_reset) lives in the SEED's lane databases, because anything
+# created in a lane at test time is overlay content that the reset discards.
+#
+# Two cases need a backend that stays connected ACROSS a reset (that is what
+# a retained pool backend is), so there is a small persistent-session helper
+# below: a psql reading a FIFO, driven with sess_query.  bash 3.2 compatible
+# on purpose (macOS /bin/bash), hence the explicit fd numbers.
+# ===========================================================================
+
+CONTROL_DB=${MEMCOW_CONTROL_DB:-memcow_control}
+
+psql_ctl()
+{
+	PGHOST=$SOCKDIR PGPORT=$PORT "$MC_BINDIR/psql" -X -q -A -t \
+		-d "$CONTROL_DB" -v ON_ERROR_STOP=0 "$@" 2>&1
+}
+
+ensure_memcow_lanes()
+{
+	psql_ctl -c "CREATE EXTENSION IF NOT EXISTS memcow_lanes" >/dev/null 2>&1
+}
+
+ensure_injection_points()	# ensure_injection_points [DB]
+{
+	PGHOST=$SOCKDIR PGPORT=$PORT "$MC_BINDIR/psql" -X -q -A -t -d "${1:-$DB}" \
+		-c "CREATE EXTENSION IF NOT EXISTS injection_points" >/dev/null 2>&1
+}
+
+lane_oid()
+{
+	psql_ctl -c "SELECT oid FROM pg_database WHERE datname = '$DB'"
+}
+
+# lane_status OID FIELD --- one column of memcow_lane_status(OID)
+lane_status()
+{
+	psql_ctl -c "SELECT $2 FROM memcow_lane_status($1)"
+}
+
+# dsm_files --- how many dynamic shared memory segments exist RIGHT NOW.
+# Only meaningful under dynamic_shared_memory_type=mmap, where every segment
+# is a file in pg_dynshmem/; that is the one implementation whose segments
+# can be counted from outside the server without trusting memcow's own
+# bookkeeping, which is the point of counting them.
+dsm_files()
+{
+	find "$PGDATA/pg_dynshmem" -name 'mmap.*' 2>/dev/null | wc -l | tr -d ' '
+}
+
+# --- persistent sessions: sess_open / sess_query / ... are in
+# --- harness/sessions.sh, shared with reset_soak.sh
+# wake_until_done NAME SEQ POINT [TIMEOUT] --- wake POINT from the control
+# connection until session NAME's command SEQ has completed; rc 1 on timeout.
+# Repeated on purpose: a backend can reach the same point more than once in
+# one command, and a wakeup that finds nobody waiting is an ERROR that is
+# simply retried.
+wake_until_done()
+{
+	local name=$1 seq=$2 point=$3 timeout=${4:-30} i=0
+	while ! sess_wait "$name" "$seq" 1; do
+		psql_ctl -c "SELECT injection_points_wakeup('$point')" >/dev/null 2>&1
+		i=$((i + 1))
+		[ $i -lt $timeout ] || return 1
+	done
+}
+
+# wait_for_wait_event PID EVENT [TIMEOUT] --- poll pg_stat_activity from the
+# control connection until PID reports wait_event EVENT; rc 1 on timeout.
+wait_for_wait_event()
+{
+	local pid=$1 ev=$2 timeout=${3:-20} i=0 got
+	while :; do
+		got=$(psql_ctl -c "SELECT wait_event FROM pg_stat_activity WHERE pid = $pid")
+		[ "$got" = "$ev" ] && return 0
+		i=$((i + 1))
+		[ $i -lt $((timeout * 10)) ] || return 1
+		sleep 0.1
+	done
+}
+
+# ===========================================================================
+# S11 -- reset reverts a written page (plan §4, invariant I1)
+#
+# The whole reason the engine exists.  Epoch 0 does the three things a test
+# does to a lane -- update a seed row, create a relation, drop a seed relation
+# (an UNLOGGED one, so the init fork's whiteout is reverted too) -- and
+# checkpoints, so every page is in the overlay rather than merely dirty in
+# shared buffers.  Then memcow_lane_reset(D).  Afterwards a FRESH backend must
+# see exactly the seed, and a RETAINED backend -- one that was connected
+# through the reset, registered and idle, the shape of a pool connection --
+# must see exactly the seed after memcow_backend_reset(), and nothing before
+# it is allowed to have served it a stale page.
+#
+# The admission fence is asserted on the way: while the lane is RESETTING a
+# new connection is refused before its first command, and once the lane is
+# opened ARMED, a connection has to present the lane's nonce.
+# ===========================================================================
+
+S11_reset_reverts()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow_lanes
+	local dboid out epoch nonce pid digest_seed digest_after
+	dboid=$(lane_oid)
+	ck_match "lane database oid resolved" '^[0-9]+$' "$dboid"
+
+	# The seed's own digest, taken from a freshly restarted server before
+	# anything has been written: the value every epoch has to come back to.
+	digest_seed=$(psql -c "SELECT md5(string_agg(relname || ':' || nrows || ':' || digest, ',' ORDER BY relname))
+  FROM public.memcow_seed_digest")
+	ck_match "seed digest taken before the workload" '^[0-9a-f]{32}$' "$digest_seed"
+
+	# --- epoch 0 workload ---------------------------------------------
+	out=$(psql -c "
+UPDATE public.events SET kind = 'epoch-zero' WHERE event_id = 1;
+CREATE TABLE s11_new AS SELECT 42 AS x;
+DROP TABLE public.staging CASCADE;  -- takes memcow_seed_digest with it
+CHECKPOINT;
+SELECT 'kind', kind FROM public.events WHERE event_id = 1;
+SELECT 'new', count(*) FROM pg_class WHERE relname = 's11_new';
+SELECT 'staging', count(*) FROM pg_class WHERE relname = 'staging';
+")
+	ck_match "epoch 0: the updated row is visible"       '^kind\|epoch-zero$' "$out"
+	ck_match "epoch 0: the created relation exists"      '^new\|1$'           "$out"
+	ck_match "epoch 0: the dropped seed relation is gone" '^staging\|0$'      "$out"
+
+	# --- a retained backend, registered and idle ---------------------
+	sess_open A 7
+	pid=$(sess_query A 7 "SELECT pg_backend_pid()")
+	ck_match "retained session A connected" '^[0-9]+$' "$pid"
+	out=$(sess_query A 7 "SELECT 'kind', kind FROM public.events WHERE event_id = 1")
+	ck_match "session A saw the epoch-0 page (so its caches are warm)" '^kind\|epoch-zero$' "$out"
+	out=$(psql_ctl -c "SELECT memcow_lane_register($dboid, $pid)")
+	ck_nomatch "session A registered with the lane" 'ERROR' "$out"
+
+	# --- the reset ----------------------------------------------------
+	epoch=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
+	ck_eq "memcow_lane_reset(D) returned epoch 1" 1 "$epoch"
+
+	# Checked BEFORE anything reconnects: a new backend rewrites the init
+	# file as part of its own startup, which would mask a reset that failed
+	# to remove it.
+	if [ -e "$PGDATA/base/$dboid/pg_internal.init" ]; then
+		ck "reset removed base/<D>/pg_internal.init" 1
+	else
+		ck "reset removed base/<D>/pg_internal.init" 0
+	fi
+	if cmp -s "$PGDATA/base/$dboid/pg_filenode.map" "$SEED/base/$dboid/pg_filenode.map"; then
+		ck "base/<D>/pg_filenode.map is byte-identical to the seed's" 0
+	else
+		ck "base/<D>/pg_filenode.map is byte-identical to the seed's" 1
+	fi
+	ck_eq "lane state after reset is RESETTING (admission closed)" RESETTING \
+		"$(lane_status "$dboid" state)"
+
+	out=$(psql -c "SELECT 1")
+	ck_match "a new connection is refused while the lane is RESETTING" \
+		'FATAL:.*lane.*not open' "$out"
+
+	# --- open, unarmed: a fresh backend sees the seed ------------------
+	out=$(psql_ctl -c "SELECT memcow_lane_open($dboid, false)")
+	ck_eq "memcow_lane_open(D, arm => false) returns nonce 0" 0 "$out"
+	ck_eq "lane state is OPEN" OPEN "$(lane_status "$dboid" state)"
+
+	out=$(psql -c "
+SELECT 'kind', kind FROM public.events WHERE event_id = 1;
+SELECT 'new', count(*) FROM pg_class WHERE relname = 's11_new';
+SELECT 'staging', count(*) FROM public.staging;
+SELECT 'events', count(*) FROM public.events;
+SELECT 'digest', md5(string_agg(relname || ':' || nrows || ':' || digest, ',' ORDER BY relname))
+  FROM public.memcow_seed_digest;
+")
+	ck_match "fresh backend: the seed row is back"                 '^kind\|logout$'  "$out"
+	ck_match "fresh backend: the epoch-0 relation is gone"         '^new\|0$'        "$out"
+	ck_match "fresh backend: the dropped seed relation is back"    '^staging\|1000$' "$out"
+	ck_match "fresh backend: events has the seed's 4000 rows"      '^events\|4000$'  "$out"
+	digest_after=$(printf '%s' "$out" | sed -n 's/^digest|//p')
+	ck_eq "fresh backend: seed digest equals the seed's own" "$digest_seed" "$digest_after"
+
+	# --- the retained backend adopts -----------------------------------
+	out=$(sess_query A 7 "SELECT public.memcow_backend_reset()")
+	ck_eq "session A: memcow_backend_reset() adopted epoch 1" 1 "$out"
+	out=$(sess_query A 7 "
+SELECT 'kind', kind FROM public.events WHERE event_id = 1;
+SELECT 'new', count(*) FROM pg_class WHERE relname = 's11_new';
+SELECT 'staging', count(*) FROM public.staging;
+")
+	ck_match "session A: the seed row is back"              '^kind\|logout$'  "$out"
+	ck_match "session A: the epoch-0 relation is gone"      '^new\|0$'        "$out"
+	ck_match "session A: the dropped seed relation is back" '^staging\|1000$' "$out"
+	ck_nomatch "session A: no error while adopting" 'ERROR|FATAL' "$out"
+
+	# --- armed open: the nonce fence -----------------------------------
+	nonce=$(psql_ctl -c "SELECT memcow_lane_open($dboid, true)")
+	ck_match "memcow_lane_open(D, arm => true) returns a nonce" '^[1-9][0-9]*$' "$nonce"
+	out=$(psql -c "SELECT 1")
+	ck_match "armed lane: a connection without the nonce is refused" 'FATAL:.*nonce' "$out"
+	out=$(PGOPTIONS="-c memcow_lane_nonce=$((nonce + 1))" psql -c "SELECT 1")
+	ck_match "armed lane: a connection with a stale nonce is refused" 'FATAL:.*nonce' "$out"
+	out=$(PGOPTIONS="-c memcow_lane_nonce=$nonce" psql -c "SELECT 1")
+	ck_match "armed lane: a connection with the current nonce is admitted" '^1$' "$out"
+	# The retained backend was admitted at epoch 0 and stays: the fence is
+	# for NEW connections; retained ones are the registry's business.
+	out=$(sess_query A 7 "SELECT 1")
+	ck_match "retained session A is unaffected by arming" '^1$' "$out"
+
+	sess_close A 7
+	ck_no_crash
+}
+
+# The sabotage: everything the same, but no memcow_lane_reset(D) in the
+# middle (the lane is merely closed and reopened).  The case's central
+# assertion -- the epoch-0 write is gone -- must then fail.
+nc_S11_reset_reverts()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow_lanes
+	local dboid out
+	dboid=$(lane_oid)
+	psql -c "UPDATE public.events SET kind = 'epoch-zero' WHERE event_id = 1; CHECKPOINT;" >/dev/null
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	out=$(psql -c "SELECT 'kind', kind FROM public.events WHERE event_id = 1")
+	ck_match "sabotage detected: without a reset the epoch-0 write persists" \
+		'^kind\|epoch-zero$' "$out"
+	ck_no_crash
+}
+
+# ===========================================================================
+# S12 -- reset reclaims blocks_high pages (ADDENDUM §P(c); §7.2 "DSM flat")
+#
+# memcow_truncate() cannot free (it runs in a critical section), so a fork
+# keeps its overlay pages up to its peak size until unlink or reset.  A
+# 200,000-row table filled, emptied and VACUUM-truncated to zero blocks is
+# therefore ~13 MB of arena that nothing but the reset can reclaim.  The
+# instrument is NOT memcow's own accounting: under
+# dynamic_shared_memory_type=mmap every DSM segment is a file in
+# pg_dynshmem/, so the segment count is observable from outside the server.
+# It must go up when the arena grows and come back to exactly the post-reset
+# baseline after the next reset -- the old arena's segments, all of them,
+# gone.
+# ===========================================================================
+
+S12_reset_reclaims()
+{
+	EXTRA_GUCS=(dynamic_shared_memory_type=mmap)
+	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
+	EXTRA_GUCS=()
+	ensure_memcow_lanes
+	local dboid out n1 n2 n3 bytes
+	dboid=$(lane_oid)
+
+	# Reset once first so the baseline is "a lane at a fresh epoch", which
+	# is the state every later reset has to return to.
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
+	ck_eq "reset #1 -> epoch 1" 1 "$out"
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	n1=$(dsm_files)
+	ck_match "baseline DSM segment count measured" '^[0-9]+$' "$n1"
+
+	out=$(psql \
+		-c "CREATE TABLE s12 AS SELECT i, repeat('x', 400) AS pad FROM generate_series(1, 200000) i" \
+		-c "DELETE FROM s12" \
+		-c "VACUUM (TRUNCATE on) s12" \
+		-c "CHECKPOINT")
+	ck_nomatch "fill, empty and truncate raised no error" 'ERROR' "$out"
+	ck_eq "s12 is 0 blocks after the truncate" 0 "$(fork_nblocks s12)"
+
+	bytes=$(lane_status "$dboid" arena_bytes)
+	ck_match "arena reports its size" '^[0-9]+$' "$bytes"
+	if [ "${bytes:-0}" -ge 12000000 ]; then
+		ck "the truncated fork's pages are retained in the arena (>= 12 MB)" 0
+	else
+		ck "the truncated fork's pages are retained in the arena (>= 12 MB), got $bytes" 1
+	fi
+	n2=$(dsm_files)
+	if [ "$n2" -ge $((n1 + 2)) ]; then
+		ck "DSM segment count grew with the arena ($n1 -> $n2)" 0
+	else
+		ck "DSM segment count grew with the arena ($n1 -> $n2)" 1
+	fi
+
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
+	ck_eq "reset #2 -> epoch 2" 2 "$out"
+	ck_eq "no attachment to the old epoch remains" 0 "$(lane_status "$dboid" attached_old)"
+	ck_eq "reclaim is not pending" f "$(lane_status "$dboid" reclaim_pending)"
+	n3=$(dsm_files)
+	ck_eq "DSM segment count is back to the baseline (old arena destroyed)" "$n1" "$n3"
+	bytes=$(lane_status "$dboid" arena_bytes)
+	if [ "${bytes:-0}" -lt 4000000 ]; then
+		ck "the new epoch's arena is small (< 4 MB)" 0
+	else
+		ck "the new epoch's arena is small (< 4 MB), got $bytes" 1
+	fi
+
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	out=$(psql -c "SELECT 'gone', count(*) FROM pg_class WHERE relname = 's12'")
+	ck_match "s12 does not exist at epoch 2" '^gone\|0$' "$out"
+
+	ck_no_crash
+}
+
+# The sabotage: no reset #2.  The segments must then still be there, i.e.
+# the "back to baseline" assertion is what carries this case.
+nc_S12_reset_reclaims()
+{
+	EXTRA_GUCS=(dynamic_shared_memory_type=mmap)
+	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
+	EXTRA_GUCS=()
+	ensure_memcow_lanes
+	local dboid n1 n2
+	dboid=$(lane_oid)
+	psql_ctl -c "SELECT memcow_lane_reset($dboid)" >/dev/null
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	n1=$(dsm_files)
+	psql -c "CREATE TABLE s12 AS SELECT i, repeat('x', 400) AS pad FROM generate_series(1, 200000) i" \
+	     -c "DELETE FROM s12" -c "VACUUM (TRUNCATE on) s12" -c "CHECKPOINT" >/dev/null
+	n2=$(dsm_files)
+	if [ "$n2" -gt "$n1" ]; then
+		ck "sabotage detected: without a reset the arena's segments remain ($n1 -> $n2)" 0
+	else
+		ck "sabotage detected: without a reset the arena's segments remain ($n1 -> $n2)" 1
+	fi
+	ck_no_crash
+}
+
+# ===========================================================================
+# S13 -- reset invalidates the cached record pointer (ADDENDUM §P(d))
+#
+# memcow_nblocks() caches a raw pointer to the fork's overlay record in the
+# backend, so that memcow_truncate() -- inside a critical section -- can
+# re-lock it without walking shared memory.  After a reset that record lives
+# in a DISCARDED arena.  A retained backend that warmed the pin at epoch 0
+# and truncates at epoch 1 must therefore (a) notice the pin is stale on its
+# next memcow_nblocks() and re-pin, and (b) truncate through the fresh pin,
+# never through the allocating fallback.  memcow's per-backend counters make
+# both observable; the truncate landing in the right epoch, and being
+# reverted by the next reset, make it correct.
+# ===========================================================================
+
+S13_reset_invalidates_pin()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow_lanes
+	local dboid out pid c_before c_after
+	dboid=$(lane_oid)
+
+	sess_open A 7
+	pid=$(sess_query A 7 "SELECT pg_backend_pid()")
+	psql_ctl -c "SELECT memcow_lane_register($dboid, $pid)" >/dev/null
+	ensure_pg_prewarm
+
+	# Warm the pin: a seq scan sizes the fork through smgrnblocks().
+	out=$(sess_query A 7 "SELECT 'rows', count(*) FROM public.events")
+	ck_match "session A sized public.events at epoch 0" '^rows\|4000$' "$out"
+	c_before=$(sess_query A 7 "SELECT value FROM public.memcow_backend_counters() WHERE name = 'nblocks_pin_refresh'")
+	ck_match "counter readable" '^[0-9]+$' "$c_before"
+
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
+	ck_eq "reset -> epoch 1" 1 "$out"
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	out=$(sess_query A 7 "SELECT public.memcow_backend_reset()")
+	ck_eq "session A adopted epoch 1" 1 "$out"
+
+	# The truncate.  pg_prewarm went with the overlay, so recreate it here.
+	out=$(sess_query A 7 "
+CREATE EXTENSION IF NOT EXISTS pg_prewarm;
+DELETE FROM public.events;
+VACUUM (TRUNCATE on) public.events;
+SELECT 'nblocks', pg_prewarm('public.events', 'prefetch', 'main');
+SELECT name || '=' || value FROM public.memcow_backend_counters()
+ WHERE name IN ('nblocks_pin_refresh', 'truncate_pinned', 'truncate_traversed', 'truncate_allocated');
+" 60)
+	ck_nomatch "session A: DELETE + VACUUM raised no error and did not crash" \
+		'ERROR|FATAL|server closed' "$out"
+	ck_match "session A: the fork is 0 blocks after the truncate" '^nblocks\|0$' "$out"
+	c_after=$(printf '%s' "$out" | sed -n 's/^nblocks_pin_refresh=//p')
+	if [ -n "$c_after" ] && [ "$c_after" -gt "$c_before" ]; then
+		ck "the stale epoch-0 pin was detected and refreshed ($c_before -> $c_after)" 0
+	else
+		ck "the stale epoch-0 pin was detected and refreshed ($c_before -> ${c_after:-?})" 1
+	fi
+	ck_match "the truncate went through the (fresh) pinned record" '^truncate_pinned=[1-9]' "$out"
+	ck_match "the truncate never needed the allocating fallback"    '^truncate_allocated=0$' "$out"
+
+	# It landed in epoch 1 -- another backend agrees -- and the next reset
+	# takes it away again.
+	out=$(psql -c "SELECT 'rows', count(*) FROM public.events")
+	ck_match "a fresh backend sees the epoch-1 truncate" '^rows\|0$' "$out"
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
+	ck_eq "reset -> epoch 2" 2 "$out"
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	out=$(psql -c "SELECT 'rows', count(*) FROM public.events")
+	ck_match "epoch 2: the truncate is reverted" '^rows\|4000$' "$out"
+
+	sess_close A 7
+	ck_no_crash
+}
+
+# The sabotage: the same session does the same warm-up and truncate with no
+# reset in between.  The pin is then legitimately fresh and the refresh
+# counter must NOT move -- if the case's "stale pin detected" assertion held
+# here too, it would be measuring the truncate, not the reset.
+nc_S13_reset_invalidates_pin()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow_lanes
+	local out c_before c_after
+	sess_open A 7
+	ensure_pg_prewarm
+	sess_query A 7 "SELECT count(*) FROM public.events" >/dev/null
+	c_before=$(sess_query A 7 "SELECT value FROM public.memcow_backend_counters() WHERE name = 'nblocks_pin_refresh'")
+	out=$(sess_query A 7 "
+DELETE FROM public.events;
+VACUUM (TRUNCATE on) public.events;
+SELECT name || '=' || value FROM public.memcow_backend_counters()
+ WHERE name IN ('nblocks_pin_refresh', 'truncate_pinned');
+" 60)
+	c_after=$(printf '%s' "$out" | sed -n 's/^nblocks_pin_refresh=//p')
+	ck_eq "sabotage detected: without a reset the pin is not refreshed" "$c_before" "$c_after"
+	ck_match "... while the truncate still used the pin" '^truncate_pinned=[1-9]' "$out"
+	sess_close A 7
+	ck_no_crash
+}
+
+# ===========================================================================
+# S14 -- reset while a truncate is in flight in another backend
+#         (plan §4.3 FENCE, Appendix B(i), ADDENDUM §A / §P(a))
+#
+# A backend parked INSIDE memcow_truncate() -- inside RelationTruncate()'s
+# critical section, via the memcow-truncate-before-whiteout injection point
+# -- is the worst possible moment for a reset: it holds no transaction id,
+# so an xid check would call it idle, and it cannot be interrupted, so a
+# SIGTERM cannot make it go away.  Two variants:
+#
+#   registered   the pool claims the backend is idle and it is not.  The
+#                reset must REFUSE (backend not idle), publish nothing, and
+#                leave the epoch unchanged; once the truncate completes a
+#                retry succeeds and the epoch-0 truncate is discarded.
+#   unregistered a straggler.  The reset SIGTERMs it, it cannot die inside
+#                the critical section, and the reset must FAIL CLOSED on its
+#                timeout -- lane retired, epoch unchanged -- rather than
+#                publish over a live writer.
+# ===========================================================================
+
+S14_reset_vs_truncate()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow_lanes
+	ensure_injection_points
+	ensure_injection_points "$CONTROL_DB"
+	local dboid out pid seq
+	dboid=$(lane_oid)
+
+	sess_open B 8
+	pid=$(sess_query B 8 "SELECT pg_backend_pid()")
+	psql_ctl -c "SELECT memcow_lane_register($dboid, $pid)" >/dev/null
+
+	# --- variant 1: registered but not idle -----------------------------
+	# Attach first, THEN load: injection_points_load() copies the point's
+	# shmem definition into this backend's cache, and it is the cached copy
+	# that INJECTION_POINT_CACHED() in memcow_truncate() runs, without
+	# allocating, inside the critical section.
+	out=$(sess_query B 8 "
+SELECT injection_points_set_local();
+SELECT injection_points_attach('memcow-truncate-before-whiteout', 'wait');
+SELECT injection_points_load('memcow-truncate-before-whiteout');
+DELETE FROM public.events;
+")
+	ck_nomatch "session B armed the injection point and emptied events" 'ERROR' "$out"
+	seq=$(sess_send B 8 "VACUUM (TRUNCATE on) public.events")
+	if wait_for_wait_event "$pid" memcow-truncate-before-whiteout 20; then
+		ck "session B is parked inside memcow_truncate()" 0
+	else
+		ck "session B is parked inside memcow_truncate()" 1
+	fi
+
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 2000)")
+	ck_match "reset REFUSED: a registered backend is not idle" \
+		'ERROR:.*(not idle|active)' "$out"
+	ck_eq "epoch unchanged after the refusal" 0 "$(lane_status "$dboid" epoch)"
+	ck_eq "lane is closed (RESETTING) after the refusal" RESETTING "$(lane_status "$dboid" state)"
+
+	if wake_until_done B "$seq" memcow-truncate-before-whiteout 30; then
+		ck "session B's truncate completed after wakeup" 0
+	else
+		ck "session B's truncate completed after wakeup" 1
+	fi
+	out=$(sess_query B 8 "SELECT injection_points_detach('memcow-truncate-before-whiteout'); SELECT 'rows', count(*) FROM public.events")
+	ck_match "epoch 0 now holds the truncated relation" '^rows\|0$' "$out"
+
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 5000)")
+	ck_eq "retry succeeds once B is idle -> epoch 1" 1 "$out"
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	out=$(sess_query B 8 "SELECT public.memcow_backend_reset(); SELECT 'rows', count(*) FROM public.events")
+	ck_match "session B adopted epoch 1" '^1$' "$out"
+	ck_match "session B: the epoch-0 truncate is gone" '^rows\|4000$' "$out"
+	out=$(psql -c "SELECT 'rows', count(*) FROM public.events")
+	ck_match "fresh backend: the epoch-0 truncate is gone" '^rows\|4000$' "$out"
+
+	# --- variant 2: an unregistered straggler that cannot die -----------
+	psql_ctl -c "SELECT memcow_lane_unregister($dboid, $pid)" >/dev/null
+	ensure_injection_points
+	out=$(sess_query B 8 "
+CREATE EXTENSION IF NOT EXISTS injection_points;
+SELECT injection_points_set_local();
+SELECT injection_points_attach('memcow-truncate-before-whiteout', 'wait');
+SELECT injection_points_load('memcow-truncate-before-whiteout');
+DELETE FROM public.events;
+")
+	ck_nomatch "session B re-armed the injection point at epoch 1" 'ERROR' "$out"
+	seq=$(sess_send B 8 "VACUUM (TRUNCATE on) public.events")
+	if wait_for_wait_event "$pid" memcow-truncate-before-whiteout 20; then
+		ck "session B is parked again" 0
+	else
+		ck "session B is parked again" 1
+	fi
+
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 1500)")
+	ck_match "reset FAILS CLOSED: the straggler did not exit within the timeout" \
+		'ERROR:.*(straggler|did not exit|timed out)' "$out"
+	ck_eq "epoch unchanged after the timeout" 1 "$(lane_status "$dboid" epoch)"
+	ck_eq "lane retired after the timeout" RETIRED "$(lane_status "$dboid" state)"
+
+	wake_until_done B "$seq" memcow-truncate-before-whiteout 30 || true
+	out=$(sess_query B 8 "SELECT 1" 10 || true)
+	ck_match "the straggler died of the SIGTERM once it left the critical section" \
+		'FATAL:.*terminating connection|server closed the connection|connection to server was lost' \
+		"$(sess_output B "$seq"; printf '%s' "$out")"
+
+	sess_close B 8
+	ck_no_crash
+}
+
+# The sabotage: nothing is parked (no injection point), so the registered
+# backend really is idle when the reset runs.  The reset must then SUCCEED --
+# if the case's "refused" assertion held here too, the fence would be
+# refusing idle backends, i.e. measuring nothing.
+nc_S14_reset_vs_truncate()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow_lanes
+	local dboid out pid
+	dboid=$(lane_oid)
+	sess_open B 8
+	pid=$(sess_query B 8 "SELECT pg_backend_pid()")
+	psql_ctl -c "SELECT memcow_lane_register($dboid, $pid)" >/dev/null
+	out=$(sess_query B 8 "DELETE FROM public.events; VACUUM (TRUNCATE on) public.events;" 60)
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 2000)")
+	ck_eq "sabotage detected: with nothing in flight the reset is NOT refused" 1 "$out"
+	sess_close B 8
+	ck_no_crash
 }
 
 # ===========================================================================
