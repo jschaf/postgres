@@ -24,7 +24,7 @@
 #   S7  the seed is byte-identical     invariant I3
 #   S8  a crashed cluster will not run findings: reinit.c, Assert(!InRecovery)
 #   S9  documented divergences         findings: pg_relation_size returns 0
-#   S10 truncate runs in a critical section        <- currently FAILS, see below
+#   S10 truncate runs in a critical section        findings: fixed; the acceptance test
 #
 # ---------------------------------------------------------------------------
 # Every case has a negative control, and it is not optional
@@ -1235,22 +1235,25 @@ SELECT 'idxsize', pg_indexes_size('public.accounts');
 	ck_match "KNOWN DIVERGENCE: pg_database_size() sees only the RAM PGDATA" \
 		'^dbsize\|t$' "$out"
 
-	# --- the divergence that is a HAZARD rather than a reporting quirk ----
+	# --- the divergence that WAS a hazard, and is now a refusal ------------
 	#
 	# DROP TABLESPACE decides whether a tablespace still holds anything by
 	# scanning its directory: destroy_tablespace_directories() calls
-	# directory_is_empty() on each subdirectory (tablespace.c:754-769) and the
-	# false return is what raises "tablespace ... is not empty"
-	# (tablespace.c:527-532).  Under memcow no relation file is ever written
-	# there, so the directory is empty however much the tablespace holds, and
-	# the DROP SUCCEEDS -- removing the catalog row while the relations are
-	# still live in the overlay.  Stock md refuses.
+	# directory_is_empty() on each subdirectory (tablespace.c) and the false
+	# return is what raises "tablespace ... is not empty".  Under memcow no
+	# relation file is ever written there, so the scan always saw an empty
+	# directory and the DROP SUCCEEDED -- removing the catalog row while the
+	# relations were still live in the overlay.  DropTableSpace() now asks
+	# memcow_tablespace_in_use() first, which walks every database's overlay
+	# (and the seed's pg_tblspc/<oid>/) and refuses exactly where md does.
 	#
 	# Pinned here for the same reason as the pg_relation_size cases: this is
-	# the difference between a named, cited hazard and twenty mystery lines in
-	# the regress `tablespace` diff.  It goes last in this case because it
-	# leaves the database referring to a tablespace that no longer exists;
-	# the next case restarts, which reverts the catalog with the overlay.
+	# a named, cited core path that reaches relation storage without smgr,
+	# and the fix lives outside memcow.c.  Three things are checked: the
+	# refusal, that the catalog row survives it, and that the data is still
+	# readable afterwards.  Then the relation is dropped and the tablespace is
+	# dropped for real, which must succeed -- the check is about emptiness,
+	# not a blanket refusal (nc_S9 covers the empty case as well).
 	local tsdir="$RAM_MOUNT/slice_s9_tblspc"
 	rm -rf "$tsdir"; mkdir -p "$tsdir"
 	out=$(psql -c "CREATE TABLESPACE slice_s9_ts LOCATION '$tsdir'" \
@@ -1259,12 +1262,19 @@ SELECT 'idxsize', pg_indexes_size('public.accounts');
 		-c "CHECKPOINT" \
 		-c "SELECT 'rows', count(*) FROM s9_in_ts" \
 		-c "DROP TABLESPACE slice_s9_ts" \
-		-c "SELECT 'gone', count(*) FROM pg_tablespace WHERE spcname = 'slice_s9_ts'")
+		-c "SELECT 'gone', count(*) FROM pg_tablespace WHERE spcname = 'slice_s9_ts'" \
+		-c "SELECT 'still', count(*) FROM s9_in_ts")
 	ck_match "  the tablespace really did hold a populated relation" '^rows\|5000$' "$out"
-	ck_nomatch "KNOWN DIVERGENCE (HAZARD): DROP TABLESPACE does NOT report \"is not empty\"" \
+	ck_match "FIXED HAZARD: DROP TABLESPACE on a populated tablespace reports \"is not empty\"" \
 		'is not empty' "$out"
-	ck_match "  ... it succeeds, and the catalog row is gone while the data was live" \
-		'^gone\|0$' "$out"
+	ck_match "  ... and the catalog row survives" '^gone\|1$' "$out"
+	ck_match "  ... and the data is still readable" '^still\|5000$' "$out"
+	out=$(psql -c "DROP TABLE s9_in_ts" \
+		-c "DROP TABLESPACE slice_s9_ts" \
+		-c "SELECT 'gone', count(*) FROM pg_tablespace WHERE spcname = 'slice_s9_ts'")
+	ck_nomatch "  ... and once the relation is dropped the tablespace is droppable" \
+		'is not empty' "$out"
+	ck_match "  ... and then it is really gone" '^gone\|0$' "$out"
 
 	ck_no_crash
 }
@@ -1295,13 +1305,17 @@ nc_S9_documented_divergences()
 # ===========================================================================
 # S10 -- smgr_truncate runs inside a critical section
 #
-# ***THIS CASE CURRENTLY FAILS.  IT IS A REAL ENGINE DEFECT, NOT A TEST BUG.***
+# This case was written against the unfixed engine and FAILED there; it is a
+# real engine defect, since fixed (memcow_truncate() is now a pure whiteout
+# that re-locks a record pointer cached by memcow_nblocks() and never walks
+# the shared table; see the comments on both), and this case is the
+# acceptance criterion for that fix staying fixed.
 #
 # RelationTruncate() calls smgrtruncate() inside START_CRIT_SECTION()
 # (src/backend/catalog/storage.c:386-424; the redo path does the same at
-# :1077-1079).  memcow_truncate() frees the overlay pages it drops, and both
-# dsa_free() and dshash_delete_entry() may have to call dsa_get_address() on a
-# DSA segment this backend has not mapped yet -- which calls dsm_attach(),
+# :1077-1079).  memcow_truncate() USED TO free the overlay pages it drops, and
+# both dsa_free() and dshash_delete_entry() may have to call dsa_get_address()
+# on a DSA segment this backend has not mapped yet -- which calls dsm_attach(),
 # which palloc()s.  Allocating inside a critical section trips
 # Assert(CritSectionCount == 0 || allowInCritSection) (mcxt.c:1240) and kills
 # the backend; with restart_after_crash=off it takes the cluster with it.  On a

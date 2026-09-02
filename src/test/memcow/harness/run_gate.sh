@@ -135,6 +135,21 @@ MSG
 	}
 	[ -d "$seed" ] || { echo "run_gate.sh: no such seed directory: $seed" >&2; exit 2; }
 
+	# The harness connects as $PGUSER, or as the OS user when it is unset,
+	# and neither slice_tests.sh nor the matrix passes -U.  The seed's
+	# bootstrap superuser is whatever build_seed.sh -u said (default
+	# "postgres"), recorded in the fingerprint; default to it, so that a
+	# mismatch can only come from someone asking for a different user on
+	# purpose.  Without this every case fails with 'role "..." does not
+	# exist', which looks like an engine failure and is not.
+	if [ -z "${PGUSER:-}" ] && [ -f "$seed/memcow_seed.fingerprint" ]; then
+		PGUSER=$(sed -n 's/^seed_superuser=//p' "$seed/memcow_seed.fingerprint")
+		if [ -n "$PGUSER" ]; then
+			export PGUSER
+			echo "run_gate.sh: connecting as the seed's superuser: $PGUSER"
+		fi
+	fi
+
 	if [ -z "$pgdata" ]; then
 		[ -n "$ram_mount" ] || {
 			cat >&2 <<'MSG'
@@ -192,16 +207,16 @@ MSG
 	#     grep -lE 'pg_(relation|table|indexes|total_relation|database)_size' \
 	#         src/test/regress/sql/*.sql
 	# intersected with subsets/phase0.txt -> insert, temp, vacuum,
-	# vacuum_parallel.  `tablespace` is the fifth, and it is there for a
-	# DIFFERENT and more serious reason: DROP TABLESPACE decides whether a
-	# tablespace is empty by scanning its directory (tablespace.c:754-769),
-	# and under memcow that directory is empty even when the tablespace still
-	# holds relations, so the DROP succeeds where md refuses.  See the
-	# tablespace_not_empty_check rule in divergences.txt -- registering it
-	# makes the gate name the problem rather than drown in its cascade; it
-	# does not make it acceptable.
+	# vacuum_parallel.  `tablespace` used to be a fifth, for a different and
+	# more serious reason: DROP TABLESPACE decided emptiness by scanning the
+	# tablespace directory, which under memcow never holds a relation file, so
+	# the DROP succeeded where md refuses.  DropTableSpace() now consults
+	# memcow_tablespace_in_use() first, the regress `tablespace` test is
+	# byte-identical between engines again, and the allowance is gone -- the
+	# stale-allowance check below would fail the gate if it were still here.
+	# Slice case S9 pins the refusal.
 	#
-	# Every hunk in those five still has to be matched by a rule in
+	# Every hunk in those four still has to be matched by a rule in
 	# divergences.txt, and an allowance whose test runs WITHOUT diverging
 	# fails the gate, so the list cannot rot silently in either direction.
 	# Re-derive it if the subset changes.
@@ -221,8 +236,7 @@ MSG
 		--allow-engine-divergence insert \
 		--allow-engine-divergence temp \
 		--allow-engine-divergence vacuum \
-		--allow-engine-divergence vacuum_parallel \
-		--allow-engine-divergence tablespace
+		--allow-engine-divergence vacuum_parallel
 	# shellcheck disable=SC2086
 	if "$here/io_matrix.sh" "$@" $extra_args; then
 		matrix=PASS
