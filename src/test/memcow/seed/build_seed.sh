@@ -219,8 +219,15 @@ sha256_of_stdin()
 
 file_bytes()
 {
-	# BSD stat and GNU stat disagree; try both.
-	stat -f %z "$1" 2>/dev/null || stat -c %s "$1"
+	# BSD stat and GNU stat disagree, and "try BSD first" is not safe: on
+	# GNU stat -f means --file-system, which prints a multi-line report to
+	# stdout before failing on the "%z" operand, so the fallback's number
+	# would be appended to garbage.  Detect GNU (only it has --version).
+	if stat --version >/dev/null 2>&1; then
+		stat -c %s "$1"
+	else
+		stat -f %z "$1"
+	fi
 }
 
 lane_db_name()

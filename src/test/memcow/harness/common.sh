@@ -111,22 +111,28 @@ with open(os.path.join(bd, 'meson-info', 'meson-info.json')) as f:
     mi = json.load(f)
 src = mi['directories']['source']
 prefix = None
+libdir = 'lib'
 with open(os.path.join(bd, 'meson-info', 'intro-buildoptions.json')) as f:
     for o in json.load(f):
         if o['name'] == 'prefix':
             prefix = o['value']
+        elif o['name'] == 'libdir':
+            # 'lib' on macOS, 'lib/<multiarch>' on Debian-family Linux;
+            # tmp_install mirrors whatever meson was told.
+            libdir = o['value']
         elif o['name'] == 'cassert':
             print('MC_BUILD_CASSERT=%s' % ('yes' if o['value'] else 'no'))
         elif o['name'] == 'injection_points':
             print('MC_BUILD_INJECTION_POINTS=%s' % ('yes' if o['value'] else 'no'))
 print('MC_SRC_DIR=%s' % src)
 print('MC_PREFIX=%s' % prefix)
+print('MC_LIBDIR_REL=%s' % libdir)
 PY
 	) || mc_die "cannot read meson introspection data from $MC_BUILD_DIR"
 	eval "$info"
 
 	: "${MC_BINDIR:=$MC_BUILD_DIR/tmp_install$MC_PREFIX/bin}"
-	: "${MC_LIBDIR:=$MC_BUILD_DIR/tmp_install$MC_PREFIX/lib}"
+	: "${MC_LIBDIR:=$MC_BUILD_DIR/tmp_install$MC_PREFIX/$MC_LIBDIR_REL}"
 	: "${MC_PG_REGRESS:=$MC_BUILD_DIR/src/test/regress/pg_regress}"
 	: "${MC_REGRESS_SRC:=$MC_SRC_DIR/src/test/regress}"
 	: "${MC_DLPATH:=$MC_BUILD_DIR/src/test/regress}"
@@ -145,7 +151,8 @@ PY
 	fi
 
 	# The tmp_install binaries were linked against an install prefix that does
-	# not exist; point the dynamic loader at the staged libdir.
+	# not exist; point the dynamic loader at the staged libdir.  (On Linux the
+	# RUNPATH names that prefix, so without this psql cannot find libpq.)
 	case "$(uname -s)" in
 		Darwin) export DYLD_LIBRARY_PATH="$MC_LIBDIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" ;;
 		*)      export LD_LIBRARY_PATH="$MC_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;

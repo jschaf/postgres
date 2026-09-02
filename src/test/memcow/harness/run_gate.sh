@@ -262,6 +262,35 @@ MSG
 		uring=COVERED
 	fi
 
+	# The io_uring paragraph is written from what the matrix REPORTED, not
+	# from uname: a Linux build without liburing is as incomplete as macOS,
+	# and only "MATRIX COVERAGE: COMPLETE" in summary.txt means all twelve
+	# cells ran.
+	if [ "$uring" = COVERED ]; then
+		uring_text="  io_uring:  all 12 matrix cells ran on $(uname -s) $(uname -r); the
+             io_uring cells are included in the matrix verdict above.
+             Note what that does and does not show: io_uring is the only
+             io_method with wait_one/check_one, so these cells are the
+             only ones on which pgaio_io_complete_synthetic()'s
+             PGAIO_HF_SYNCHRONOUS flag is live at all -- but a green cell
+             is still only evidence that nothing raced into the window
+             the flag guards.  The flag itself is pinned by
+             src/test/modules/test_aio/t/005_synthetic_completion.pl
+             (concurrent-waiter subtest); run that suite on this host too."
+	else
+		uring_text="  io_uring:  this build offers no io_uring io_method ($(uname -s): no
+             liburing), so 4 of the 12 matrix cells are ENUMERATED AS
+             UNAVAILABLE and were not run.  Phase 1 on this host is
+             therefore, at best,
+                 \"PASS on the available cells, io_uring UNVERIFIED\"
+             and must not be recorded as a full Phase 1 pass.  In
+             particular pgaio_io_complete_synthetic()'s
+             PGAIO_HF_SYNCHRONOUS flag is dead code here: io_uring is the
+             only io_method with wait_one/check_one, so every green cell
+             above is equally consistent with that flag being absent.
+             See progress.md open problem 3 for what a Linux runner owes."
+	fi
+
 	cat <<MSG
 
 ========================================================================
@@ -270,16 +299,7 @@ PHASE 1 GATE
   differential matrix (io_method x cold/hot x temp, A=md B=memcow) : $matrix
   memcow slice tests (plan §7.1 items 1-4 plus the findings)       : $slice_result
 ------------------------------------------------------------------------
-  io_uring:  $(uname -s) has no liburing, so 4 of the 12 matrix cells are
-             ENUMERATED AS UNAVAILABLE and were not run.  Phase 1 on this
-             host is therefore, at best,
-                 "PASS on the macOS cells, io_uring UNVERIFIED"
-             and must not be recorded as a full Phase 1 pass.  In
-             particular pgaio_io_complete_synthetic()'s
-             PGAIO_HF_SYNCHRONOUS flag is dead code here: io_uring is the
-             only io_method with wait_one/check_one, so every green cell
-             above is equally consistent with that flag being absent.
-             See progress.md open problem 3 for what a Linux runner owes.
+$uring_text
   autovacuum=off (plan §6) diverges \`cluster\` from upstream expected
              output by way of index_update_stats() (index.c:2896-2908);
              carried as --allow-expected-failure, which never relaxes the
@@ -289,7 +309,11 @@ PHASE 1 GATE
 MSG
 
 	if [ $rc -eq 0 ]; then
-		echo "GATE PASS (phase 1, macOS cells; io_uring $uring)"
+		if [ "$uring" = COVERED ]; then
+			echo "GATE PASS (phase 1, all 12 matrix cells; io_uring $uring)"
+		else
+			echo "GATE PASS (phase 1, available cells only; io_uring $uring)"
+		fi
 	else
 		echo "GATE FAIL (phase 1)"
 	fi

@@ -114,6 +114,16 @@ opts=(
 	"-Ddocs_pdf=disabled"
 )
 
+# io_uring is the only io_method with wait_one/check_one, i.e. the only one
+# that can tell whether pgaio_io_complete_synthetic()'s PGAIO_HF_SYNCHRONOUS
+# flag is live.  It needs liburing, which exists only on Linux; make it a
+# hard requirement there so a Linux gate build cannot silently lose the four
+# io_uring matrix cells.  Elsewhere leave it to meson's auto-detection
+# (which finds nothing), so this script keeps working on macOS.
+if [ "$(uname -s)" = Linux ]; then
+	opts+=("-Dliburing=enabled")
+fi
+
 # pkg-config search path: the same Homebrew kegs build-fast uses, minus any
 # that are not installed here.  A caller-supplied PKG_CONFIG_PATH is appended.
 pkg_paths=()

@@ -7,7 +7,8 @@
 #
 # Given a seed built by build_seed.sh, this:
 #
-#     1. attaches a RAM disk and mounts it            (macOS: hdiutil + newfs_hfs)
+#     1. attaches a RAM disk and mounts it            (macOS: hdiutil + newfs_hfs;
+#                                                     Linux: a tmpfs you mounted)
 #     2. mirrors the seed's directory tree into <mount>/pgdata
 #     3. copies every NON-relation file across; relation-fork segment files are
 #        left behind in the seed, where memcow will mmap them PROT_READ
@@ -52,6 +53,23 @@
 #
 # Non-journaled HFS+ is deliberate: journaling on a volume whose entire point
 # is to be volatile is pure overhead.
+#
+# ---------------------------------------------------------------------------
+# Linux
+# ---------------------------------------------------------------------------
+# Linux has tmpfs, and mounting one needs root, so this script does not try:
+# it requires that the mount point ALREADY be on a tmpfs and refuses anything
+# else.  The RAM-backing is verified the same way hdiutil is consulted on
+# macOS -- `stat -f -c %T <dir>` must say "tmpfs" -- and nothing is attached,
+# resized or detached; --detach only removes the assembled PGDATA and leaves
+# the tmpfs mounted.  Set it up once with
+#
+#     sudo mkdir -p /mnt/ram
+#     sudo mount -t tmpfs -o size=2g tmpfs /mnt/ram
+#     sudo chown "$USER" /mnt/ram
+#
+# (a directory under /dev/shm also qualifies).  -z is ignored on Linux: the
+# size is whatever the tmpfs was mounted with.
 #
 # ---------------------------------------------------------------------------
 # Sizing
@@ -157,8 +175,9 @@ log() { printf '[assemble_ramdir] %s\n' "$*" >&2; }
 die() { printf '[assemble_ramdir] ERROR: %s\n' "$*" >&2; exit 1; }
 
 case $(uname -s) in
-	Darwin) ;;
-	*) die "this script implements the macOS RAM-disk path only (uname=$(uname -s)); on Linux use tmpfs and skip the attach/detach steps" ;;
+	Darwin) OS=darwin ;;
+	Linux)  OS=linux ;;
+	*) die "this script implements the macOS (hdiutil) and Linux (tmpfs) paths only (uname=$(uname -s))" ;;
 esac
 
 # ---------------------------------------------------------------------------
@@ -170,6 +189,14 @@ esac
 # ours" -- which is the fail-closed answer everywhere it is used.
 ram_dev_for_mount()
 {
+	if [ "$OS" = linux ]; then
+		# The "device" is the filesystem type; tmpfs is RAM by definition.
+		[ -d "$1" ] || return 0
+		if [ "$(stat -f -c %T "$1" 2>/dev/null)" = tmpfs ]; then
+			printf 'tmpfs\n'
+		fi
+		return 0
+	fi
 	hdiutil info 2>/dev/null | awk -v mp="$1" '
 		/^=+$/            { isram = 0; next }
 		/^image-path/     { isram = ($0 ~ /ram:\/\//); next }
@@ -187,6 +214,10 @@ ram_dev_for_mount()
 
 ramdisk_size_mb()
 {
+	if [ "$OS" = linux ]; then
+		df -Pm "$RAM_MOUNT" 2>/dev/null | awk 'NR == 2 { print $2 }'
+		return 0
+	fi
 	# $1 = /dev/diskN
 	hdiutil info 2>/dev/null | awk -v want="$1" '
 		/^=+$/        { sectors = 0; isram = 0; next }
@@ -198,6 +229,8 @@ ramdisk_size_mb()
 ramdisk_attach()
 {
 	local sectors dev
+
+	[ "$OS" = linux ] && die "no tmpfs at $RAM_MOUNT; on Linux mount one first: sudo mount -t tmpfs -o size=${RAMDISK_MB}m tmpfs $RAM_MOUNT && sudo chown \$USER $RAM_MOUNT"
 
 	sectors=$((RAMDISK_MB * 2048))    # 512-byte sectors
 	log "attaching ram://$sectors (${RAMDISK_MB} MB)"
@@ -252,7 +285,11 @@ do_status()
 	printf 'device     %s\n' "$dev"
 	printf 'mount      %s\n' "$RAM_MOUNT"
 	printf 'pgdata     %s\n' "$PGDATA_DIR"
-	printf 'ram_backed yes (hdiutil image-path is ram://)\n'
+	if [ "$OS" = linux ]; then
+		printf 'ram_backed yes (stat -f says tmpfs)\n'
+	else
+		printf 'ram_backed yes (hdiutil image-path is ram://)\n'
+	fi
 	printf 'size_mb    %s\n' "$(ramdisk_size_mb "$dev")"
 	df -h "$RAM_MOUNT" | sed 's/^/df         /'
 	mount | grep " on $RAM_MOUNT " | sed 's/^/mount      /'
@@ -282,6 +319,14 @@ do_detach()
 		else
 			die "a postmaster (pid $pid) is still running on $PGDATA_DIR; stop it or re-run with -f"
 		fi
+	fi
+
+	if [ "$OS" = linux ]; then
+		# Nothing to detach: the tmpfs is the administrator's.  Just drop
+		# what we assembled on it.
+		rm -rf "${PGDATA_DIR:?}" "$MARKER"
+		log "removed $PGDATA_DIR; the tmpfs at $RAM_MOUNT stays mounted (sudo umount to free it)"
+		return 0
 	fi
 
 	log "detaching $dev"
@@ -475,7 +520,12 @@ do_assemble()
 			"$PG_BINDIR/pg_ctl" -D "$PGDATA_DIR" -m immediate -w stop >/dev/null 2>&1 || true
 		fi
 		existing_mb=$(ramdisk_size_mb "$dev")
-		if [ "$existing_mb" != "$RAMDISK_MB" ]; then
+		if [ "$OS" = linux ]; then
+			# The size is the tmpfs's, not ours to change; -z is advisory.
+			log "reusing tmpfs at $RAM_MOUNT (${existing_mb} MB)"
+			RAM_DEV=$dev
+			rm -rf "${PGDATA_DIR:?}"
+		elif [ "$existing_mb" != "$RAMDISK_MB" ]; then
 			log "existing RAM disk at $RAM_MOUNT is ${existing_mb} MB, want ${RAMDISK_MB} MB; recreating"
 			do_detach
 			ramdisk_attach
@@ -486,7 +536,7 @@ do_assemble()
 		fi
 	else
 		if mount | grep -q " on $RAM_MOUNT "; then
-			die "$RAM_MOUNT has something mounted on it that is not a ram:// image; refusing to use it"
+			die "$RAM_MOUNT has something mounted on it that is not RAM-backed (ram:// image on macOS, tmpfs on Linux); refusing to use it"
 		fi
 		if [ -d "$RAM_MOUNT" ] && [ -n "$(ls -A "$RAM_MOUNT" 2>/dev/null)" ]; then
 			die "$RAM_MOUNT exists, is not a mount point, and is not empty; refusing to use it"
