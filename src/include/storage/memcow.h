@@ -27,6 +27,15 @@
 extern PGDLLIMPORT bool memcow_enabled;
 extern PGDLLIMPORT char *memcow_seed_directory;
 extern PGDLLIMPORT int memcow_lane_nonce;
+extern PGDLLIMPORT int memcow_lane_arena_limit;
+
+/*
+ * The SQLSTATE raised when a lane's overlay arena reaches
+ * memcow_lane_arena_limit: class 53 (insufficient resources), with an
+ * implementation-defined subclass so that a caller can tell it from every
+ * other out-of-memory condition without parsing the message.
+ */
+#define ERRCODE_MEMCOW_ARENA_FULL	MAKE_SQLSTATE('5','3','M','C','1')
 
 /* memcow storage manager functionality */
 extern void memcow_init(void);
@@ -94,10 +103,25 @@ typedef struct MemcowLaneStatus
 	uint32		nonce;			/* 0: not armed */
 	int			nregistered;
 	int64		arena_bytes;	/* dsa total size of the published epoch */
+	int64		arena_limit;	/* dsa_set_size_limit in force, 0 = none */
 	uint32		attached;		/* attachments to the published epoch */
 	uint32		attached_old;	/* attachments to the previous epoch */
 	bool		reclaim_pending;
+	uint64		writes_discarded;	/* writes dropped in discard windows, all time */
+	uint32		poisoned_pages; /* old-arena pages poisoned by the last reclaim */
 } MemcowLaneStatus;
+
+/*
+ * What the authentication-time fence (contrib/memcow_lanes, plan §5 I2 fence
+ * 2 of 3) is told about a connection that names a database.
+ */
+typedef enum MemcowAuthVerdict
+{
+	MEMCOW_AUTH_NOT_A_LANE,		/* no slot was ever opened under that name */
+	MEMCOW_AUTH_ADMIT,			/* unarmed lane, or armed and the nonce matches */
+	MEMCOW_AUTH_REFUSE_NOT_OPEN,	/* armed lane that is RESETTING or RETIRED */
+	MEMCOW_AUTH_REFUSE_NONCE	/* armed lane, nonce absent or stale */
+} MemcowAuthVerdict;
 
 typedef struct MemcowBackendCounters
 {
@@ -111,9 +135,14 @@ typedef struct MemcowBackendCounters
 } MemcowBackendCounters;
 
 extern uint32 memcow_lane_reset(Oid dbOid, Oid spcOid, int timeout_ms);
-extern uint32 memcow_lane_open(Oid dbOid, bool arm);
+extern uint32 memcow_lane_open(Oid dbOid, bool arm, const char *datname);
+extern void memcow_lane_retire(Oid dbOid);
 extern void memcow_lane_register(Oid dbOid, int pid, bool add);
 extern void memcow_lane_status(Oid dbOid, MemcowLaneStatus *st);
+extern MemcowAuthVerdict memcow_lane_auth_check(const char *datname,
+												uint32 presented,
+												Oid *dbOid, uint32 *nonce,
+												MemcowLaneState *state);
 extern uint32 memcow_backend_adopt(void);
 extern void memcow_get_backend_counters(MemcowBackendCounters *out);
 extern const char *memcow_lane_state_name(MemcowLaneState state);

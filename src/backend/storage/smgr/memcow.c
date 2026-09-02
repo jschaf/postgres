@@ -182,6 +182,7 @@
 bool		memcow_enabled = false;
 char	   *memcow_seed_directory = NULL;
 int			memcow_lane_nonce = 0;
+int			memcow_lane_arena_limit = 0;	/* MB; 0 = no limit */
 
 /*
  * The fingerprint file is a few hundred bytes of ASCII key=value lines and the
@@ -451,12 +452,36 @@ typedef struct MemcowDbSlot
 	bool		reclaim_pending;
 	uint32		old_epoch;
 	dsa_handle	old_area;
+	dshash_table_handle old_blocks; /* so RECLAIM can poison its pages */
+
+	/*
+	 * Writes dropped in this slot's discard windows, all epochs.  A shared
+	 * counter beside the per-process one in MemcowCounters because the
+	 * process that discards is usually the checkpointer, which has no SQL
+	 * surface to report its own counters through.
+	 */
+	pg_atomic_uint64 writes_discarded;
+
+	/* what the last RECLAIM poisoned (assert-enabled builds only) */
+	uint32		poisoned_pages;
+
+	/* the dsa_set_size_limit() bound on the published arena, 0 = none */
+	size_t		arena_limit;
 
 	/* lane control plane */
 	int			state;			/* MemcowLaneState; 0 == OPEN, so memset works */
 	uint32		nonce;			/* 0 == not armed */
 	int			nregistered;
 	int			registered[MEMCOW_LANE_MAX_BACKENDS];
+
+	/*
+	 * The database's name, recorded by memcow_lane_open() so that the
+	 * authentication-time fence -- which runs before the backend has a
+	 * database and cannot look one up -- can find the lane by the name in
+	 * the startup packet.  Empty until the lane has been opened; a slot that
+	 * was only ever written to is not a lane and admits anyone.
+	 */
+	char		datname[NAMEDATALEN];
 } MemcowDbSlot;
 
 typedef struct MemcowShmemState
@@ -574,7 +599,8 @@ static void memcow_detach_db(MemcowDbLocal *db);
 static void memcow_maybe_detach_stale(void);
 static void memcow_detach_all_at_exit(int code, Datum arg);
 static MemcowDbSlot *memcow_find_slot(Oid dbOid);
-static MemcowDbSlot *memcow_create_slot(Oid dbOid, dsa_area **areap,
+static MemcowDbSlot *memcow_create_slot(Oid dbOid, size_t limit,
+										dsa_area **areap,
 										dshash_table **relsp,
 										dshash_table **blocksp);
 static void memcow_lookup_fork(SMgrRelation reln, ForkNumber forknum,
@@ -597,7 +623,8 @@ static void memcow_store_range(MemcowDbLocal *db, const MemcowRelKey *relkey,
 							   const void *const *buffers);
 pg_noreturn static void memcow_fork_missing(const RelFileLocatorBackend *rlocator,
 											ForkNumber forknum);
-pg_noreturn static void memcow_out_of_memory(BlockNumber blocknum, Oid spcOid,
+pg_noreturn static void memcow_out_of_memory(MemcowDbLocal *db,
+											 BlockNumber blocknum, Oid spcOid,
 											 RelFileNumber relNumber);
 
 static void MemcowShmemRequest(void *arg);
@@ -1384,7 +1411,8 @@ memcow_overlay(Oid dbOid, bool create)
 		 * the old arena is still valid memory for exactly this reason.
 		 */
 		if (db->epoch == pg_atomic_read_u32(&db->slot->epoch) ||
-			CritSectionCount > 0)
+			CritSectionCount > 0 ||
+			IS_INJECTION_POINT_ATTACHED("memcow-skip-stale-detach"))
 			return db;
 		memcow_detach_db(db);
 	}
@@ -1435,7 +1463,7 @@ memcow_overlay(Oid dbOid, bool create)
 		 * untouched if anything in it fails.  The creator is attached to what
 		 * it created.
 		 */
-		slot = memcow_create_slot(dbOid, &area, &rels, &blocks);
+		slot = memcow_create_slot(dbOid, 0, &area, &rels, &blocks);
 	}
 	else
 	{
@@ -1501,7 +1529,7 @@ memcow_find_slot(Oid dbOid)
  * session-scoped rather than resource-owner-scoped (see memcow_overlay()).
  */
 static void
-memcow_arena_create(dsa_area **areap, dshash_table **relsp,
+memcow_arena_create(size_t limit, dsa_area **areap, dshash_table **relsp,
 					dshash_table **blocksp)
 {
 	dsa_area   *area;
@@ -1510,6 +1538,15 @@ memcow_arena_create(dsa_area **areap, dshash_table **relsp,
 	area = dsa_create(MemcowShmem->dsa_tranche);
 	dsa_pin(area);
 	dsa_pin_mapping(area);
+
+	/*
+	 * CONCERN 4a: a bound on what one lane-epoch may hold, so that a runaway
+	 * workload fails its own statement with ERRCODE_MEMCOW_ARENA_FULL rather
+	 * than growing until the machine pages.  The limit lives in the arena's
+	 * shared control, so setting it once here binds every process.
+	 */
+	if (limit > 0)
+		dsa_set_size_limit(area, limit);
 
 	params = memcow_overlay_params(&memcow_rel_params, MemcowShmem->rel_tranche);
 	*relsp = dshash_create(area, &params, NULL);
@@ -1544,8 +1581,8 @@ memcow_arena_detach(dsa_area *area, dshash_table *rels, dshash_table *blocks)
  * if dshash_create() failed after dsa_create() succeeded.
  */
 static MemcowDbSlot *
-memcow_create_slot(Oid dbOid, dsa_area **areap, dshash_table **relsp,
-				   dshash_table **blocksp)
+memcow_create_slot(Oid dbOid, size_t limit, dsa_area **areap,
+				   dshash_table **relsp, dshash_table **blocksp)
 {
 	MemcowDbSlot *slot;
 
@@ -1557,7 +1594,7 @@ memcow_create_slot(Oid dbOid, dsa_area **areap, dshash_table **relsp,
 				 errmsg("memcow cannot hold overlays for more than %d databases",
 						MEMCOW_MAX_OVERLAY_DBS)));
 
-	memcow_arena_create(areap, relsp, blocksp);
+	memcow_arena_create(limit, areap, relsp, blocksp);
 
 	slot = &MemcowShmem->slots[MemcowShmem->nslots];
 	memset(slot, 0, sizeof(*slot));
@@ -1568,6 +1605,10 @@ memcow_create_slot(Oid dbOid, dsa_area **areap, dshash_table **relsp,
 	pg_atomic_init_u32(&slot->epoch, 0);
 	pg_atomic_init_u32(&slot->attached[0], 0);
 	pg_atomic_init_u32(&slot->attached[1], 0);
+	pg_atomic_init_u64(&slot->writes_discarded, 0);
+	slot->arena_limit = limit;
+	slot->old_area = DSA_HANDLE_INVALID;
+	slot->old_blocks = DSHASH_HANDLE_INVALID;
 	slot->state = MEMCOW_LANE_OPEN;
 	slot->in_use = true;
 
@@ -1639,6 +1680,15 @@ memcow_maybe_detach_stale(void)
 	if (gen == MemcowSeenResetGen)
 		return;
 	MemcowSeenResetGen = gen;
+
+	/*
+	 * Negative-control knob for the race tests (R3): a process that keeps a
+	 * stale attachment is what RECLAIM's attach-count gate exists to expose.
+	 * Evaluated once per reset per process, here after the generation check,
+	 * so it costs the barrier path nothing when it is not attached.
+	 */
+	if (IS_INJECTION_POINT_ATTACHED("memcow-skip-stale-detach"))
+		return;
 
 	/* the epoch reads below must not be satisfied from before the gen read */
 	pg_read_barrier();
@@ -1817,14 +1867,23 @@ memcow_lookup_fork(SMgrRelation reln, ForkNumber forknum, bool missing_ok,
  * would read as ordinary backend memory pressure.
  */
 pg_noreturn static void
-memcow_out_of_memory(BlockNumber blocknum, Oid spcOid, RelFileNumber relNumber)
+memcow_out_of_memory(MemcowDbLocal *db, BlockNumber blocknum, Oid spcOid,
+					 RelFileNumber relNumber)
 {
+	size_t		total = dsa_get_total_size(db->area);
+
+	/*
+	 * ERRCODE_MEMCOW_ARENA_FULL whether the ceiling was memcow_lane_arena_limit
+	 * or the machine: both mean "this epoch's overlay can hold no more", and
+	 * the caller's remedy is the same -- reset the lane.
+	 */
 	ereport(ERROR,
-			(errcode(ERRCODE_OUT_OF_MEMORY),
-			 errmsg("memcow overlay could not allocate shared memory"),
-			 errdetail("Failed while storing block %u of relation %u/%u.",
-					   blocknum, spcOid, relNumber),
-			 errhint("The overlay holds every page written since the server started; it is reclaimed only by DROP and TRUNCATE until lane reset exists.")));
+			(errcode(ERRCODE_MEMCOW_ARENA_FULL),
+			 errmsg("memcow overlay for database %u is full", db->dbOid),
+			 errdetail("The arena holds %zu bytes; memcow_lane_arena_limit is %d MB. Failed while storing block %u of relation %u/%u.",
+					   total, memcow_lane_arena_limit, blocknum, spcOid,
+					   relNumber),
+			 errhint("Every page written in this epoch stays in the arena until the lane is reset; reset the lane, or raise memcow_lane_arena_limit.")));
 }
 
 /*
@@ -1867,7 +1926,7 @@ memcow_relentry_lock(SMgrRelation reln, ForkNumber forknum,
 														  &found,
 														  DSHASH_INSERT_NO_OOM);
 	if (re == NULL)
-		memcow_out_of_memory(InvalidBlockNumber, key.spcOid, key.relNumber);
+		memcow_out_of_memory(db, InvalidBlockNumber, key.spcOid, key.relNumber);
 
 	if (!found)
 	{
@@ -1908,7 +1967,7 @@ memcow_store_block(MemcowDbLocal *db, MemcowBlockKey *key, const void *page)
 															 &found,
 															 DSHASH_INSERT_NO_OOM);
 	if (be == NULL)
-		memcow_out_of_memory(key->blocknum, key->spcOid, key->relNumber);
+		memcow_out_of_memory(db, key->blocknum, key->spcOid, key->relNumber);
 
 	if (!found)
 	{
@@ -1918,7 +1977,7 @@ memcow_store_block(MemcowDbLocal *db, MemcowBlockKey *key, const void *page)
 		if (!DsaPointerIsValid(be->page))
 		{
 			dshash_delete_entry(db->blocks, be);	/* also releases the lock */
-			memcow_out_of_memory(key->blocknum, key->spcOid, key->relNumber);
+			memcow_out_of_memory(db, key->blocknum, key->spcOid, key->relNumber);
 		}
 		if (page == NULL)
 		{
@@ -2929,6 +2988,24 @@ memcow_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	Assert(nblocks > 0);
 
+#ifdef USE_INJECTION_POINTS
+	/*
+	 * For the race tests (plan §7.3 d): park the CHECKPOINTER here, holding
+	 * the buffer's pin, its content lock and BM_IO_IN_PROGRESS with interrupts
+	 * held, i.e. inside FlushBuffer() and before anything memcow does.  The
+	 * database is passed as the condition string so that a test can name the
+	 * lane it means; nothing but the checkpointer ever reaches this.
+	 */
+	if (AmCheckpointerProcess())
+	{
+		char		dbstr[16];
+
+		snprintf(dbstr, sizeof(dbstr), "%u",
+				 reln->smgr_rlocator.locator.dbOid);
+		INJECTION_POINT("memcow-checkpointer-writev", dbstr);
+	}
+#endif
+
 	re = memcow_relentry_lock(reln, forknum, &db, &created);
 
 	/*
@@ -2948,10 +3025,12 @@ memcow_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	 * backends are all idle, and discarding one would break the fork
 	 * invariant for a caller that believes the block exists.
 	 */
-	if (db->slot->discard_writes)
+	if (db->slot->discard_writes &&
+		!IS_INJECTION_POINT_ATTACHED("memcow-writev-skip-discard"))
 	{
 		dshash_release_lock(db->rels, re);
 		MemcowCounters.writes_discarded++;
+		pg_atomic_fetch_add_u64(&db->slot->writes_discarded, 1);
 		return;
 	}
 
@@ -3481,6 +3560,13 @@ memcow_lane_check_enabled(void)
  * function runs on the control connection, which must never hold an
  * attachment to the lane it manages.
  */
+/* memcow_lane_arena_limit, in the unit dsa_set_size_limit() wants */
+static size_t
+memcow_lane_limit_bytes(void)
+{
+	return (size_t) memcow_lane_arena_limit * 1024 * 1024;
+}
+
 static MemcowDbSlot *
 memcow_lane_slot_locked(Oid dbOid)
 {
@@ -3492,24 +3578,45 @@ memcow_lane_slot_locked(Oid dbOid)
 		dshash_table *rels;
 		dshash_table *blocks;
 
-		slot = memcow_create_slot(dbOid, &area, &rels, &blocks);
+		slot = memcow_create_slot(dbOid, memcow_lane_limit_bytes(),
+								  &area, &rels, &blocks);
 		memcow_arena_detach(area, rels, blocks);
 	}
 	return slot;
 }
 
 static void
-memcow_lane_retire_locked(MemcowDbSlot *slot)
+memcow_lane_retire_slot_locked(MemcowDbSlot *slot)
 {
 	Assert(LWLockHeldByMeInMode(&MemcowShmem->lock, LW_EXCLUSIVE));
 	slot->state = MEMCOW_LANE_RETIRED;
 }
 
 static void
-memcow_lane_retire(MemcowDbSlot *slot)
+memcow_lane_retire_slot(MemcowDbSlot *slot)
 {
 	LWLockAcquire(&MemcowShmem->lock, LW_EXCLUSIVE);
-	memcow_lane_retire_locked(slot);
+	memcow_lane_retire_slot_locked(slot);
+	LWLockRelease(&MemcowShmem->lock);
+}
+
+/*
+ * memcow_lane_retire() -- take a lane out of service for good: admission
+ * refused at both fences, resets refused, no way back.  The pool calls this
+ * when it gives up on a lane whose reset keeps being refused (plan Appendix
+ * B(i): a refused reset leaves the lane closed and the caller reopens or
+ * retires).  Creates the slot if the lane was never touched, so that a
+ * retired lane stays retired even if nobody ever wrote to it.
+ */
+void
+memcow_lane_retire(Oid dbOid)
+{
+	MemcowDbSlot *slot;
+
+	memcow_lane_check_enabled();
+	LWLockAcquire(&MemcowShmem->lock, LW_EXCLUSIVE);
+	slot = memcow_lane_slot_locked(dbOid);
+	memcow_lane_retire_slot_locked(slot);
 	LWLockRelease(&MemcowShmem->lock);
 }
 
@@ -3577,10 +3684,11 @@ memcow_lane_register(Oid dbOid, int pid, bool add)
  * Appendix B(i): steps 6-8 are re-runnable, publication is the commit point).
  */
 uint32
-memcow_lane_open(Oid dbOid, bool arm)
+memcow_lane_open(Oid dbOid, bool arm, const char *datname)
 {
 	MemcowDbSlot *slot;
 	uint32		nonce = 0;
+	dsa_handle	area;
 
 	memcow_lane_check_enabled();
 
@@ -3610,9 +3718,101 @@ memcow_lane_open(Oid dbOid, bool arm)
 	}
 	slot->nonce = nonce;
 	slot->state = MEMCOW_LANE_OPEN;
+	if (datname != NULL)
+		strlcpy(slot->datname, datname, sizeof(slot->datname));
+	slot->arena_limit = memcow_lane_limit_bytes();
+	area = slot->area;
 	LWLockRelease(&MemcowShmem->lock);
 
+	/*
+	 * Bind memcow_lane_arena_limit to the published arena.  A reset's PREPARE
+	 * already does this for every arena it creates; this covers the epoch-0
+	 * arena of a lane something wrote to before the pool opened it, and it
+	 * makes "open" the moment a changed limit takes effect.  The attachment
+	 * is transient: a control connection must never stay attached to a lane
+	 * it manages.
+	 */
+	{
+		dsa_area   *a = dsa_attach(area);
+
+		/*
+		 * (size_t) -1 is dsa_create()'s own "no limit" sentinel (dsa.c); pass
+		 * it rather than 0, because dsa_set_size_limit(area, 0) means "no
+		 * growth beyond the initial segment", which would cap the arena at
+		 * ~1 MB the moment a lane with no configured limit is opened.
+		 */
+		dsa_set_size_limit(a, memcow_lane_arena_limit > 0
+						   ? memcow_lane_limit_bytes() : (size_t) -1);
+		dsa_detach(a);
+	}
+
 	return nonce;
+}
+
+/*
+ * memcow_lane_auth_check() -- the authentication-time fence's question.
+ *
+ * Runs in ClientAuthentication(), i.e. before the backend has a database,
+ * a transaction or a relcache, so the lane is found by NAME, which
+ * memcow_lane_open() recorded in the slot.  A database that was never
+ * opened as a lane is not one, whatever has been written to it.  An unarmed
+ * lane admits anyone; an armed lane admits only the current nonce, and only
+ * while OPEN (plan §4.1: at CLOSE "auth hook, PostgresMain admission and
+ * wrapper handout now fail for lane D").
+ *
+ * This fence is never the final one (plan A.1.3): it runs before the
+ * database startup lock and before the ProcArray advertisement, so a
+ * connection it admits can still meet a reset in the window that follows;
+ * memcow_check_admission() closes that window.  What this fence buys is
+ * that a stale connection string dies before it costs the server a database
+ * startup, and that it dies at a place a test can tell apart in the log.
+ */
+MemcowAuthVerdict
+memcow_lane_auth_check(const char *datname, uint32 presented, Oid *dbOid,
+					   uint32 *nonce, MemcowLaneState *state)
+{
+	MemcowDbSlot *slot = NULL;
+	MemcowAuthVerdict verdict;
+
+	*dbOid = InvalidOid;
+	*nonce = 0;
+	*state = MEMCOW_LANE_OPEN;
+
+	if (!memcow_enabled || MemcowShmem == NULL || datname == NULL)
+		return MEMCOW_AUTH_NOT_A_LANE;
+
+	LWLockAcquire(&MemcowShmem->lock, LW_SHARED);
+	for (int i = 0; i < MemcowShmem->nslots; i++)
+	{
+		MemcowDbSlot *cand = &MemcowShmem->slots[i];
+
+		if (cand->in_use && cand->datname[0] != '\0' &&
+			strcmp(cand->datname, datname) == 0)
+		{
+			slot = cand;
+			break;
+		}
+	}
+	if (slot != NULL)
+	{
+		*dbOid = slot->dbOid;
+		*nonce = slot->nonce;
+		*state = slot->state;
+	}
+	LWLockRelease(&MemcowShmem->lock);
+
+	if (slot == NULL)
+		verdict = MEMCOW_AUTH_NOT_A_LANE;
+	else if (*nonce == 0)
+		verdict = MEMCOW_AUTH_ADMIT;
+	else if (*state != MEMCOW_LANE_OPEN)
+		verdict = MEMCOW_AUTH_REFUSE_NOT_OPEN;
+	else if (presented != *nonce)
+		verdict = MEMCOW_AUTH_REFUSE_NONCE;
+	else
+		verdict = MEMCOW_AUTH_ADMIT;
+
+	return verdict;
 }
 
 /*
@@ -3641,6 +3841,9 @@ memcow_lane_status(Oid dbOid, MemcowLaneStatus *st)
 		st->attached = pg_atomic_read_u32(&slot->attached[epoch & 1]);
 		st->attached_old = pg_atomic_read_u32(&slot->attached[(epoch + 1) & 1]);
 		st->reclaim_pending = slot->reclaim_pending;
+		st->writes_discarded = pg_atomic_read_u64(&slot->writes_discarded);
+		st->poisoned_pages = slot->poisoned_pages;
+		st->arena_limit = (int64) slot->arena_limit;
 		area = slot->area;
 	}
 	LWLockRelease(&MemcowShmem->lock);
@@ -3690,18 +3893,28 @@ memcow_check_admission(void)
 	if (slot == NULL)
 		return;
 
+	/* negative-control knob for the race tests (R1): fence 3 switched off */
+	if (IS_INJECTION_POINT_ATTACHED("memcow-skip-admission"))
+		return;
+
+	/*
+	 * The DETAIL names the fence on purpose: the authentication fence in
+	 * contrib/memcow_lanes refuses with the same message shapes, and a test
+	 * of either has to be able to tell from the log which one fired.
+	 */
 	if (state != MEMCOW_LANE_OPEN)
 		ereport(FATAL,
 				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
 				 errmsg("memcow lane for database %u is not open (state: %s)",
-						MyDatabaseId, memcow_lane_state_name(state))));
+						MyDatabaseId, memcow_lane_state_name(state)),
+				 errdetail("Refused by the PostgresMain admission fence (plan §5 I2, fence 3 of 3).")));
 
 	if (nonce != 0 && (uint32) memcow_lane_nonce != nonce)
 		ereport(FATAL,
 				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
 				 errmsg("memcow lane nonce mismatch for database %u",
 						MyDatabaseId),
-				 errdetail("The connection presented nonce %d.",
+				 errdetail("The connection presented nonce %d; refused by the PostgresMain admission fence (plan §5 I2, fence 3 of 3).",
 						   memcow_lane_nonce)));
 }
 
@@ -3749,10 +3962,16 @@ memcow_get_backend_counters(MemcowBackendCounters *out)
 /*
  * Step 3, FENCE.  On return every backend in the lane is a registered pool
  * backend verified idle, every unregistered one has been observed dead, and
- * the ProcArray count agrees.  Otherwise it raises, and the lane is either
- * merely closed (a registered backend was busy: a pool bug, retryable once
- * the backend is idle) or retired (a straggler did not exit in time: nothing
- * about the lane can be trusted any more).
+ * the ProcArray count agrees.  Otherwise it raises and the lane stays
+ * CLOSED (RESETTING) with its epoch untouched -- whether a registered
+ * backend was busy (a pool bug, retryable once the backend is idle) or a
+ * straggler did not exit within the timeout (retryable once it has; a
+ * SIGSTOPped straggler, plan §7.3 b, is exactly this).  Nothing has been
+ * published either way, so the lane is precisely as trustworthy as before
+ * the call, and it is the pool's decision whether to retry or to
+ * memcow_lane_retire() it (plan Appendix B(i)).  The plan's §4.3 said
+ * "timeout -> lane retired"; that was stricter than the invariant needs and
+ * would have forced the pool to abandon a lane over a slow exit.
  *
  * Enumeration is by the cumulative-stats backend entries -- the same source
  * pg_stat_activity reads, and the only exported enumerator that carries the
@@ -3909,17 +4128,20 @@ memcow_lane_fence(MemcowDbSlot *slot, Oid dbOid, TimestampTz deadline,
 
 		if (GetCurrentTimestamp() >= deadline)
 		{
-			memcow_lane_retire(slot);
 			if (unknown_pid != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("memcow lane %u retired: straggler backend %d did not exit within %d ms",
-								dbOid, unknown_pid, timeout_ms)));
+						 errmsg("cannot reset memcow lane %u: straggler backend %d did not exit within %d ms",
+								dbOid, unknown_pid, timeout_ms),
+						 errdetail("The lane stays closed and its epoch is unchanged; nothing was published."),
+						 errhint("Retry once the backend is gone, or retire the lane.")));
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("memcow lane %u retired: %d backend(s) in the database but %d registered and idle, after %d ms",
-								dbOid, nbackends, nknown_idle, timeout_ms)));
+						 errmsg("cannot reset memcow lane %u: %d backend(s) in the database but %d registered and idle, after %d ms",
+								dbOid, nbackends, nknown_idle, timeout_ms),
+						 errdetail("The lane stays closed and its epoch is unchanged; nothing was published."),
+						 errhint("Retry once the backends are idle or gone, or retire the lane.")));
 		}
 
 		memcow_lane_poll_sleep();
@@ -4020,7 +4242,7 @@ memcow_lane_sweep_files(MemcowDbSlot *slot, Oid dbOid, Oid spcOid)
 	if (ourlen != seedlen || ourlen < 0 ||
 		memcmp(ours, seeds, ourlen) != 0)
 	{
-		memcow_lane_retire(slot);
+		memcow_lane_retire_slot(slot);
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("memcow lane %u retired: \"%s\" differs from the seed's copy",
@@ -4029,6 +4251,46 @@ memcow_lane_sweep_files(MemcowDbSlot *slot, Oid dbOid, Oid spcOid)
 	}
 	pfree(dbpath);
 }
+
+#ifdef USE_ASSERT_CHECKING
+/*
+ * Overwrite every overlay page of an arena nobody else is attached to.
+ * 0x7F is CLOBBER_FREED_MEMORY's pattern; no page of that content passes
+ * PageIsVerified().  Returns the page count.  The transient dshash
+ * attachment takes each partition lock in turn, uncontended by
+ * construction: the attach count was zero when the caller got here.
+ */
+static uint32
+memcow_poison_arena(dsa_area *area, dshash_table_handle blocks_handle)
+{
+	dshash_parameters params;
+	dshash_table *blocks;
+	dshash_seq_status status;
+	MemcowBlockEntry *be;
+	uint32		n = 0;
+
+	if (blocks_handle == DSHASH_HANDLE_INVALID)
+		return 0;
+
+	params = memcow_overlay_params(&memcow_block_params,
+								   MemcowShmem->block_tranche);
+	blocks = dshash_attach(area, &params, blocks_handle, NULL);
+
+	dshash_seq_init(&status, blocks, false);
+	while ((be = (MemcowBlockEntry *) dshash_seq_next(&status)) != NULL)
+	{
+		if (DsaPointerIsValid(be->page))
+		{
+			memset(dsa_get_address(area, be->page), 0x7F, BLCKSZ);
+			n++;
+		}
+	}
+	dshash_seq_term(&status);
+	dshash_detach(blocks);
+
+	return n;
+}
+#endif
 
 /*
  * Steps 6-8: BARRIER, SWEEP, RECLAIM.  Re-runnable (plan Appendix B(i)):
@@ -4041,7 +4303,9 @@ memcow_lane_finish(MemcowDbSlot *slot, Oid dbOid, Oid spcOid,
 {
 	uint32		old_epoch;
 	dsa_handle	old_area;
+	dshash_table_handle old_blocks;
 	uint32		still;
+	uint32		poisoned = 0;
 
 	/*
 	 * 6. BARRIER.  Every process runs smgrreleaseall() ->
@@ -4059,13 +4323,15 @@ memcow_lane_finish(MemcowDbSlot *slot, Oid dbOid, Oid spcOid,
 	 * no process can create an epoch-N buffer any more, so what this drops
 	 * is everything.  It waits out residual pins and in-flight IO.
 	 */
-	DropDatabaseBuffers(dbOid);
+	if (!IS_INJECTION_POINT_ATTACHED("memcow-lane-skip-sweep"))	/* R5's knob */
+		DropDatabaseBuffers(dbOid);
 	memcow_lane_sweep_files(slot, dbOid, spcOid);
 
 	LWLockAcquire(&MemcowShmem->lock, LW_EXCLUSIVE);
 	slot->discard_writes = false;
 	old_epoch = slot->old_epoch;
 	old_area = slot->old_area;
+	old_blocks = slot->old_blocks;
 	LWLockRelease(&MemcowShmem->lock);
 
 	/*
@@ -4089,6 +4355,20 @@ memcow_lane_finish(MemcowDbSlot *slot, Oid dbOid, Oid spcOid,
 	{
 		dsa_area   *area = dsa_attach(old_area);
 		dsm_segment *seg;
+
+#ifdef USE_ASSERT_CHECKING
+		/*
+		 * POISON THE OLD ARENA before it goes (plan §7.3 c).  Nobody is
+		 * counted as attached, so a page read from it after this point can
+		 * only come from a process reading through a mapping memcow does not
+		 * know about -- and without this it would read a perfectly valid
+		 * epoch-N page, a cross-epoch artifact that looks like correct data.
+		 * With it, the read fails PageIsVerified() and says so.  Assert
+		 * builds only: it walks every page of the arena.
+		 */
+		if (!IS_INJECTION_POINT_ATTACHED("memcow-reclaim-skip-poison"))
+			poisoned = memcow_poison_arena(area, old_blocks);
+#endif
 
 		dsa_unpin(area);
 		dsa_detach(area);
@@ -4117,6 +4397,8 @@ memcow_lane_finish(MemcowDbSlot *slot, Oid dbOid, Oid spcOid,
 	LWLockAcquire(&MemcowShmem->lock, LW_EXCLUSIVE);
 	slot->reclaim_pending = false;
 	slot->old_area = DSA_HANDLE_INVALID;
+	slot->old_blocks = DSHASH_HANDLE_INVALID;
+	slot->poisoned_pages = poisoned;
 	LWLockRelease(&MemcowShmem->lock);
 }
 
@@ -4204,7 +4486,7 @@ memcow_lane_reset(Oid dbOid, Oid spcOid, int timeout_ms)
 	memcow_lane_fence(slot, dbOid, deadline, timeout_ms);
 
 	/* 4. PREPARE: the arena outlives our mapping because it is pinned */
-	memcow_arena_create(&area, &rels, &blocks);
+	memcow_arena_create(memcow_lane_limit_bytes(), &area, &rels, &blocks);
 	new_area = dsa_get_handle(area);
 	new_rels = dshash_get_hash_table_handle(rels);
 	new_blocks = dshash_get_hash_table_handle(blocks);
@@ -4219,7 +4501,9 @@ memcow_lane_reset(Oid dbOid, Oid spcOid, int timeout_ms)
 	Assert(pg_atomic_read_u32(&slot->attached[new_epoch & 1]) == 0);
 	slot->old_epoch = old_epoch;
 	slot->old_area = slot->area;
+	slot->old_blocks = slot->blocks;
 	slot->reclaim_pending = true;
+	slot->arena_limit = memcow_lane_limit_bytes();
 	slot->area = new_area;
 	slot->rels = new_rels;
 	slot->blocks = new_blocks;
@@ -4229,6 +4513,13 @@ memcow_lane_reset(Oid dbOid, Oid spcOid, int timeout_ms)
 	pg_atomic_fetch_add_u32(&MemcowShmem->generation, 1);
 	pg_atomic_fetch_add_u32(&MemcowShmem->reset_generation, 1);
 	LWLockRelease(&MemcowShmem->lock);
+
+	/*
+	 * For the race tests (plan §7.3 e): the window between PUBLISH and the
+	 * barrier, where a parked pool backend can still be made to rebuild a
+	 * nailed relcache entry.  No lock is held here but the database's.
+	 */
+	INJECTION_POINT("memcow-lane-reset-after-publish", NULL);
 
 	/* 6-8 */
 	memcow_lane_finish(slot, dbOid, spcOid, deadline, timeout_ms);

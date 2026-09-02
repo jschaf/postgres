@@ -15,6 +15,11 @@ RETURNS bigint
 AS 'MODULE_PATHNAME', 'memcow_lane_open_sql'
 LANGUAGE C STRICT VOLATILE;
 
+CREATE FUNCTION memcow_lane_retire(dboid oid)
+RETURNS void
+AS 'MODULE_PATHNAME', 'memcow_lane_retire_sql'
+LANGUAGE C STRICT VOLATILE;
+
 CREATE FUNCTION memcow_lane_register(dboid oid, pid int)
 RETURNS void
 AS 'MODULE_PATHNAME', 'memcow_lane_register_sql'
@@ -28,9 +33,16 @@ LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION memcow_lane_status(dboid oid,
     OUT state text, OUT epoch bigint, OUT nonce bigint, OUT registered int,
     OUT arena_bytes bigint, OUT attached int, OUT attached_old int,
-    OUT reclaim_pending boolean)
+    OUT reclaim_pending boolean, OUT writes_discarded bigint,
+    OUT poisoned_pages bigint, OUT arena_limit bigint)
 RETURNS record
 AS 'MODULE_PATHNAME', 'memcow_lane_status_sql'
+LANGUAGE C STRICT VOLATILE;
+
+-- Test helper: deliver a sinval catchup interrupt to one backend.
+CREATE FUNCTION memcow_lane_catchup(pid int)
+RETURNS void
+AS 'MODULE_PATHNAME', 'memcow_lane_catchup_sql'
 LANGUAGE C STRICT VOLATILE;
 
 -- Lane-backend functions (plan §3.9): run in the lane, on each retained
@@ -47,8 +59,10 @@ LANGUAGE C STRICT VOLATILE;
 
 REVOKE ALL ON FUNCTION memcow_lane_reset(oid, int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_lane_open(oid, boolean) FROM PUBLIC;
+REVOKE ALL ON FUNCTION memcow_lane_retire(oid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_lane_register(oid, int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_lane_unregister(oid, int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_lane_status(oid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION memcow_lane_catchup(int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_backend_reset() FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_backend_counters() FROM PUBLIC;
