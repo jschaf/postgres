@@ -105,6 +105,8 @@ extern void *dshash_find_or_insert_extended(dshash_table *hash_table,
 extern bool dshash_delete_key(dshash_table *hash_table, const void *key);
 extern void dshash_delete_entry(dshash_table *hash_table, void *entry);
 extern void dshash_release_lock(dshash_table *hash_table, void *entry);
+extern void dshash_lock_entry(dshash_table *hash_table, void *entry,
+							  bool exclusive);
 
 /* Find or insert with error on out-of-memory. */
 #define dshash_find_or_insert(hash_table, key, found) \

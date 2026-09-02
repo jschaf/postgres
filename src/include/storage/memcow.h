@@ -66,4 +66,7 @@ extern void memcow_registersync(SMgrRelation reln, ForkNumber forknum);
 extern int	memcow_fd(SMgrRelation reln, ForkNumber forknum,
 					  BlockNumber blocknum, uint32 *off);
 
+/* not an smgr callback: consulted by DropTableSpace() */
+extern bool memcow_tablespace_in_use(Oid spcOid);
+
 #endif							/* MEMCOW_H */

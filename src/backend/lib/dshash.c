@@ -598,6 +598,41 @@ dshash_release_lock(dshash_table *hash_table, void *entry)
 }
 
 /*
+ * Re-lock an entry this backend has already found once, without walking the
+ * table.
+ *
+ * The entry pointer must have come from an earlier dshash_find() or
+ * dshash_find_or_insert() in this same backend, and the entry must not have
+ * been deleted since -- the caller has to guarantee that by its own protocol
+ * (an entry that is never deleted, or a lock that excludes the deleter).  On
+ * return the entry's partition lock is held, exactly as after dshash_find(),
+ * and dshash_release_lock() releases it.
+ *
+ * Why this exists: dshash_find() traverses the bucket array and the bucket's
+ * chain, both of which live in DSA memory that other backends may have moved
+ * or added to since this backend last looked, and dereferencing a dsa_pointer
+ * into a segment this backend has not mapped yet attaches it, which
+ * allocates (dsm_attach() -> MemoryContextAlloc()).  That makes dshash_find()
+ * unusable inside a critical section.  This function touches only the item
+ * header, which is in the same allocation as the entry and therefore already
+ * mapped, and the partition lock array, which is in the control object and
+ * mapped at attach time -- so it never allocates and is safe to call inside a
+ * critical section.
+ */
+void
+dshash_lock_entry(dshash_table *hash_table, void *entry, bool exclusive)
+{
+	dshash_table_item *item = ITEM_FROM_ENTRY(entry);
+	size_t		partition_index = PARTITION_FOR_HASH(item->hash);
+
+	Assert(hash_table->control->magic == DSHASH_MAGIC);
+	ASSERT_NO_PARTITION_LOCKS_HELD_BY_ME(hash_table);
+
+	LWLockAcquire(PARTITION_LOCK(hash_table, partition_index),
+				  exclusive ? LW_EXCLUSIVE : LW_SHARED);
+}
+
+/*
  * A compare function that forwards to memcmp.
  */
 int

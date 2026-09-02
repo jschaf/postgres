@@ -71,6 +71,7 @@
 #include "postmaster/bgwriter.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
+#include "storage/memcow.h"
 #include "storage/procsignal.h"
 #include "storage/standby.h"
 #include "utils/acl.h"
@@ -493,6 +494,18 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 	 * is running concurrently.
 	 */
 	LWLockAcquire(TablespaceCreateLock, LW_EXCLUSIVE);
+
+	/*
+	 * Under memcow no relation is ever a file in the tablespace directory, so
+	 * the directory scan below cannot tell whether the tablespace still holds
+	 * relations.  Ask the storage manager instead; it answers from the seed
+	 * and the overlay, and refuses exactly where md's scan would.
+	 */
+	if (memcow_enabled && memcow_tablespace_in_use(tablespaceoid))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("tablespace \"%s\" is not empty",
+						tablespacename)));
 
 	/*
 	 * Try to remove the physical infrastructure.
