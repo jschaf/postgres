@@ -45,6 +45,27 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'memcow_lane_catchup_sql'
 LANGUAGE C STRICT VOLATILE;
 
+-- Cost attribution (plan §7.4): where the lane's last completed reset spent
+-- its time, in microseconds, step by step.  NULLs if no reset has completed.
+CREATE FUNCTION memcow_lane_reset_timings(dboid oid,
+    OUT epoch bigint, OUT total_us bigint, OUT fence_us bigint,
+    OUT prepare_us bigint, OUT publish_us bigint, OUT barrier_us bigint,
+    OUT sweep_buffers_us bigint, OUT sweep_files_us bigint,
+    OUT reclaim_wait_us bigint, OUT poison_us bigint, OUT destroy_us bigint,
+    OUT fence_polls int, OUT reclaim_polls int, OUT stragglers int,
+    OUT poisoned_pages bigint)
+RETURNS record
+AS 'MODULE_PATHNAME', 'memcow_lane_reset_timings_sql'
+LANGUAGE C STRICT VOLATILE;
+
+-- Test helper (plan §7.4, barrier absorption): hold off interrupts in THIS
+-- backend for ms milliseconds, so that it cannot absorb a ProcSignal barrier
+-- until then -- a deterministic CFI-starved process.
+CREATE FUNCTION memcow_lane_starve_interrupts(ms int)
+RETURNS void
+AS 'MODULE_PATHNAME', 'memcow_lane_starve_interrupts_sql'
+LANGUAGE C STRICT VOLATILE;
+
 -- Lane-backend functions (plan §3.9): run in the lane, on each retained
 -- connection, after memcow_lane_reset returned.
 CREATE FUNCTION memcow_backend_reset()
@@ -64,5 +85,7 @@ REVOKE ALL ON FUNCTION memcow_lane_register(oid, int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_lane_unregister(oid, int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_lane_status(oid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_lane_catchup(int) FROM PUBLIC;
+REVOKE ALL ON FUNCTION memcow_lane_reset_timings(oid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION memcow_lane_starve_interrupts(int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_backend_reset() FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_backend_counters() FROM PUBLIC;

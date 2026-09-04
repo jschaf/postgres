@@ -157,6 +157,7 @@
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "port/pg_iovec.h"
+#include "portability/instr_time.h"
 #include "storage/aio.h"
 #include "storage/aio_internal.h"
 #include "storage/bufmgr.h"
@@ -464,6 +465,9 @@ typedef struct MemcowDbSlot
 
 	/* what the last RECLAIM poisoned (assert-enabled builds only) */
 	uint32		poisoned_pages;
+
+	/* where the last completed reset spent its time (plan §7.4) */
+	MemcowLaneResetTimings last_reset;
 
 	/* the dsa_set_size_limit() bound on the published arena, 0 = none */
 	size_t		arena_limit;
@@ -3629,6 +3633,21 @@ memcow_lane_poll_sleep(void)
 }
 
 /*
+ * Cost attribution for plan §7.4: each step of memcow_lane_reset() is timed
+ * into a MemcowLaneResetTimings, which the reset stores in the slot when it
+ * returns.  MEMCOW_STEP_START/END bracket a step; the elapsed microseconds are
+ * ADDED to the field, so a step split across a retry accumulates.
+ */
+#define MEMCOW_STEP_START(t0) INSTR_TIME_SET_CURRENT(t0)
+#define MEMCOW_STEP_END(t0, field) \
+	do { \
+		instr_time	_t1; \
+		INSTR_TIME_SET_CURRENT(_t1); \
+		INSTR_TIME_SUBTRACT(_t1, (t0)); \
+		(field) += INSTR_TIME_GET_MICROSEC(_t1); \
+	} while (0)
+
+/*
  * memcow_lane_register() -- add (or remove) a pool backend's PID to a lane's
  * registry.  Registered backends are the ones the fence trusts to be idle;
  * every other backend found in the lane is a straggler and is terminated.
@@ -3990,7 +4009,7 @@ memcow_get_backend_counters(MemcowBackendCounters *out)
  */
 static void
 memcow_lane_fence(MemcowDbSlot *slot, Oid dbOid, TimestampTz deadline,
-				  int timeout_ms)
+				  int timeout_ms, MemcowLaneResetTimings *t)
 {
 	int			registered[MEMCOW_LANE_MAX_BACKENDS];
 	bool		alive[MEMCOW_LANE_MAX_BACKENDS];
@@ -4126,6 +4145,8 @@ memcow_lane_fence(MemcowDbSlot *slot, Oid dbOid, TimestampTz deadline,
 			nknown_idle == nknown_alive)
 			break;
 
+		t->fence_polls++;
+
 		if (GetCurrentTimestamp() >= deadline)
 		{
 			if (unknown_pid != 0)
@@ -4147,6 +4168,7 @@ memcow_lane_fence(MemcowDbSlot *slot, Oid dbOid, TimestampTz deadline,
 		memcow_lane_poll_sleep();
 	}
 
+	t->stragglers = nsignalled;
 	pfree(signalled);
 
 	/* drop registered PIDs that turned out to be dead */
@@ -4299,13 +4321,15 @@ memcow_poison_arena(dsa_area *area, dshash_table_handle blocks_handle)
  */
 static void
 memcow_lane_finish(MemcowDbSlot *slot, Oid dbOid, Oid spcOid,
-				   TimestampTz deadline, int timeout_ms)
+				   TimestampTz deadline, int timeout_ms,
+				   MemcowLaneResetTimings *t)
 {
 	uint32		old_epoch;
 	dsa_handle	old_area;
 	dshash_table_handle old_blocks;
 	uint32		still;
 	uint32		poisoned = 0;
+	instr_time	t0;
 
 	/*
 	 * 6. BARRIER.  Every process runs smgrreleaseall() ->
@@ -4316,16 +4340,28 @@ memcow_lane_finish(MemcowDbSlot *slot, Oid dbOid, Oid spcOid,
 	 * (ADDENDUM §A).
 	 */
 	Assert(!LWLockHeldByMe(&MemcowShmem->lock));
+	MEMCOW_STEP_START(t0);
 	WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
+	MEMCOW_STEP_END(t0, t->barrier_us);
 
 	/*
 	 * 7. SWEEP, after the barrier and not before (plan §4, Appendix B(h)):
 	 * no process can create an epoch-N buffer any more, so what this drops
 	 * is everything.  It waits out residual pins and in-flight IO.
+	 *
+	 * The injection point is the §7.4 harness's negative control: parked
+	 * here, a reset's cost lands in exactly one attributed term
+	 * (sweep_buffers_us), and a harness that cannot see it there measures
+	 * nothing.  A no-op unless attached.
 	 */
+	MEMCOW_STEP_START(t0);
+	INJECTION_POINT("memcow-lane-reset-in-sweep", NULL);
 	if (!IS_INJECTION_POINT_ATTACHED("memcow-lane-skip-sweep"))	/* R5's knob */
 		DropDatabaseBuffers(dbOid);
+	MEMCOW_STEP_END(t0, t->sweep_buffers_us);
+	MEMCOW_STEP_START(t0);
 	memcow_lane_sweep_files(slot, dbOid, spcOid);
+	MEMCOW_STEP_END(t0, t->sweep_files_us);
 
 	LWLockAcquire(&MemcowShmem->lock, LW_EXCLUSIVE);
 	slot->discard_writes = false;
@@ -4341,6 +4377,7 @@ memcow_lane_finish(MemcowDbSlot *slot, Oid dbOid, Oid spcOid,
 	 * Then unpin, and DSA's refcount frees the segments on the last detach,
 	 * which is ours.
 	 */
+	MEMCOW_STEP_START(t0);
 	while ((still = pg_atomic_read_u32(&slot->attached[old_epoch & 1])) != 0)
 	{
 		if (GetCurrentTimestamp() >= deadline)
@@ -4349,12 +4386,16 @@ memcow_lane_finish(MemcowDbSlot *slot, Oid dbOid, Oid spcOid,
 					 errmsg("memcow lane %u: %u process(es) still attached to epoch %u %d ms after the barrier",
 							dbOid, still, old_epoch, timeout_ms),
 					 errhint("Call memcow_lane_reset() again to retry the reclaim.")));
+		t->reclaim_polls++;
 		memcow_lane_poll_sleep();
 	}
+	MEMCOW_STEP_END(t0, t->reclaim_wait_us);
 
 	{
 		dsa_area   *area = dsa_attach(old_area);
 		dsm_segment *seg;
+
+		MEMCOW_STEP_START(t0);
 
 #ifdef USE_ASSERT_CHECKING
 		/*
@@ -4369,7 +4410,9 @@ memcow_lane_finish(MemcowDbSlot *slot, Oid dbOid, Oid spcOid,
 		if (!IS_INJECTION_POINT_ATTACHED("memcow-reclaim-skip-poison"))
 			poisoned = memcow_poison_arena(area, old_blocks);
 #endif
+		MEMCOW_STEP_END(t0, t->poison_us);
 
+		MEMCOW_STEP_START(t0);
 		dsa_unpin(area);
 		dsa_detach(area);
 
@@ -4392,13 +4435,32 @@ memcow_lane_finish(MemcowDbSlot *slot, Oid dbOid, Oid spcOid,
 					 errdetail("The arena's control segment is still attachable after the last counted detach."),
 					 errhint("Call memcow_lane_reset() again to retry the reclaim.")));
 		}
+		MEMCOW_STEP_END(t0, t->destroy_us);
 	}
+	t->poisoned_pages = poisoned;
 
 	LWLockAcquire(&MemcowShmem->lock, LW_EXCLUSIVE);
 	slot->reclaim_pending = false;
 	slot->old_area = DSA_HANDLE_INVALID;
 	slot->old_blocks = DSHASH_HANDLE_INVALID;
 	slot->poisoned_pages = poisoned;
+	LWLockRelease(&MemcowShmem->lock);
+}
+
+/* the reset is over: record where it spent its time (plan §7.4) */
+static void
+memcow_lane_store_timings(MemcowDbSlot *slot, MemcowLaneResetTimings *t,
+						  uint32 epoch, instr_time t_start)
+{
+	instr_time	now;
+
+	INSTR_TIME_SET_CURRENT(now);
+	INSTR_TIME_SUBTRACT(now, t_start);
+	t->total_us = INSTR_TIME_GET_MICROSEC(now);
+	t->epoch = epoch;
+
+	LWLockAcquire(&MemcowShmem->lock, LW_EXCLUSIVE);
+	slot->last_reset = *t;
 	LWLockRelease(&MemcowShmem->lock);
 }
 
@@ -4439,6 +4501,12 @@ memcow_lane_reset(Oid dbOid, Oid spcOid, int timeout_ms)
 	dsa_handle	new_area;
 	dshash_table_handle new_rels;
 	dshash_table_handle new_blocks;
+	MemcowLaneResetTimings t;
+	instr_time	t_start;
+	instr_time	t0;
+
+	memset(&t, 0, sizeof(t));
+	INSTR_TIME_SET_CURRENT(t_start);
 
 	memcow_lane_check_enabled();
 	if (dbOid == MyDatabaseId)
@@ -4477,22 +4545,29 @@ memcow_lane_reset(Oid dbOid, Oid spcOid, int timeout_ms)
 	if (reclaim_pending)
 	{
 		/* a retry after an error past the commit point: finish it */
-		memcow_lane_finish(slot, dbOid, spcOid, deadline, timeout_ms);
+		memcow_lane_finish(slot, dbOid, spcOid, deadline, timeout_ms, &t);
 		UnlockSharedObject(DatabaseRelationId, dbOid, 0, AccessExclusiveLock);
-		return pg_atomic_read_u32(&slot->epoch);
+		new_epoch = pg_atomic_read_u32(&slot->epoch);
+		memcow_lane_store_timings(slot, &t, new_epoch, t_start);
+		return new_epoch;
 	}
 
 	/* 3. FENCE */
-	memcow_lane_fence(slot, dbOid, deadline, timeout_ms);
+	MEMCOW_STEP_START(t0);
+	memcow_lane_fence(slot, dbOid, deadline, timeout_ms, &t);
+	MEMCOW_STEP_END(t0, t.fence_us);
 
 	/* 4. PREPARE: the arena outlives our mapping because it is pinned */
+	MEMCOW_STEP_START(t0);
 	memcow_arena_create(memcow_lane_limit_bytes(), &area, &rels, &blocks);
 	new_area = dsa_get_handle(area);
 	new_rels = dshash_get_hash_table_handle(rels);
 	new_blocks = dshash_get_hash_table_handle(blocks);
 	memcow_arena_detach(area, rels, blocks);
+	MEMCOW_STEP_END(t0, t.prepare_us);
 
 	/* 5. PUBLISH */
+	MEMCOW_STEP_START(t0);
 	LWLockAcquire(&MemcowShmem->lock, LW_EXCLUSIVE);
 	Assert(!slot->reclaim_pending);
 	old_epoch = pg_atomic_read_u32(&slot->epoch);
@@ -4513,6 +4588,7 @@ memcow_lane_reset(Oid dbOid, Oid spcOid, int timeout_ms)
 	pg_atomic_fetch_add_u32(&MemcowShmem->generation, 1);
 	pg_atomic_fetch_add_u32(&MemcowShmem->reset_generation, 1);
 	LWLockRelease(&MemcowShmem->lock);
+	MEMCOW_STEP_END(t0, t.publish_us);
 
 	/*
 	 * For the race tests (plan §7.3 e): the window between PUBLISH and the
@@ -4522,10 +4598,36 @@ memcow_lane_reset(Oid dbOid, Oid spcOid, int timeout_ms)
 	INJECTION_POINT("memcow-lane-reset-after-publish", NULL);
 
 	/* 6-8 */
-	memcow_lane_finish(slot, dbOid, spcOid, deadline, timeout_ms);
+	memcow_lane_finish(slot, dbOid, spcOid, deadline, timeout_ms, &t);
 
 	/* 9. UNLOCK */
 	UnlockSharedObject(DatabaseRelationId, dbOid, 0, AccessExclusiveLock);
 
+	memcow_lane_store_timings(slot, &t, new_epoch, t_start);
 	return new_epoch;
+}
+
+/*
+ * memcow_lane_reset_timings() -- the last completed reset's cost breakdown.
+ * Returns false if the database is not a lane or no reset has completed.
+ */
+bool
+memcow_lane_reset_timings(Oid dbOid, MemcowLaneResetTimings *t)
+{
+	MemcowDbSlot *slot;
+	bool		found = false;
+
+	memcow_lane_check_enabled();
+	memset(t, 0, sizeof(*t));
+
+	LWLockAcquire(&MemcowShmem->lock, LW_SHARED);
+	slot = memcow_find_slot(dbOid);
+	if (slot != NULL && slot->last_reset.total_us > 0)
+	{
+		*t = slot->last_reset;
+		found = true;
+	}
+	LWLockRelease(&MemcowShmem->lock);
+
+	return found;
 }

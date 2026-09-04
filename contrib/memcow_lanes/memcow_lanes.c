@@ -49,12 +49,14 @@
 #include "libpq/auth.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "storage/memcow.h"
 #include "storage/procsignal.h"
 #include "utils/builtins.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 
 PG_MODULE_MAGIC;
@@ -390,10 +392,114 @@ memcow_lane_catchup_sql(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+/*
+ * memcow_lane_reset_timings(dboid) -- plan §7.4's cost attribution: where
+ * the lane's last completed reset spent its time, one column per step, all
+ * in microseconds.  Every column NULL when no reset has completed.
+ */
+PG_FUNCTION_INFO_V1(memcow_lane_reset_timings_sql);
+Datum
+memcow_lane_reset_timings_sql(PG_FUNCTION_ARGS)
+{
+	Oid			dbOid = PG_GETARG_OID(0);
+	MemcowLaneResetTimings t;
+	TupleDesc	tupdesc;
+	Datum		values[15];
+	bool		nulls[15];
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	if (!memcow_lane_reset_timings(dbOid, &t))
+	{
+		memset(nulls, true, sizeof(nulls));
+		memset(values, 0, sizeof(values));
+		PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+	}
+
+	memset(nulls, 0, sizeof(nulls));
+	values[0] = Int64GetDatum((int64) t.epoch);
+	values[1] = Int64GetDatum(t.total_us);
+	values[2] = Int64GetDatum(t.fence_us);
+	values[3] = Int64GetDatum(t.prepare_us);
+	values[4] = Int64GetDatum(t.publish_us);
+	values[5] = Int64GetDatum(t.barrier_us);
+	values[6] = Int64GetDatum(t.sweep_buffers_us);
+	values[7] = Int64GetDatum(t.sweep_files_us);
+	values[8] = Int64GetDatum(t.reclaim_wait_us);
+	values[9] = Int64GetDatum(t.poison_us);
+	values[10] = Int64GetDatum(t.destroy_us);
+	values[11] = Int32GetDatum(t.fence_polls);
+	values[12] = Int32GetDatum(t.reclaim_polls);
+	values[13] = Int32GetDatum(t.stragglers);
+	values[14] = Int64GetDatum((int64) t.poisoned_pages);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * memcow_lane_starve_interrupts(ms) -- a test helper for plan §7.4's barrier
+ * measurement: this backend holds off interrupts for ms milliseconds.
+ * ProcessInterrupts() returns at once while InterruptHoldoffCount is
+ * nonzero, so a ProcSignal barrier emitted meanwhile is absorbed only when
+ * the hold ends; a reset waiting on that barrier waits exactly that long.
+ * That is the CFI-starved process the plan asks the barrier to be measured
+ * against, made deterministic.  Superuser only; bounded to a minute.
+ * (First version used one pg_usleep(), which the barrier's signal cut
+ * short: the reset benchmark then saw no hold at all -- barrier p99 1.5 ms
+ * against a "200 ms" neighbour.  Measured, not assumed.)
+ */
+PG_FUNCTION_INFO_V1(memcow_lane_starve_interrupts_sql);
+Datum
+memcow_lane_starve_interrupts_sql(PG_FUNCTION_ARGS)
+{
+	int32		ms = PG_GETARG_INT32(0);
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to hold off interrupts")));
+	if (ms < 0 || ms > 60000)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ms must be between 0 and 60000")));
+
+	/*
+	 * pg_usleep() returns early when a signal arrives -- and the barrier's
+	 * own SIGURG is one -- so sleep in a loop to the deadline: the handler
+	 * runs and sets its flags, and this backend goes on ignoring them, which
+	 * is the point.
+	 */
+	{
+		TimestampTz deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), ms);
+
+		HOLD_INTERRUPTS();
+		for (;;)
+		{
+			long		secs;
+			int			usecs;
+			TimestampTz now = GetCurrentTimestamp();
+
+			if (now >= deadline)
+				break;
+			TimestampDifference(now, deadline, &secs, &usecs);
+			pg_usleep(secs * 1000000L + usecs);
+		}
+		RESUME_INTERRUPTS();
+	}
+
+	PG_RETURN_VOID();
+}
+
 /* ----------------------------------------------------------------
  *		lane-backend functions
  * ----------------------------------------------------------------
  */
+
+/* the last adopt's InvalidateSystemCaches() time, for the §7.4 breakdown */
+static int64 memcow_adopt_last_us = 0;
+static int64 memcow_adopt_total_us = 0;
+static int64 memcow_adopt_count = 0;
 
 /*
  * The per-connection adopt call (plan §3.9, Appendix A.1.1).
@@ -405,8 +511,20 @@ PG_FUNCTION_INFO_V1(memcow_backend_reset_sql);
 Datum
 memcow_backend_reset_sql(PG_FUNCTION_ARGS)
 {
+	instr_time	t0;
+	instr_time	t1;
+	uint32		epoch;
+
+	INSTR_TIME_SET_CURRENT(t0);
 	InvalidateSystemCaches();
-	PG_RETURN_INT64((int64) memcow_backend_adopt());
+	epoch = memcow_backend_adopt();
+	INSTR_TIME_SET_CURRENT(t1);
+	INSTR_TIME_SUBTRACT(t1, t0);
+	memcow_adopt_last_us = INSTR_TIME_GET_MICROSEC(t1);
+	memcow_adopt_total_us += memcow_adopt_last_us;
+	memcow_adopt_count++;
+
+	PG_RETURN_INT64((int64) epoch);
 }
 
 PG_FUNCTION_INFO_V1(memcow_backend_counters_sql);
@@ -419,7 +537,7 @@ memcow_backend_counters_sql(PG_FUNCTION_ARGS)
 	{
 		const char *name;
 		uint64		value;
-	}			rows[7];
+	}			rows[10];
 
 	InitMaterializedSRF(fcinfo, 0);
 	memcow_get_backend_counters(&c);
@@ -438,6 +556,12 @@ memcow_backend_counters_sql(PG_FUNCTION_ARGS)
 	rows[5].value = c.truncate_allocated;
 	rows[6].name = "writes_discarded";
 	rows[6].value = c.writes_discarded;
+	rows[7].name = "adopt_last_us";
+	rows[7].value = (uint64) memcow_adopt_last_us;
+	rows[8].name = "adopt_total_us";
+	rows[8].value = (uint64) memcow_adopt_total_us;
+	rows[9].name = "adopt_count";
+	rows[9].value = (uint64) memcow_adopt_count;
 
 	for (int i = 0; i < lengthof(rows); i++)
 	{

@@ -123,6 +123,33 @@ typedef enum MemcowAuthVerdict
 	MEMCOW_AUTH_REFUSE_NONCE	/* armed lane, nonce absent or stale */
 } MemcowAuthVerdict;
 
+/*
+ * Where the last memcow_lane_reset() of a lane spent its time (plan §7.4 cost
+ * attribution).  Microseconds, measured with instr_time around each step;
+ * total_us is CLOSE to return.  Polls are iterations of the bounded waits
+ * (each one a 10 ms sleep), stragglers the PIDs the fence terminated.  Written
+ * under the lane lock when a reset returns; a reset that raises leaves the
+ * previous record in place, so epoch says which reset the record is of.
+ */
+typedef struct MemcowLaneResetTimings
+{
+	uint32		epoch;			/* the epoch that reset published */
+	int64		total_us;
+	int64		fence_us;		/* step 3: idle check + straggler kills */
+	int64		prepare_us;		/* step 4: dsa_create + dshash tables */
+	int64		publish_us;		/* step 5: the locked store */
+	int64		barrier_us;		/* step 6: emit -> every process absorbed */
+	int64		sweep_buffers_us;	/* step 7a: DropDatabaseBuffers */
+	int64		sweep_files_us; /* step 7b: pg_internal.init + pg_filenode.map */
+	int64		reclaim_wait_us;	/* step 8a: attach count -> 0 */
+	int64		poison_us;		/* step 8b: old-arena poison walk (cassert) */
+	int64		destroy_us;		/* step 8c: unpin + detach + verify gone */
+	int32		fence_polls;
+	int32		reclaim_polls;
+	int32		stragglers;
+	uint32		poisoned_pages;
+} MemcowLaneResetTimings;
+
 typedef struct MemcowBackendCounters
 {
 	uint64		attaches;
@@ -139,6 +166,7 @@ extern uint32 memcow_lane_open(Oid dbOid, bool arm, const char *datname);
 extern void memcow_lane_retire(Oid dbOid);
 extern void memcow_lane_register(Oid dbOid, int pid, bool add);
 extern void memcow_lane_status(Oid dbOid, MemcowLaneStatus *st);
+extern bool memcow_lane_reset_timings(Oid dbOid, MemcowLaneResetTimings *t);
 extern MemcowAuthVerdict memcow_lane_auth_check(const char *datname,
 												uint32 presented,
 												Oid *dbOid, uint32 *nonce,
