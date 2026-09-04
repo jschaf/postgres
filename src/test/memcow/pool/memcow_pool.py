@@ -42,8 +42,10 @@ import collections
 import ctypes
 import os
 import platform
+import queue
 import re
 import sys
+import threading
 import time
 
 # ---------------------------------------------------------------------------
@@ -366,13 +368,56 @@ class Lane:
         self.recycles = 0
         self.resets = 0
         self.refusals = 0
+        self.ready_at = 0.0
+        self.released_at = 0.0
 
 
 class LanePool:
+    """
+    Two ways to run the reset cycle, chosen by `resetters`:
+
+      resetters=0   release() runs the whole cycle INLINE -- drain, reset,
+                    adopt, warm up, open -- and returns its timings.  The
+                    caller pays for the reset; lease() never waits.  This is
+                    plan §3 read literally and what the §7.2/§7.3 soaks use.
+
+      resetters=R   release() hands the lane to one of R resetter THREADS,
+                    each with a control connection of its own, and returns
+                    at once; a lane re-enters the ready queue when its cycle
+                    is done.  lease() blocks on that queue.  This is what
+                    "ready capacity" (plan §7.4) means operationally: a
+                    lease waits only if every lane is mid-reset, and the
+                    pool records every such wait (last_lease_wait_ms,
+                    last_ready_depth, lease_waits) so a benchmark can tell
+                    a slow query from a starved queue.
+
+    libpq calls go through ctypes, which drops the GIL for the duration of
+    the C call, so a resetter blocked in PQexec() does not stall the leasing
+    thread; a driver that measures sub-millisecond latencies should still
+    lower sys.setswitchinterval(), because the default 5 ms is the worst
+    case a thread waits for the GIL after its C call returns.
+
+    Per-cycle records (the dict release() returns in inline mode, or what
+    on_cycle(record) receives from a resetter) carry the client-side terms
+    in ms -- drain, reset (the round trip), adopt, warmup_open, recycle,
+    cycle -- and, with capture_timings, the server's own attribution of the
+    reset (memcow_lane_reset_timings: fence, prepare, publish, barrier,
+    sweep_buffers, sweep_files, reclaim_wait, poison, destroy, all us) and
+    the adopt's server time (adopt_server_us), fetched AFTER the cycle so
+    that the fetch is not in it.
+
+    resetter_delay_ms is a NEGATIVE-CONTROL knob for the §7.4 harness: a
+    pure client-side sleep at the head of every cycle, which inflates one
+    cost term (the cycle) and nothing else.  A harness that cannot attribute
+    a lease p99 miss to the starved queue under it is not measuring.
+    """
+
     def __init__(self, pq, conninfo, lanes, conns_per_lane=2,
                  control_db='memcow_control', retire_after_epochs=50,
                  reset_timeout_ms=5000, reset_retries=3,
-                 warmup_sql='SELECT 1', reset_on_open=True, log=None):
+                 warmup_sql='SELECT 1', reset_on_open=True, log=None,
+                 resetters=0, lease_timeout=60.0, capture_timings=False,
+                 resetter_delay_ms=0, on_cycle=None):
         self.pq = pq
         self.base_conninfo = conninfo
         self.lane_names = list(lanes)
@@ -386,8 +431,25 @@ class LanePool:
         self.log = log or (lambda *a: None)
         self.ctl = None
         self.lanes = collections.OrderedDict()
-        self.ready = collections.deque()
         self.last_cycle = None
+        # asynchronous resetting
+        self.nresetters = int(resetters)
+        self.lease_timeout = lease_timeout
+        self.capture_timings = capture_timings
+        self.resetter_delay_ms = resetter_delay_ms
+        self.on_cycle = on_cycle
+        self._threads = []
+        self._reset_q = None
+        self.failures = []          # (lane name, exception text) from resetters
+        self.last_lease_wait_ms = 0.0
+        self.last_ready_depth = 0
+        self.last_ready_age_ms = 0.0
+        self.lease_waits = 0        # leases that found the ready queue empty
+        self.leases = 0
+        if self.nresetters > 0:
+            self.ready = queue.Queue()
+        else:
+            self.ready = collections.deque()
 
     # --- connection strings ------------------------------------------------
 
@@ -410,6 +472,21 @@ class LanePool:
             lane = Lane(name, int(oid))
             self.lanes[name] = lane
             self._open_lane(lane)
+            self._make_ready(lane)
+        if self.nresetters > 0:
+            self._reset_q = queue.Queue()
+            for i in range(self.nresetters):
+                th = threading.Thread(target=self._resetter_main, args=(i,),
+                                      name='memcow-resetter-%d' % i, daemon=True)
+                th.start()
+                self._threads.append(th)
+
+    def _make_ready(self, lane):
+        lane.state = 'READY'
+        lane.ready_at = time.monotonic()
+        if self.nresetters > 0:
+            self.ready.put(lane)
+        else:
             self.ready.append(lane)
 
     def _open_lane(self, lane):
@@ -418,34 +495,40 @@ class LanePool:
         epoch, so every lease starts from a known state."""
         lane.nonce = int(self.ctl.scalar('SELECT memcow_lane_open(%d, true)' % lane.oid))
         lane.epoch = int(self._status(lane)['epoch'])
-        self._connect_backends(lane)
+        self._connect_backends(lane, self.ctl)
         if self.reset_on_open:
             self._drain(lane)
-            self._reset_cycle(lane)
+            self._reset_cycle(lane, self.ctl)
         else:
             self._warmup(lane)
-        lane.state = 'READY'
 
-    def _connect_backends(self, lane):
+    def _connect_backends(self, lane, ctl):
         lane.conns = []
         for i in range(self.M):
             c = Conn(self.pq, self.lane_conninfo(lane, lane.nonce))
             lane.conns.append(c)
-            self.ctl.exec('SELECT memcow_lane_register(%d, %d)' % (lane.oid, c.pid))
+            ctl.exec('SELECT memcow_lane_register(%d, %d)' % (lane.oid, c.pid))
         lane.epochs_served = 0
 
-    def _disconnect_backends(self, lane):
+    def _disconnect_backends(self, lane, ctl):
         for c in lane.conns:
             try:
-                self.ctl.exec('SELECT memcow_lane_unregister(%d, %d)' % (lane.oid, c.pid))
+                ctl.exec('SELECT memcow_lane_unregister(%d, %d)' % (lane.oid, c.pid))
             except PGError:
                 pass
             c.close()
         lane.conns = []
 
     def close(self):
+        if self._reset_q is not None:
+            for th in self._threads:
+                self._reset_q.put(None)
+            for th in self._threads:
+                th.join(timeout=120)
+            self._threads = []
         for lane in self.lanes.values():
-            self._disconnect_backends(lane)
+            if lane.state != 'RETIRED':
+                self._disconnect_backends(lane, self.ctl)
         if self.ctl:
             self.ctl.close()
             self.ctl = None
@@ -453,27 +536,95 @@ class LanePool:
     # --- lease / release ------------------------------------------------------
 
     def lease(self):
-        if not self.ready:
-            raise PoolError('no ready lane')
-        lane = self.ready.popleft()
+        self.leases += 1
+        if self.nresetters > 0:
+            t0 = time.monotonic()
+            depth = self.ready.qsize()
+            try:
+                lane = self.ready.get(timeout=self.lease_timeout)
+            except queue.Empty:
+                raise PoolError('no lane became ready within %.0fs (%d resetter failure(s): %s)'
+                                % (self.lease_timeout, len(self.failures), self.failures[:3]))
+            now = time.monotonic()
+            self.last_lease_wait_ms = (now - t0) * 1000.0
+            self.last_ready_depth = depth
+            self.last_ready_age_ms = (now - lane.ready_at) * 1000.0
+            if depth == 0:
+                self.lease_waits += 1
+        else:
+            if not self.ready:
+                raise PoolError('no ready lane')
+            lane = self.ready.popleft()
+            self.last_lease_wait_ms = 0.0
+            self.last_ready_depth = len(self.ready) + 1
+            self.last_ready_age_ms = (time.monotonic() - lane.ready_at) * 1000.0
         lane.state = 'LEASED'
         return Wrapper(self, lane)
 
     def release(self, w):
-        """Plan §3.6-§3.10.  Returns the cycle's timings (ms)."""
+        """Plan §3.6-§3.10.  Inline mode: runs the cycle and returns its
+        timings (ms).  Resetter mode: queues the lane and returns None."""
         w.invalidate()                      # fence 1, in process, first
         lane = w._lane
+        lane.state = 'RESETTING'
+        lane.released_at = time.monotonic()
+        if self.nresetters > 0:
+            self._reset_q.put(lane)
+            return None
+        timings = self._run_cycle(lane, self.ctl)
+        self._make_ready(lane)
+        self.last_cycle = timings
+        return timings
+
+    def _run_cycle(self, lane, ctl):
+        """drain + reset cycle on the given control connection; returns the
+        record.  Raises LaneRetired / PoolError / PGError."""
+        if self.resetter_delay_ms:
+            time.sleep(self.resetter_delay_ms / 1000.0)
         t0 = time.monotonic()
         self._drain(lane)
         t1 = time.monotonic()
-        timings = self._reset_cycle(lane)
+        timings = self._reset_cycle(lane, ctl)
         t2 = time.monotonic()
         timings['drain_ms'] = (t1 - t0) * 1000.0
         timings['cycle_ms'] = (t2 - t0) * 1000.0
-        lane.state = 'READY'
-        self.ready.append(lane)
-        self.last_cycle = timings
+        timings['lane'] = lane.name
+        timings['epoch'] = lane.epoch
+        if self.capture_timings:
+            timings['server'] = self._server_timings(lane, ctl)
+            try:
+                v = lane.conns[0].scalar("SELECT value FROM public.memcow_backend_counters() "
+                                         "WHERE name = 'adopt_last_us'")
+                timings['adopt_server_us'] = int(v) if v is not None else None
+            except PGError:
+                timings['adopt_server_us'] = None
         return timings
+
+    def _resetter_main(self, idx):
+        ctl = Conn(self.pq, self.control_conninfo())
+        try:
+            while True:
+                lane = self._reset_q.get()
+                if lane is None:
+                    break
+                try:
+                    rec = self._run_cycle(lane, ctl)
+                except Exception as e:      # noqa: BLE001 -- reported, not hidden
+                    self.failures.append((lane.name, '%s: %s' % (type(e).__name__, e)))
+                    self.log('resetter %d: lane %s failed: %s' % (idx, lane.name, e))
+                    if lane.state != 'RETIRED':
+                        try:
+                            self.retire(lane, reason=str(e), ctl=ctl)
+                        except Exception:   # noqa: BLE001
+                            lane.state = 'RETIRED'
+                    continue
+                rec['resetter'] = idx
+                self.last_cycle = rec
+                if self.on_cycle is not None:
+                    self.on_cycle(rec)
+                self._make_ready(lane)
+        finally:
+            ctl.close()
 
     # --- the protocol -------------------------------------------------------------
 
@@ -496,44 +647,62 @@ class LanePool:
                 raise PoolError('lane %s pid %d not idle after drain (status %d)'
                                 % (lane.name, c.pid, c.txn_status()))
 
-    def _status(self, lane):
-        r = self.ctl.exec('SELECT state, epoch, nonce, registered, arena_bytes, attached, '
-                          'attached_old, reclaim_pending, writes_discarded, poisoned_pages, '
-                          'arena_limit FROM memcow_lane_status(%d)' % lane.oid)
-        row = r.rows[0]
-        keys = ('state', 'epoch', 'nonce', 'registered', 'arena_bytes', 'attached',
-                'attached_old', 'reclaim_pending', 'writes_discarded', 'poisoned_pages',
-                'arena_limit')
-        return dict(zip(keys, row))
+    STATUS_KEYS = ('state', 'epoch', 'nonce', 'registered', 'arena_bytes', 'attached',
+                   'attached_old', 'reclaim_pending', 'writes_discarded', 'poisoned_pages',
+                   'arena_limit')
+
+    def _status(self, lane, ctl=None):
+        r = (ctl or self.ctl).exec(
+            'SELECT state, epoch, nonce, registered, arena_bytes, attached, '
+            'attached_old, reclaim_pending, writes_discarded, poisoned_pages, '
+            'arena_limit FROM memcow_lane_status(%d)' % lane.oid)
+        return dict(zip(self.STATUS_KEYS, r.rows[0]))
 
     def status(self, name):
         return self._status(self.lanes[name])
 
-    def reset_lane_raw(self, lane, timeout_ms=None):
+    TIMING_KEYS = ('epoch', 'total_us', 'fence_us', 'prepare_us', 'publish_us', 'barrier_us',
+                   'sweep_buffers_us', 'sweep_files_us', 'reclaim_wait_us', 'poison_us',
+                   'destroy_us', 'fence_polls', 'reclaim_polls', 'stragglers', 'poisoned_pages')
+
+    def _server_timings(self, lane, ctl=None):
+        """memcow_lane_reset_timings(D): the server's attribution of the
+        lane's last completed reset, as a dict of ints (us / counts)."""
+        r = (ctl or self.ctl).exec('SELECT %s FROM memcow_lane_reset_timings(%d)'
+                                   % (', '.join(self.TIMING_KEYS), lane.oid))
+        row = r.rows[0]
+        if row[0] is None:
+            return None
+        return dict((k, int(v)) for k, v in zip(self.TIMING_KEYS, row))
+
+    def server_timings(self, name):
+        return self._server_timings(self.lanes[name])
+
+    def reset_lane_raw(self, lane, timeout_ms=None, ctl=None):
         """memcow_lane_reset(D) alone, for tests that want to see it refused.
         Returns the new epoch or raises LaneRefused with the server's text."""
         try:
-            r = self.ctl.exec('SELECT memcow_lane_reset(%d, %d)'
-                              % (lane.oid, timeout_ms or self.reset_timeout_ms))
+            r = (ctl or self.ctl).exec('SELECT memcow_lane_reset(%d, %d)'
+                                       % (lane.oid, timeout_ms or self.reset_timeout_ms))
         except PGError as e:
             lane.refusals += 1
             raise LaneRefused(str(e))
         lane.resets += 1
         return int(r.scalar())
 
-    def _reset_cycle(self, lane):
+    def _reset_cycle(self, lane, ctl):
         timings = {}
         attempt = 0
         while True:
             attempt += 1
             t0 = time.monotonic()
             try:
-                new_epoch = self.reset_lane_raw(lane)
+                new_epoch = self.reset_lane_raw(lane, ctl=ctl)
                 break
             except LaneRefused as e:
                 self.log('lane %s: reset refused (attempt %d): %s' % (lane.name, attempt, e))
                 if attempt > self.reset_retries:
-                    self.retire(lane, reason=str(e))
+                    self.retire(lane, reason=str(e), ctl=ctl)
                     raise LaneRetired('lane %s retired after %d refused resets: %s'
                                       % (lane.name, attempt, e))
                 # a refused reset leaves the lane CLOSED; re-drain and retry
@@ -542,10 +711,11 @@ class LanePool:
         timings['reset_ms'] = (time.monotonic() - t0) * 1000.0
         timings['attempts'] = attempt
 
-        st = self._status(lane)
+        st = self._status(lane, ctl)
         if st['state'] != 'RESETTING' or int(st['epoch']) != new_epoch or \
                 int(st['attached_old']) != 0 or st['reclaim_pending'] != 'f':
             raise PoolError('lane %s: unexpected status after reset: %r' % (lane.name, st))
+        timings['status_ms'] = (time.monotonic() - t0) * 1000.0 - timings['reset_ms']
 
         # adopt (plan §3.9), schema-qualified: DISCARD ALL reset search_path
         t1 = time.monotonic()
@@ -561,17 +731,22 @@ class LanePool:
         # warmup (plan §3.10), then OPEN armed; the nonce goes into the next wrapper
         t2 = time.monotonic()
         self._warmup(lane)
-        lane.nonce = int(self.ctl.scalar('SELECT memcow_lane_open(%d, true)' % lane.oid))
-        timings['warmup_open_ms'] = (time.monotonic() - t2) * 1000.0
+        t3 = time.monotonic()
+        lane.nonce = int(ctl.scalar('SELECT memcow_lane_open(%d, true)' % lane.oid))
+        timings['warmup_ms'] = (t3 - t2) * 1000.0
+        timings['open_ms'] = (time.monotonic() - t3) * 1000.0
+        timings['warmup_open_ms'] = timings['warmup_ms'] + timings['open_ms']
 
         # retire-after-K-epochs: fresh backends, admitted with the new nonce
+        timings['recycled'] = False
         if self.retire_after and lane.epochs_served >= self.retire_after:
-            t3 = time.monotonic()
-            self._disconnect_backends(lane)
-            self._connect_backends(lane)
+            t4 = time.monotonic()
+            self._disconnect_backends(lane, ctl)
+            self._connect_backends(lane, ctl)
             self._warmup(lane)
             lane.recycles += 1
-            timings['recycle_ms'] = (time.monotonic() - t3) * 1000.0
+            timings['recycle_ms'] = (time.monotonic() - t4) * 1000.0
+            timings['recycled'] = True
         return timings
 
     def _warmup(self, lane):
@@ -582,20 +757,20 @@ class LanePool:
             c.exec('SET client_min_messages = warning')
             c.exec(self.warmup_sql)
 
-    def retire(self, lane, reason=''):
+    def retire(self, lane, reason='', ctl=None):
         self.log('lane %s: retiring (%s)' % (lane.name, reason))
+        ctl = ctl or self.ctl
         try:
-            self.ctl.exec('SELECT memcow_lane_retire(%d)' % lane.oid)
+            ctl.exec('SELECT memcow_lane_retire(%d)' % lane.oid)
         finally:
-            self._disconnect_backends(lane)
+            self._disconnect_backends(lane, ctl)
             lane.state = 'RETIRED'
 
     def reopen(self, lane):
         """After a refusal the caller may prefer to reopen rather than retry
         the reset (plan Appendix B(i): 'the pool reopens or retires')."""
         lane.nonce = int(self.ctl.scalar('SELECT memcow_lane_open(%d, true)' % lane.oid))
-        lane.state = 'READY'
-        self.ready.append(lane)
+        self._make_ready(lane)
 
 
 # ---------------------------------------------------------------------------

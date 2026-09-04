@@ -17,9 +17,41 @@
 #
 # Phase 1 is the plan's falsification slice.  Phase 2 is the lane reset
 # (plan §7.2).  Phase 3 is the pool, the races and the pool-driven soak
-# (plan §3, §7.3).  Phase 4 is NOT implemented: its subject (the benchmarks)
-# does not exist yet.  It exits 3 with a clear message and must never be
-# made to pass by stubbing.
+# (plan §3, §7.3).  Phase 4 is the benchmarks (plan §7.4) and the Appendix
+# A.4 answers, run by harness/bench.sh over bench/; see PHASE 4 below.
+#
+# ---------------------------------------------------------------------------
+# PHASE 4, and what it does and does not prove
+# ---------------------------------------------------------------------------
+#
+# §7.4's gate is: "lease->first-parameterized-query p99 < 1 ms over 100k
+# leases with ready capacity; reset (quiesce->ready, including warmup) p99
+# < 25 ms at shared_buffers=512MB, including the global SMGRRELEASE barrier
+# under concurrent busy lanes (absorption latency measured explicitly);
+# zero leakage."  Held on the cassert build (progress.md open problem 2,
+# option (a)).  So phase 4 runs, and requires all of:
+#
+#   (1) the harness's own negative controls, first: one cost term inflated
+#       on purpose (the cycle, client-side, for the lease driver; the sweep
+#       step, via the memcow-lane-reset-in-sweep injection point, for the
+#       reset driver), and the driver must miss its threshold AND attribute
+#       the miss to that term;
+#   (2) bench/bench_lease.py: 100,000 leases, resets on resetter threads so
+#       that a lease waits only when every lane is mid-reset (and every such
+#       wait is recorded), plus the same at a fifth the length through the
+#       DDL+DML workload and read-only, for A.4 (2);
+#   (3) bench/bench_reset.py at 512MB: idle neighbours, six busy lanes on
+#       the DDL+DML workload, six busy lanes running a tight plpgsql loop
+#       (the CFI-starved case), each cycle attributed step by step from
+#       memcow_lane_reset_timings(); and, informationally, a neighbour that
+#       holds interrupts for 200 ms, which is the global barrier's worst
+#       case;
+#   (4) bench/a4_summary.py: the five Appendix A.4 triggers, each answered
+#       from those numbers by a stated rule.
+#
+# Zero leakage is checked inside every run (DSM segment count after a
+# warm-up, PGDATA-minus-WAL, pg_aios, pinned buffers, descriptors and DSM
+# mappings of the long-lived processes, the cassert leak WARNINGs).
 #
 # ---------------------------------------------------------------------------
 # PHASE 3, and what it does and does not prove
@@ -545,16 +577,161 @@ MSG
 	exit $rc
 	;;
 4)
-	cat >&2 <<MSG
-run_gate.sh: phase 4 is NOT IMPLEMENTED.
+	echo "run_gate.sh: phase 4 -- the benchmarks (plan §7.4) and Appendix A.4"
+	need_seed_and_pgdata
 
-    Its subject does not exist yet in this tree: the benchmarks (plan §7.4)
-    wait on the cassert-vs-thresholds decision (progress.md open problem 2).
+	work="$MEMCOW_GATE_WORKDIR/phase4"
+	mkdir -p "$work"
+	rc=0
 
-    This is reported as a FAILURE on purpose.  Do not stub it, do not make
-    it exit 0, and do not treat a green CI line for this phase as coverage.
+	# The pool configuration the gate holds the thresholds at.  Chosen from
+	# measurement (progress.md 2026-09-03, the lanes x resetters x K matrix,
+	# 5000 light leases per cell on this cassert build), not from taste:
+	#   1 resetter thread starves the ready queue at full lease rate (4 or
+	#     8 lanes: ~4600 of 5000 leases found it empty, p99 4.2-4.5 ms,
+	#     every miss attributed to the queue, 85% resetter utilisation);
+	#   2 threads pass but are marginal (8 lanes: 32-45 waits, p99
+	#     0.36-0.64 ms across two runs);
+	#   3 threads on 8 lanes: 0-7 waits, p99 0.25-0.33 ms, ~37% utilised;
+	#     a 4th adds nothing (p99 0.27).
+	#   K: a backend's memory contexts are flat across epochs (2120 kB), so
+	#     K is set by the recycle's tail alone: at K=50 recycles are 2% of
+	#     cycles and sit inside the cycle p99 (7.6 vs 4.5 ms at K=200); at
+	#     K=200 they are 0.5% and outside it.  100k leases at K=200 is ~500
+	#     reconnects.
+	# Override to re-measure, never to pass.
+	lanes8=memcow_lane_00,memcow_lane_01,memcow_lane_02,memcow_lane_03,memcow_lane_04,memcow_lane_05,memcow_lane_06,memcow_lane_07
+	lease_lanes=${MEMCOW_BENCH_LANES:-$lanes8}
+	resetters=${MEMCOW_BENCH_RESETTERS:-3}
+	retire_after=${MEMCOW_BENCH_RETIRE_AFTER:-200}
+	leases=${MEMCOW_BENCH_LEASES:-100000}
+	resets=${MEMCOW_BENCH_RESETS:-3000}
+	sb=${MEMCOW_BENCH_SHARED_BUFFERS:-512MB}
+	bench="$here/bench.sh --seed $seed --pgdata $pgdata --ram-mount $ram_mount --build-dir $build_dir --shared-buffers $sb"
+
+	# --- (1) the negative controls FIRST: a benchmark that cannot fail ----
+	# measures nothing.  Each inflates exactly one cost term and must FAIL
+	# its threshold AND attribute the failure to that term.
+	if $bench --outputdir "$work/nc-lease" --driver lease -- \
+		--leases 3000 --lanes "$lease_lanes" --resetters "$resetters" \
+		--retire-after "$retire_after" --workload light \
+		--negative-control --resetter-delay-ms 30
+	then nc_lease=BEHAVED; else nc_lease="DID NOT BEHAVE"; rc=1; fi
+	if $bench --outputdir "$work/nc-reset" --driver reset -- \
+		--resets 400 --lanes memcow_lane_00,memcow_lane_01 \
+		--busy-lanes memcow_lane_02,memcow_lane_03 --busy-mode soak \
+		--negative-control --nc-sweep-wait-ms 40
+	then nc_reset=BEHAVED; else nc_reset="DID NOT BEHAVE"; rc=1; fi
+
+	# --- (2) lease -> first parameterized query, 100k, with ready capacity -
+	if $bench --outputdir "$work/lease-light" --driver lease -- \
+		--leases "$leases" --lanes "$lease_lanes" --resetters "$resetters" \
+		--retire-after "$retire_after" --workload light
+	then lease_light=PASS; else lease_light=FAIL; rc=1; fi
+	# the same through the soak (DDL+DML) workload, and read-only, for A.4 (2)
+	if $bench --outputdir "$work/lease-soak" --driver lease -- \
+		--leases $((leases / 5)) --lanes "$lease_lanes" --resetters "$resetters" \
+		--retire-after "$retire_after" --workload soak
+	then lease_soak=PASS; else lease_soak=FAIL; rc=1; fi
+	# read-only, PACED: with no work at all between the first query and the
+	# release, an unpaced driver leases at whatever rate the resetters can
+	# recycle lanes and measures nothing but that rate (1199 leases/s, 435
+	# of 1000 leases waited, in the first run).  Paced at 500/s -- below the
+	# ~650/s the light run sustains -- it measures the lease path without
+	# writes, which is what A.4 (2) compares against.
+	if $bench --outputdir "$work/lease-query" --driver lease -- \
+		--leases $((leases / 5)) --lanes "$lease_lanes" --resetters "$resetters" \
+		--retire-after "$retire_after" --workload query --rate 500
+	then lease_query=PASS; else lease_query=FAIL; rc=1; fi
+
+	# --- (3) reset p99 at 512MB under concurrent busy lanes ---------------
+	busy6=memcow_lane_02,memcow_lane_03,memcow_lane_04,memcow_lane_05,memcow_lane_06,memcow_lane_07
+	if $bench --outputdir "$work/reset-idle" --driver reset -- \
+		--resets "$resets" --lanes memcow_lane_00,memcow_lane_01 \
+		--retire-after "$retire_after" --label idle
+	then reset_idle=PASS; else reset_idle=FAIL; rc=1; fi
+	if $bench --outputdir "$work/reset-busy-soak" --driver reset -- \
+		--resets "$resets" --lanes memcow_lane_00,memcow_lane_01 \
+		--retire-after "$retire_after" --busy-lanes "$busy6" --busy-mode soak --label busy-soak
+	then reset_soak=PASS; else reset_soak=FAIL; rc=1; fi
+	if $bench --outputdir "$work/reset-busy-plpgsql" --driver reset -- \
+		--resets "$resets" --lanes memcow_lane_00,memcow_lane_01 \
+		--retire-after "$retire_after" --busy-lanes "$busy6" --busy-mode plpgsql --label busy-plpgsql
+	then reset_plpgsql=PASS; else reset_plpgsql=FAIL; rc=1; fi
+	# informational: a neighbour that holds interrupts is the global
+	# barrier's worst case; reported, not gated (see A.4 item 3)
+	if $bench --outputdir "$work/reset-hold" --driver reset -- \
+		--resets 300 --lanes memcow_lane_00,memcow_lane_01 \
+		--retire-after "$retire_after" --busy-lanes memcow_lane_02 --busy-mode hold \
+		--hold-ms 200 --threshold-ms 100000 --label hold
+	then reset_hold=MEASURED; else reset_hold=FAILED; fi
+
+	# --- (4) Appendix A.4, from the numbers ---------------------------------
+	a4="$work/a4"
+	mkdir -p "$a4"
+	cp "$work/lease-soak/report.json" "$a4/lease_soak.json" 2>/dev/null
+	cp "$work/lease-query/report.json" "$a4/lease_query.json" 2>/dev/null
+	cp "$work/lease-light/report.json" "$a4/lease_light.json" 2>/dev/null
+	cp "$work/reset-idle/report.json" "$a4/reset_idle.json" 2>/dev/null
+	cp "$work/reset-busy-soak/report.json" "$a4/reset_busy_soak.json" 2>/dev/null
+	cp "$work/reset-busy-plpgsql/report.json" "$a4/reset_busy_plpgsql.json" 2>/dev/null
+	cp "$work/reset-hold/report.json" "$a4/reset_hold.json" 2>/dev/null
+	python3 "$here/../bench/a4_summary.py" "$a4" || rc=1
+
+	lat() { python3 -c "
+import json
+try:
+    r=json.load(open('$1'))
+    k='lease_ms' if 'lease_ms' in r else 'cycle_ms'
+    print('p50 %.3f p99 %.3f max %.2f ms over %d%s' % (r[k]['p50'], r[k]['p99'], r[k]['max'], r['completed'],
+          '; waits %d' % r['lease_waits'] if 'lease_waits' in r else ''))
+except Exception as e:
+    print('(no report: %s)' % e)
+" 2>/dev/null; }
+
+	cat <<MSG
+
+========================================================================
+PHASE 4 GATE  (cassert build, shared_buffers=$sb; open problem 2: option (a))
+------------------------------------------------------------------------
+  negative control, lease: cycle inflated 30 ms client-side          : $nc_lease
+  negative control, reset: 40 ms parked in the sweep step            : $nc_reset
+  lease->first query p99 < 1 ms, $leases leases, light, ready capacity : $lease_light
+             $(lat "$work/lease-light/report.json")
+  lease->first query p99 < 1 ms, $((leases / 5)) leases, soak workload   : $lease_soak
+             $(lat "$work/lease-soak/report.json")
+  lease->first query p99 < 1 ms, $((leases / 5)) leases, read-only, 500/s : $lease_query
+             $(lat "$work/lease-query/report.json")
+  reset p99 < 25 ms, $resets resets, idle neighbours                   : $reset_idle
+             $(lat "$work/reset-idle/report.json")
+  reset p99 < 25 ms, $resets resets, 6 busy lanes (DDL+DML)            : $reset_soak
+             $(lat "$work/reset-busy-soak/report.json")
+  reset p99 < 25 ms, $resets resets, 6 busy lanes (tight plpgsql loop) : $reset_plpgsql
+             $(lat "$work/reset-busy-plpgsql/report.json")
+  barrier vs an interrupts-held neighbour (informational)            : $reset_hold
+             $(lat "$work/reset-hold/report.json")
+------------------------------------------------------------------------
+  pool: $resetters resetter thread(s), $(echo "$lease_lanes" | tr ',' '\n' | wc -l | tr -d ' ') lanes, retire after $retire_after epochs
+  zero leakage is part of every PASS above (DSM, PGDATA-minus-WAL, AIO
+             handles, pins, fds, mappings to gone segments, log scan).
+  Appendix A.4 answers: $a4/a4_summary.txt
+  not re-run here: phases 1-3.  Phase 4 changed the engine (reset
+             timings, the sweep injection point, adopt timing, the
+             interrupt-hold helper), so run all three again after it.
+  artifacts: $work
+========================================================================
 MSG
-	exit 3
+
+	if [ $rc -eq 0 ]; then
+		if [ "$leases" -lt 100000 ]; then
+			echo "GATE PASS (phase 4, SMOKE: $leases leases, not the §7.4 gate)"
+		else
+			echo "GATE PASS (phase 4, $leases leases, $resets resets per load)"
+		fi
+	else
+		echo "GATE FAIL (phase 4)"
+	fi
+	exit $rc
 	;;
 *)
 	echo "run_gate.sh: unknown phase '$phase' (expected 0-4)" >&2
