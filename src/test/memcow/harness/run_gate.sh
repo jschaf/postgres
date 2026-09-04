@@ -643,6 +643,15 @@ MSG
 		--leases $((leases / 5)) --lanes "$lease_lanes" --resetters "$resetters" \
 		--retire-after "$retire_after" --workload query --rate 500
 	then lease_query=PASS; else lease_query=FAIL; rc=1; fi
+	# and the writing workload at the SAME pace, so that A.4 (2) compares
+	# writes against no writes and nothing else.  (The first gate run
+	# compared the unpaced runs against the paced read-only one and the
+	# rule fired on a +0.3..0.57 ms delta that three controlled repeats put
+	# at -0.02 ms: the delta was rate and run-to-run tail, not writes.)
+	if $bench --outputdir "$work/lease-light-paced" --driver lease -- \
+		--leases $((leases / 5)) --lanes "$lease_lanes" --resetters "$resetters" \
+		--retire-after "$retire_after" --workload light --rate 500
+	then lease_light_paced=PASS; else lease_light_paced=FAIL; rc=1; fi
 
 	# --- (3) reset p99 at 512MB under concurrent busy lanes ---------------
 	busy6=memcow_lane_02,memcow_lane_03,memcow_lane_04,memcow_lane_05,memcow_lane_06,memcow_lane_07
@@ -672,6 +681,7 @@ MSG
 	cp "$work/lease-soak/report.json" "$a4/lease_soak.json" 2>/dev/null
 	cp "$work/lease-query/report.json" "$a4/lease_query.json" 2>/dev/null
 	cp "$work/lease-light/report.json" "$a4/lease_light.json" 2>/dev/null
+	cp "$work/lease-light-paced/report.json" "$a4/lease_light_paced.json" 2>/dev/null
 	cp "$work/reset-idle/report.json" "$a4/reset_idle.json" 2>/dev/null
 	cp "$work/reset-busy-soak/report.json" "$a4/reset_busy_soak.json" 2>/dev/null
 	cp "$work/reset-busy-plpgsql/report.json" "$a4/reset_busy_plpgsql.json" 2>/dev/null
@@ -702,6 +712,8 @@ PHASE 4 GATE  (cassert build, shared_buffers=$sb; open problem 2: option (a))
              $(lat "$work/lease-soak/report.json")
   lease->first query p99 < 1 ms, $((leases / 5)) leases, read-only, 500/s : $lease_query
              $(lat "$work/lease-query/report.json")
+  lease->first query p99 < 1 ms, $((leases / 5)) leases, light DML, 500/s : $lease_light_paced
+             $(lat "$work/lease-light-paced/report.json")
   reset p99 < 25 ms, $resets resets, idle neighbours                   : $reset_idle
              $(lat "$work/reset-idle/report.json")
   reset p99 < 25 ms, $resets resets, 6 busy lanes (DDL+DML)            : $reset_soak

@@ -14,8 +14,9 @@ not" is never an opinion.  The rules (all at the p99 of the run they read):
                                busy reset run's slowest cycles.
   2. Test VFS / WAL bypass     TRIGGERED iff lease p99 with the writing
                                workload exceeds lease p99 with the read-only
-                               workload by more than a quarter of the 1 ms
-                               budget (0.25 ms), or any ENOSPC in the log.
+                               workload AT THE SAME PACE by more than a
+                               quarter of the 1 ms budget (0.25 ms), or any
+                               ENOSPC in the log.
   3. Per-lane barrier          TRIGGERED iff barrier absorption is more than
                                half of the reset cycle at its p99 under busy
                                lanes (soak or plpgsql).  The interrupts-held
@@ -61,6 +62,7 @@ def main():
     ls = load(d, 'lease_soak.json')
     lq = load(d, 'lease_query.json')
     ll = load(d, 'lease_light.json') or ls    # the full-rate run: where the queue would starve
+    lp = load(d, 'lease_light_paced.json')    # writes at the read-only run's pace: A.4 (2)'s partner
     rs = load(d, 'reset_busy_soak.json')
     rp = load(d, 'reset_busy_plpgsql.json')
     ri = load(d, 'reset_idle.json')
@@ -93,17 +95,23 @@ def main():
     line()
 
     # 2
-    if ls and lq:
-        a, b = p99(ls, 'lease_ms'), p99(lq, 'lease_ms')
-        enospc = [h for h in ls.get('log_hits', []) + lq.get('log_hits', []) if 'space' in h or 'ENOSPC' in h]
+    if lq and (lp or ls):
+        w = lp or ls
+        a, b = p99(w, 'lease_ms'), p99(lq, 'lease_ms')
+        enospc = [h for h in w.get('log_hits', []) + lq.get('log_hits', []) if 'space' in h or 'ENOSPC' in h]
         trig = (a is not None and b is not None and a - b > 0.25) or bool(enospc)
         verdicts['test_vfs_wal_bypass'] = trig
         line('2. Test VFS / WAL bypass: %s' % ('TRIGGERED' if trig else 'NOT TRIGGERED'))
-        line('   lease p99 with the writing (soak) workload %.3f ms vs read-only (query) workload %.3f ms: '
+        line('   lease p99 with writes (%s workload%s) %.3f ms vs read-only (query, paced %.0f/s) %.3f ms: '
              'delta %+.3f ms (trigger: > 0.25 ms); ENOSPC/PANIC hits: %d'
-             % (a or 0, b or 0, (a or 0) - (b or 0), len(enospc)))
+             % (w['workload'], ', paced %.0f/s' % w['rate'] if w.get('rate') else '', a or 0,
+                lq.get('rate') or 0, b or 0, (a or 0) - (b or 0), len(enospc)))
+        if lp and ls:
+            line('   (the unpaced DDL+DML soak run, for reference: p99 %.3f ms, delta %+.3f ms -- a different '
+                 'rate and workload, not a like-for-like comparison)'
+                 % (p99(ls, 'lease_ms') or 0, (p99(ls, 'lease_ms') or 0) - (b or 0)))
     else:
-        line('2. Test VFS / WAL bypass: NO DATA (need lease_soak.json and lease_query.json)')
+        line('2. Test VFS / WAL bypass: NO DATA (need lease_query.json and lease_light_paced.json)')
     line()
 
     # 3
