@@ -34,7 +34,7 @@
 #   make_templates.sh --seed DIR --ramdir DIR --outdir DIR
 #
 #     --seed DIR    the read-only seed (build_seed.sh -o)
-#     --ramdir DIR  an assembled runtime PGDATA (assemble_ramdir.sh, no -R)
+#     --ramdir DIR  an assembled runtime PGDATA (assemble_ramdir.sh)
 #     --outdir DIR  where tpl-md/ and tpl-memcow/ are written (recreated)
 #
 # Exit status: 0 both templates written, 2 could not run.

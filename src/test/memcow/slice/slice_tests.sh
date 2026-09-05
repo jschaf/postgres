@@ -20,7 +20,7 @@
 #   S3  ALTER TABLE SET TABLESPACE     §7.1 item 3
 #   S4  pg_prewarm, all three modes    §7.1 item 4
 #   S5  past-EOF read is a clean ERROR findings: commit 1.3's two-phase loop
-#   S6  fingerprint mismatch is FATAL  findings: ten implemented failure modes
+#   S6  fingerprint mismatch is FATAL  seven exercised fingerprint failure modes
 #   S7  the seed is byte-identical     invariant I3
 #   S8  a crashed cluster will not run findings: reinit.c, Assert(!InRecovery)
 #   S9  documented divergences         findings: pg_relation_size returns 0
@@ -36,6 +36,8 @@
 #   S14 reset while a truncate is in flight          plan §4.3 fence, Appendix B(i)
 #   S15 the authentication-time fence               plan §5 I2 fence 2 of 3
 #   S16 the per-lane arena limit, a named error     CONCERN 4a
+#   S17 explicit retirement and relmapper mismatch   plan §4.7, §6
+#   S18 retry after publication without republishing plan Appendix B(i)
 #   R1  §7.3 (a): connection parked after auth, reset runs past it
 #   R2  §7.3 (b): SIGSTOPped straggler; reset fails closed, never publishes
 #   R3  §7.3 (c): cancel with an IO in flight, release + reset at once
@@ -48,8 +50,9 @@
 #
 # A test that has never failed is not known to work.  `--negative-control`
 # re-runs each selected case with a deliberate, case-specific sabotage applied
-# and requires the case to FAIL; a case that still passes with its subject
-# broken is reported as an INSENSITIVE INSTRUMENT and fails the run.  The
+# and requires the specific sabotage symptom (or the documented boundary
+# where the positive case must not fire). An unrelated ERROR is not evidence
+# that the detector works; an insensitive control fails the run. The
 # sabotage for each case is documented at its `nc_` function.  This is the same
 # discipline the Phase 0 harness earned its trust with.
 #
@@ -102,7 +105,7 @@
 #     --outputdir DIR     logs and artifacts (default: <pgdata>/../slice-out)
 #     --db NAME           database to run in (default: memcow_lane_00)
 #     --case NAME         run only this case (repeatable); default: all
-#     --phase 1|2         run only that phase's cases (S1-S10, or S11-S16 + R1-R5)
+#     --phase 1|2         run only that phase's cases (S1-S10, or S11-S18 + R1-R5)
 #     --list              list the cases and exit
 #     --negative-control  run the sabotage variant of each selected case and
 #                         verify its expected sabotage symptom

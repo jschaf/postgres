@@ -23,7 +23,7 @@
 # Environment overrides:
 #   MEMCOW_BUILD_DIR   build directory path       (default <root>/build-memcow)
 #   MEMCOW_BUILDTYPE   meson buildtype            (default debugoptimized)
-#   MEMCOW_PREFIX      install prefix             (default <root>/../postgres-install-memcow)
+#   MEMCOW_PREFIX      install prefix             (default <build>/install)
 #   MEMCOW_WERROR      true/false                 (default false)
 #   MEMCOW_PERL        perl used for TAP tests    (default Homebrew perl, else `perl`)
 #   MEMCOW_TAP_TESTS   enabled/disabled/auto      (default: enabled if this
