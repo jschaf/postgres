@@ -58,14 +58,6 @@ RETURNS record
 AS 'MODULE_PATHNAME', 'memcow_lane_reset_timings_sql'
 LANGUAGE C STRICT VOLATILE;
 
--- Test helper (plan §7.4, barrier absorption): hold off interrupts in THIS
--- backend for ms milliseconds, so that it cannot absorb a ProcSignal barrier
--- until then -- a deterministic CFI-starved process.
-CREATE FUNCTION memcow_lane_starve_interrupts(ms int)
-RETURNS void
-AS 'MODULE_PATHNAME', 'memcow_lane_starve_interrupts_sql'
-LANGUAGE C STRICT VOLATILE;
-
 -- Lane-backend functions (plan §3.9): run in the lane, on each retained
 -- connection, after memcow_lane_reset returned.
 CREATE FUNCTION memcow_backend_reset()
@@ -86,7 +78,6 @@ REVOKE ALL ON FUNCTION memcow_lane_unregister(oid, int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_lane_status(oid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_lane_catchup(int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_lane_reset_timings(oid) FROM PUBLIC;
-REVOKE ALL ON FUNCTION memcow_lane_starve_interrupts(int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_backend_reset() FROM PUBLIC;
 REVOKE ALL ON FUNCTION memcow_backend_counters() FROM PUBLIC;
 

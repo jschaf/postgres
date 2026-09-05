@@ -28,15 +28,11 @@
 #include "libpq/auth.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
-#include "portability/instr_time.h"
 #include "memcow.h"
 #include "storage/procsignal.h"
 #include "utils/builtins.h"
 #include "utils/injection_point.h"
-#include "utils/inval.h"
 #include "utils/syscache.h"
-#include "utils/timestamp.h"
-#include "utils/tuplestore.h"
 
 PG_MODULE_MAGIC;
 
@@ -175,12 +171,6 @@ memcow_presented_nonce(Port *port)
 static void
 memcow_client_auth(Port *port, int status)
 {
-	uint32		presented;
-	Oid			dbOid;
-	uint32		nonce;
-	MemcowLaneState state;
-	MemcowAuthVerdict verdict;
-
 	if (prev_client_auth_hook)
 		prev_client_auth_hook(port, status);
 
@@ -192,35 +182,8 @@ memcow_client_auth(Port *port, int status)
 	if (IS_INJECTION_POINT_ATTACHED("memcow-skip-auth"))
 		return;
 
-	presented = memcow_presented_nonce(port);
 	/* Database/role defaults must not disable the seed-backed login fence. */
 	SetConfigOption("event_triggers", "on", PGC_SUSET, PGC_S_OVERRIDE);
-	verdict = memcow_lane_auth_check(port->database_name, presented,
-									 &dbOid, &nonce, &state);
-
-	switch (verdict)
-	{
-		case MEMCOW_AUTH_NOT_A_LANE:
-			return;
-		case MEMCOW_AUTH_ADMIT:
-			break;
-		case MEMCOW_AUTH_REFUSE_NOT_OPEN:
-			ereport(FATAL,
-					(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-					 errmsg("memcow lane for database \"%s\" is not open (state: %s)",
-							port->database_name,
-							memcow_lane_state_name(state)),
-					 errdetail("Refused by the memcow authentication fence (plan §5 I2, fence 2 of 3).")));
-			break;
-		case MEMCOW_AUTH_REFUSE_NONCE:
-			ereport(FATAL,
-					(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-					 errmsg("memcow lane nonce mismatch for database \"%s\"",
-							port->database_name),
-					 errdetail("The connection presented nonce %u at authentication; refused by the memcow authentication fence (plan §5 I2, fence 2 of 3).",
-							   presented)));
-			break;
-	}
 
 	/*
 	 * For the race tests (plan §7.3 a): a connection to a LANE that this
@@ -229,7 +192,8 @@ memcow_client_auth(Port *port, int status)
 	 * reset runs past it.  Never fires for a database that is not a lane, so
 	 * the control connection is unaffected.
 	 */
-	INJECTION_POINT("memcow-lanes-post-auth", NULL);
+	if (memcow_lane_auth_check(port->database_name, memcow_presented_nonce(port)))
+		INJECTION_POINT("memcow-lanes-post-auth", NULL);
 }
 
 /* Core has already checked ownership and dependencies at OAT_DROP. */
@@ -390,37 +354,6 @@ memcow_lane_unregister_sql(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-PG_FUNCTION_INFO_V1(memcow_lane_status_sql);
-Datum
-memcow_lane_status_sql(PG_FUNCTION_ARGS)
-{
-	Oid			dbOid = PG_GETARG_OID(0);
-	MemcowLaneStatus st;
-	TupleDesc	tupdesc;
-	Datum		values[11];
-	bool		nulls[11];
-
-	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-		elog(ERROR, "return type must be a row type");
-
-	memcow_lane_status(dbOid, &st);
-
-	memset(nulls, 0, sizeof(nulls));
-	values[0] = CStringGetTextDatum(memcow_lane_state_name(st.state));
-	values[1] = Int64GetDatum((int64) st.epoch);
-	values[2] = Int64GetDatum((int64) st.nonce);
-	values[3] = Int32GetDatum(st.nregistered);
-	values[4] = Int64GetDatum(st.arena_bytes);
-	values[5] = Int32GetDatum((int32) st.attached);
-	values[6] = Int32GetDatum((int32) st.attached_old);
-	values[7] = BoolGetDatum(st.reclaim_pending);
-	values[8] = Int64GetDatum((int64) st.writes_discarded);
-	values[9] = Int64GetDatum((int64) st.poisoned_pages);
-	values[10] = Int64GetDatum(st.arena_limit);
-
-	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
-}
-
 /*
  * memcow_lane_catchup(pid) -- a test helper: deliver a sinval catchup
  * interrupt to one backend, exactly as SICleanupQueue() would to a backend
@@ -451,188 +384,17 @@ memcow_lane_catchup_sql(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-/*
- * memcow_lane_reset_timings(dboid) -- plan §7.4's cost attribution: where
- * the lane's last completed reset spent its time, one column per step, all
- * in microseconds.  Every column NULL when no reset has completed.
- */
-PG_FUNCTION_INFO_V1(memcow_lane_reset_timings_sql);
-Datum
-memcow_lane_reset_timings_sql(PG_FUNCTION_ARGS)
-{
-	Oid			dbOid = PG_GETARG_OID(0);
-	MemcowLaneResetTimings t;
-	TupleDesc	tupdesc;
-	Datum		values[15];
-	bool		nulls[15];
-
-	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-		elog(ERROR, "return type must be a row type");
-
-	if (!memcow_lane_reset_timings(dbOid, &t))
-	{
-		memset(nulls, true, sizeof(nulls));
-		memset(values, 0, sizeof(values));
-		PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
-	}
-
-	memset(nulls, 0, sizeof(nulls));
-	values[0] = Int64GetDatum((int64) t.epoch);
-	values[1] = Int64GetDatum(t.total_us);
-	values[2] = Int64GetDatum(t.fence_us);
-	values[3] = Int64GetDatum(t.prepare_us);
-	values[4] = Int64GetDatum(t.publish_us);
-	values[5] = Int64GetDatum(t.barrier_us);
-	values[6] = Int64GetDatum(t.sweep_buffers_us);
-	values[7] = Int64GetDatum(t.sweep_files_us);
-	values[8] = Int64GetDatum(t.reclaim_wait_us);
-	values[9] = Int64GetDatum(t.poison_us);
-	values[10] = Int64GetDatum(t.destroy_us);
-	values[11] = Int32GetDatum(t.fence_polls);
-	values[12] = Int32GetDatum(t.reclaim_polls);
-	values[13] = Int32GetDatum(t.stragglers);
-	values[14] = Int64GetDatum((int64) t.poisoned_pages);
-
-	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
-}
-
-/*
- * memcow_lane_starve_interrupts(ms) -- a test helper for plan §7.4's barrier
- * measurement: this backend holds off interrupts for ms milliseconds.
- * ProcessInterrupts() returns at once while InterruptHoldoffCount is
- * nonzero, so a ProcSignal barrier emitted meanwhile is absorbed only when
- * the hold ends; a reset waiting on that barrier waits exactly that long.
- * That is the CFI-starved process the plan asks the barrier to be measured
- * against, made deterministic.  Superuser only; bounded to a minute.
- * (First version used one pg_usleep(), which the barrier's signal cut
- * short: the reset benchmark then saw no hold at all -- barrier p99 1.5 ms
- * against a "200 ms" neighbour.  Measured, not assumed.)
- */
-PG_FUNCTION_INFO_V1(memcow_lane_starve_interrupts_sql);
-Datum
-memcow_lane_starve_interrupts_sql(PG_FUNCTION_ARGS)
-{
-	int32		ms = PG_GETARG_INT32(0);
-
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to hold off interrupts")));
-	if (ms < 0 || ms > 60000)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("ms must be between 0 and 60000")));
-
-	/*
-	 * pg_usleep() returns early when a signal arrives -- and the barrier's
-	 * own SIGURG is one -- so sleep in a loop to the deadline: the handler
-	 * runs and sets its flags, and this backend goes on ignoring them, which
-	 * is the point.
-	 */
-	{
-		TimestampTz deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), ms);
-
-		HOLD_INTERRUPTS();
-		for (;;)
-		{
-			long		secs;
-			int			usecs;
-			TimestampTz now = GetCurrentTimestamp();
-
-			if (now >= deadline)
-				break;
-			TimestampDifference(now, deadline, &secs, &usecs);
-			pg_usleep(secs * 1000000L + usecs);
-		}
-		RESUME_INTERRUPTS();
-	}
-
-	PG_RETURN_VOID();
-}
-
 /* ----------------------------------------------------------------
  *		lane-backend functions
  * ----------------------------------------------------------------
  */
 
-/* the last adopt's InvalidateSystemCaches() time, for the §7.4 breakdown */
-static int64 memcow_adopt_last_us = 0;
-static int64 memcow_adopt_total_us = 0;
-static int64 memcow_adopt_count = 0;
-
-/*
- * The per-connection adopt call (plan §3.9, Appendix A.1.1).
- * InvalidateSystemCaches() discards relcache, catcache, the relation map
- * cache and -- via smgrreleaseall() -- this backend's attachment to the old
- * epoch; memcow_backend_adopt() then verifies that and reports the epoch.
- */
+/* The per-connection adopt call (plan §3.9): see memcow_backend_adopt(). */
 PG_FUNCTION_INFO_V1(memcow_backend_reset_sql);
 Datum
 memcow_backend_reset_sql(PG_FUNCTION_ARGS)
 {
-	instr_time	t0;
-	instr_time	t1;
-	uint32		epoch;
-
-	INSTR_TIME_SET_CURRENT(t0);
-	InvalidateSystemCaches();
-	epoch = memcow_backend_adopt();
-	INSTR_TIME_SET_CURRENT(t1);
-	INSTR_TIME_SUBTRACT(t1, t0);
-	memcow_adopt_last_us = INSTR_TIME_GET_MICROSEC(t1);
-	memcow_adopt_total_us += memcow_adopt_last_us;
-	memcow_adopt_count++;
-
-	PG_RETURN_INT64((int64) epoch);
-}
-
-PG_FUNCTION_INFO_V1(memcow_backend_counters_sql);
-Datum
-memcow_backend_counters_sql(PG_FUNCTION_ARGS)
-{
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	MemcowBackendCounters c;
-	struct
-	{
-		const char *name;
-		uint64		value;
-	}			rows[10];
-
-	InitMaterializedSRF(fcinfo, 0);
-	memcow_get_backend_counters(&c);
-
-	rows[0].name = "attaches";
-	rows[0].value = c.attaches;
-	rows[1].name = "detaches";
-	rows[1].value = c.detaches;
-	rows[2].name = "nblocks_pin_refresh";
-	rows[2].value = c.nblocks_pin_refresh;
-	rows[3].name = "truncate_pinned";
-	rows[3].value = c.truncate_pinned;
-	rows[4].name = "truncate_traversed";
-	rows[4].value = c.truncate_traversed;
-	rows[5].name = "truncate_allocated";
-	rows[5].value = c.truncate_allocated;
-	rows[6].name = "writes_discarded";
-	rows[6].value = c.writes_discarded;
-	rows[7].name = "adopt_last_us";
-	rows[7].value = (uint64) memcow_adopt_last_us;
-	rows[8].name = "adopt_total_us";
-	rows[8].value = (uint64) memcow_adopt_total_us;
-	rows[9].name = "adopt_count";
-	rows[9].value = (uint64) memcow_adopt_count;
-
-	for (int i = 0; i < lengthof(rows); i++)
-	{
-		Datum		values[2];
-		bool		nulls[2] = {false, false};
-
-		values[0] = CStringGetTextDatum(rows[i].name);
-		values[1] = Int64GetDatum((int64) rows[i].value);
-		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
-	}
-
-	PG_RETURN_VOID();
+	PG_RETURN_INT64((int64) memcow_backend_adopt());
 }
 
 /* Runs in the seed-backed ON login trigger before either protocol dispatches. */

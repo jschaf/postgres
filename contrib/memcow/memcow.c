@@ -145,6 +145,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/htup_details.h"
 #include "access/twophase.h"
 #include "access/xlog.h"
 #include "access/xlogutils.h"
@@ -153,6 +154,8 @@
 #include "catalog/pg_database.h"
 #include "common/pg_prng.h"
 #include "common/relpath.h"
+#include "fmgr.h"
+#include "funcapi.h"
 #include "lib/dshash.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
@@ -171,12 +174,15 @@
 #include "storage/procsignal.h"
 #include "storage/shmem.h"
 #include "utils/backend_status.h"
+#include "utils/builtins.h"
 #include "utils/dsa.h"
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/relcache.h"
 #include "utils/timestamp.h"
+#include "utils/tuplestore.h"
 
 /* GUC variables */
 bool		memcow_enabled = false;
@@ -401,6 +407,43 @@ typedef struct MemcowBlockEntry
 } MemcowBlockEntry;
 
 /*
+ * Lane admission state; zero so that a fresh slot is open.
+ */
+typedef enum MemcowLaneState
+{
+	MEMCOW_LANE_OPEN = 0,
+	MEMCOW_LANE_RESETTING,
+	MEMCOW_LANE_RETIRED
+} MemcowLaneState;
+
+/*
+ * Where the last memcow_lane_reset() of a lane spent its time (plan §7.4 cost
+ * attribution).  Microseconds, measured with instr_time around each step;
+ * total_us is CLOSE to return.  Polls are iterations of the bounded waits
+ * (each one a 10 ms sleep), stragglers the PIDs the fence terminated.  Written
+ * under the lane lock when a reset returns; a reset that raises leaves the
+ * previous record in place, so epoch says which reset the record is of.
+ */
+typedef struct MemcowLaneResetTimings
+{
+	uint32		epoch;			/* the epoch that reset published */
+	int64		total_us;
+	int64		fence_us;		/* step 3: idle check + straggler kills */
+	int64		prepare_us;		/* step 4: dsa_create + dshash tables */
+	int64		publish_us;		/* step 5: the locked store */
+	int64		barrier_us;		/* step 6: emit -> every process absorbed */
+	int64		sweep_buffers_us;	/* step 7a: DropDatabaseBuffers */
+	int64		sweep_files_us; /* step 7b: pg_internal.init + pg_filenode.map */
+	int64		reclaim_wait_us;	/* step 8a: attach count -> 0 */
+	int64		poison_us;		/* step 8b: old-arena poison walk (cassert) */
+	int64		destroy_us;		/* step 8c: unpin + detach + verify gone */
+	int32		fence_polls;
+	int32		reclaim_polls;
+	int32		stragglers;
+	uint32		poisoned_pages;
+} MemcowLaneResetTimings;
+
+/*
  * How many pool backends a lane may register.  A lane is one database, and
  * the plan's pool opens M connections per lane with M in the single digits;
  * 64 leaves an order of magnitude of headroom and costs 256 bytes per slot.
@@ -590,8 +633,17 @@ static HTAB *MemcowDbHash = NULL;
 /* the reset_generation this process has already acted on */
 static uint32 MemcowSeenResetGen = 0;
 
-/* per-process event counters; read back through memcow_get_backend_counters() */
-static MemcowBackendCounters MemcowCounters;
+/* per-process event counters; read back through memcow_backend_counters() */
+static struct
+{
+	uint64		attaches;
+	uint64		detaches;
+	uint64		nblocks_pin_refresh;
+	uint64		truncate_pinned;
+	uint64		truncate_unpinned;
+	uint64		writes_discarded;
+	uint64		adopt_last_us;	/* the last memcow_backend_reset()'s server time */
+}			MemcowCounters;
 
 static void memcow_check_seed_directory(void);
 static void memcow_check_fingerprint(void);
@@ -3245,8 +3297,8 @@ memcow_nblocks(SMgrRelation reln, ForkNumber forknum)
  * re-locked through its own LWLock. The pointer and lock were mapped by
  * memcow_nblocks() before the critical section. No hash table traversal or
  * dsa_get_address() occurs on this path, so it cannot attach a new segment.
- * The traversing/allocating fallbacks are retained for non-critical callers;
- * slice S10 and S13 require neither fallback during a critical truncate.
+ * The unwarmed fallback is retained for non-critical callers; slice S10 and
+ * S13 require that it is never taken during a critical truncate.
  */
 void
 memcow_truncate(SMgrRelation reln, ForkNumber forknum,
@@ -3254,7 +3306,6 @@ memcow_truncate(SMgrRelation reln, ForkNumber forknum,
 {
 	MemcowDbLocal *db;
 	MemcowRelEntry *re;
-	MemcowRelKey relkey;
 	bool		created;
 
 	/* mdtruncate()'s guards, verbatim in effect */
@@ -3310,22 +3361,19 @@ memcow_truncate(SMgrRelation reln, ForkNumber forknum,
 				MemcowCounters.truncate_pinned++;
 			}
 		}
-
-		/* the traversing fallback; see the header comment */
-		if (re == NULL)
-		{
-			memcow_rel_key(&relkey, &reln->smgr_rlocator, forknum);
-			re = memcow_find_rel(db, &relkey, true);
-			if (re != NULL)
-				MemcowCounters.truncate_traversed++;
-		}
 	}
 
-	/* the allocating fallback; see the header comment */
+	/*
+	 * The unwarmed fallback, for a caller outside any critical section (the
+	 * only such caller in the tree is pg_visibility's map truncation): find or
+	 * create the record, which may traverse and allocate.  Inside a critical
+	 * section the warmed path above must have hit; the counter is how slice
+	 * S13 checks that it did.
+	 */
 	if (re == NULL)
 	{
 		re = memcow_relentry_lock(reln, forknum, &db, &created);
-		MemcowCounters.truncate_allocated++;
+		MemcowCounters.truncate_unpinned++;
 	}
 
 	if (!re->exists)
@@ -3518,7 +3566,7 @@ memcow_fd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
  * ----------------------------------------------------------------
  */
 
-const char *
+static const char *
 memcow_lane_state_name(MemcowLaneState state)
 {
 	switch (state)
@@ -3754,15 +3802,19 @@ memcow_lane_open(Oid dbOid, bool arm, const char *datname)
 }
 
 /*
- * memcow_lane_auth_check() -- the authentication-time fence's question.
+ * memcow_lane_auth_check() -- the authentication-time fence (plan §5 I2,
+ * fence 2 of 3), called from the ClientAuthentication_hook in lanes.c.
  *
  * Runs in ClientAuthentication(), i.e. before the backend has a database,
  * a transaction or a relcache, so the lane is found by NAME, which
  * memcow_lane_open() recorded in the slot.  A database that was never
- * opened as a lane is not one, whatever has been written to it.  An unarmed
- * lane admits anyone; an armed lane admits only the current nonce, and only
- * while OPEN (plan §4.1: at CLOSE "auth hook, PostgresMain admission and
- * wrapper handout now fail for lane D").
+ * opened as a lane is not one, whatever has been written to it, and admits
+ * anyone; returns false for it.  An unarmed lane admits anyone; an armed lane
+ * admits only the current nonce, and only while OPEN (plan §4.1: at CLOSE
+ * "auth hook, login admission and wrapper handout now fail for lane D").  A
+ * refusal is FATAL here, with a DETAIL naming this fence so that a test can
+ * tell it apart from the login trigger's refusal in the log.  Returns true
+ * for an admitted lane connection.
  *
  * This fence is never the final one (plan A.1.3): it runs before the
  * database startup lock and before the ProcArray advertisement, so a
@@ -3771,19 +3823,15 @@ memcow_lane_open(Oid dbOid, bool arm, const char *datname)
  * that a stale connection string dies before it costs the server a database
  * startup, and that it dies at a place a test can tell apart in the log.
  */
-MemcowAuthVerdict
-memcow_lane_auth_check(const char *datname, uint32 presented, Oid *dbOid,
-					   uint32 *nonce, MemcowLaneState *state)
+bool
+memcow_lane_auth_check(const char *datname, uint32 presented)
 {
 	MemcowDbSlot *slot = NULL;
-	MemcowAuthVerdict verdict;
-
-	*dbOid = InvalidOid;
-	*nonce = 0;
-	*state = MEMCOW_LANE_OPEN;
+	uint32		nonce = 0;
+	MemcowLaneState state = MEMCOW_LANE_OPEN;
 
 	if (!memcow_enabled || MemcowShmem == NULL || datname == NULL)
-		return MEMCOW_AUTH_NOT_A_LANE;
+		return false;
 
 	LWLockAcquire(&MemcowShmem->lock, LW_SHARED);
 	for (int i = 0; i < MemcowShmem->nslots; i++)
@@ -3794,42 +3842,56 @@ memcow_lane_auth_check(const char *datname, uint32 presented, Oid *dbOid,
 			strcmp(cand->datname, datname) == 0)
 		{
 			slot = cand;
+			nonce = slot->nonce;
+			state = slot->state;
 			break;
 		}
-	}
-	if (slot != NULL)
-	{
-		*dbOid = slot->dbOid;
-		*nonce = slot->nonce;
-		*state = slot->state;
 	}
 	LWLockRelease(&MemcowShmem->lock);
 
 	if (slot == NULL)
-		verdict = MEMCOW_AUTH_NOT_A_LANE;
-	else if (*nonce == 0)
-		verdict = MEMCOW_AUTH_ADMIT;
-	else if (*state != MEMCOW_LANE_OPEN)
-		verdict = MEMCOW_AUTH_REFUSE_NOT_OPEN;
-	else if (presented != *nonce)
-		verdict = MEMCOW_AUTH_REFUSE_NONCE;
-	else
-		verdict = MEMCOW_AUTH_ADMIT;
-
-	return verdict;
+		return false;
+	if (nonce == 0)
+		return true;
+	if (state != MEMCOW_LANE_OPEN)
+		ereport(FATAL,
+				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+				 errmsg("memcow lane for database \"%s\" is not open (state: %s)",
+						datname, memcow_lane_state_name(state)),
+				 errdetail("Refused by the memcow authentication fence (plan §5 I2, fence 2 of 3).")));
+	if (presented != nonce)
+		ereport(FATAL,
+				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+				 errmsg("memcow lane nonce mismatch for database \"%s\"", datname),
+				 errdetail("The connection presented nonce %u at authentication; refused by the memcow authentication fence (plan §5 I2, fence 2 of 3).",
+						   presented)));
+	return true;
 }
 
 /*
- * memcow_lane_status() -- a snapshot of a lane's slot, for tests and the pool.
+ * memcow_lane_status(dboid) -- a snapshot of a lane's slot, for tests and
+ * the pool.  A database with no slot reports as OPEN at epoch 0 with nothing
+ * attached, which is what a never-written lane is.
  */
-void
-memcow_lane_status(Oid dbOid, MemcowLaneStatus *st)
+PG_FUNCTION_INFO_V1(memcow_lane_status_sql);
+Datum
+memcow_lane_status_sql(PG_FUNCTION_ARGS)
 {
+	Oid			dbOid = PG_GETARG_OID(0);
 	MemcowDbSlot *slot;
+	TupleDesc	tupdesc;
+	Datum		values[11];
+	bool		nulls[11];
 	dsa_handle	area = DSA_HANDLE_INVALID;
 
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
 	memcow_lane_check_enabled();
-	memset(st, 0, sizeof(*st));
+
+	memset(nulls, 0, sizeof(nulls));
+	memset(values, 0, sizeof(values));
+	values[0] = CStringGetTextDatum("OPEN");
+	values[7] = BoolGetDatum(false);
 
 	LWLockAcquire(&MemcowShmem->lock, LW_SHARED);
 	slot = memcow_find_slot(dbOid);
@@ -3837,23 +3899,24 @@ memcow_lane_status(Oid dbOid, MemcowLaneStatus *st)
 	{
 		uint32		epoch = pg_atomic_read_u32(&slot->epoch);
 
-		st->is_lane = true;
-		st->state = slot->state;
-		st->epoch = epoch;
-		st->nonce = slot->nonce;
-		st->nregistered = slot->nregistered;
-		st->attached = pg_atomic_read_u32(&slot->attached[epoch & 1]);
-		st->attached_old = pg_atomic_read_u32(&slot->attached[(epoch + 1) & 1]);
-		st->reclaim_pending = slot->reclaim_pending;
-		st->writes_discarded = pg_atomic_read_u64(&slot->writes_discarded);
-		st->poisoned_pages = slot->poisoned_pages;
-		st->arena_limit = (int64) slot->arena_limit;
+		values[0] = CStringGetTextDatum(memcow_lane_state_name(slot->state));
+		values[1] = Int64GetDatum((int64) epoch);
+		values[2] = Int64GetDatum((int64) slot->nonce);
+		values[3] = Int32GetDatum(slot->nregistered);
+		values[5] = Int32GetDatum((int32) pg_atomic_read_u32(&slot->attached[epoch & 1]));
+		values[6] = Int32GetDatum((int32) pg_atomic_read_u32(&slot->attached[(epoch + 1) & 1]));
+		values[7] = BoolGetDatum(slot->reclaim_pending);
+		values[8] = Int64GetDatum((int64) pg_atomic_read_u64(&slot->writes_discarded));
+		values[9] = Int64GetDatum((int64) slot->poisoned_pages);
+		values[10] = Int64GetDatum((int64) slot->arena_limit);
 		area = slot->area;
 	}
 	LWLockRelease(&MemcowShmem->lock);
 
 	if (slot != NULL)
-		st->arena_bytes = (int64) dsa_get_total_size_from_handle(area);
+		values[4] = Int64GetDatum((int64) dsa_get_total_size_from_handle(area));
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
 /*
@@ -3923,13 +3986,15 @@ memcow_check_admission(void)
 }
 
 /*
- * memcow_backend_adopt() -- the server-side half of memcow_backend_reset().
+ * memcow_backend_adopt() -- memcow_backend_reset(): the per-connection adopt
+ * call (plan §3.9, Appendix A.1.1).
  *
- * The caller (contrib/memcow) has just run InvalidateSystemCaches(),
- * which reached smgrreleaseall() and therefore memcow_release_stale_epochs();
- * this verifies that nothing stale survived and returns the epoch this
- * backend is now at.  A surviving stale attachment is a bug in the release
- * path, not a condition to recover from quietly.
+ * InvalidateSystemCaches() discards relcache, catcache, the relation map
+ * cache and -- via smgrreleaseall() -> memcow_release_stale_epochs() -- this
+ * backend's attachment to the old epoch; then verify that nothing stale
+ * survived and return the epoch this backend is now at.  A surviving stale
+ * attachment is a bug in the release path, not a condition to recover from
+ * quietly.  The elapsed time is kept for the §7.4 breakdown.
  */
 uint32
 memcow_backend_adopt(void)
@@ -3937,9 +4002,13 @@ memcow_backend_adopt(void)
 	MemcowDbSlot *slot;
 	MemcowDbLocal *db;
 	uint32		epoch = 0;
+	instr_time	t0;
+	instr_time	t1;
 
 	memcow_lane_check_enabled();
 
+	INSTR_TIME_SET_CURRENT(t0);
+	InvalidateSystemCaches();
 	memcow_maybe_detach_stale();
 
 	LWLockAcquire(&MemcowShmem->lock, LW_SHARED);
@@ -3954,13 +4023,48 @@ memcow_backend_adopt(void)
 		elog(ERROR, "memcow: an attachment to epoch %u of database %u survived adoption of epoch %u",
 			 db->epoch, MyDatabaseId, epoch);
 
+	INSTR_TIME_SET_CURRENT(t1);
+	INSTR_TIME_SUBTRACT(t1, t0);
+	MemcowCounters.adopt_last_us = INSTR_TIME_GET_MICROSEC(t1);
+
 	return epoch;
 }
 
-void
-memcow_get_backend_counters(MemcowBackendCounters *out)
+/*
+ * memcow_backend_counters() -- this backend's event counters, one row each.
+ * Diagnostics: slice S13 reads the truncate and pin-refresh counters, the
+ * §7.4 reset benchmark reads adopt_last_us.
+ */
+PG_FUNCTION_INFO_V1(memcow_backend_counters_sql);
+Datum
+memcow_backend_counters_sql(PG_FUNCTION_ARGS)
 {
-	*out = MemcowCounters;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	const struct
+	{
+		const char *name;
+		uint64		value;
+	}			rows[] = {
+		{"attaches", MemcowCounters.attaches},
+		{"detaches", MemcowCounters.detaches},
+		{"nblocks_pin_refresh", MemcowCounters.nblocks_pin_refresh},
+		{"truncate_pinned", MemcowCounters.truncate_pinned},
+		{"truncate_unpinned", MemcowCounters.truncate_unpinned},
+		{"writes_discarded", MemcowCounters.writes_discarded},
+		{"adopt_last_us", MemcowCounters.adopt_last_us},
+	};
+
+	InitMaterializedSRF(fcinfo, 0);
+	for (int i = 0; i < lengthof(rows); i++)
+	{
+		Datum		values[2];
+		bool		nulls[2] = {false, false};
+
+		values[0] = CStringGetTextDatum(rows[i].name);
+		values[1] = Int64GetDatum((int64) rows[i].value);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	PG_RETURN_VOID();
 }
 
 /*
@@ -4593,26 +4697,58 @@ memcow_lane_reset(Oid dbOid, Oid spcOid, int timeout_ms)
 }
 
 /*
- * memcow_lane_reset_timings() -- the last completed reset's cost breakdown.
- * Returns false if the database is not a lane or no reset has completed.
+ * memcow_lane_reset_timings(dboid) -- plan §7.4's cost attribution: where
+ * the lane's last completed reset spent its time, one column per step, all
+ * in microseconds.  Every column NULL when no reset has completed.
  */
-bool
-memcow_lane_reset_timings(Oid dbOid, MemcowLaneResetTimings *t)
+PG_FUNCTION_INFO_V1(memcow_lane_reset_timings_sql);
+Datum
+memcow_lane_reset_timings_sql(PG_FUNCTION_ARGS)
 {
+	Oid			dbOid = PG_GETARG_OID(0);
 	MemcowDbSlot *slot;
+	MemcowLaneResetTimings t;
 	bool		found = false;
+	TupleDesc	tupdesc;
+	Datum		values[15];
+	bool		nulls[15];
 
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
 	memcow_lane_check_enabled();
-	memset(t, 0, sizeof(*t));
 
 	LWLockAcquire(&MemcowShmem->lock, LW_SHARED);
 	slot = memcow_find_slot(dbOid);
 	if (slot != NULL && slot->last_reset.total_us > 0)
 	{
-		*t = slot->last_reset;
+		t = slot->last_reset;
 		found = true;
 	}
 	LWLockRelease(&MemcowShmem->lock);
 
-	return found;
+	memset(values, 0, sizeof(values));
+	if (!found)
+	{
+		memset(nulls, true, sizeof(nulls));
+		PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+	}
+
+	memset(nulls, 0, sizeof(nulls));
+	values[0] = Int64GetDatum((int64) t.epoch);
+	values[1] = Int64GetDatum(t.total_us);
+	values[2] = Int64GetDatum(t.fence_us);
+	values[3] = Int64GetDatum(t.prepare_us);
+	values[4] = Int64GetDatum(t.publish_us);
+	values[5] = Int64GetDatum(t.barrier_us);
+	values[6] = Int64GetDatum(t.sweep_buffers_us);
+	values[7] = Int64GetDatum(t.sweep_files_us);
+	values[8] = Int64GetDatum(t.reclaim_wait_us);
+	values[9] = Int64GetDatum(t.poison_us);
+	values[10] = Int64GetDatum(t.destroy_us);
+	values[11] = Int32GetDatum(t.fence_polls);
+	values[12] = Int32GetDatum(t.reclaim_polls);
+	values[13] = Int32GetDatum(t.stragglers);
+	values[14] = Int64GetDatum((int64) t.poisoned_pages);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }

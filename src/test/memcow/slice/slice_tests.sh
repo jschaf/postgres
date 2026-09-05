@@ -1805,7 +1805,7 @@ DELETE FROM public.events;
 VACUUM (TRUNCATE on) public.events;
 SELECT 'nblocks', pg_prewarm('public.events', 'prefetch', 'main');
 SELECT name || '=' || value FROM public.memcow_backend_counters()
- WHERE name IN ('nblocks_pin_refresh', 'truncate_pinned', 'truncate_traversed', 'truncate_allocated');
+ WHERE name IN ('nblocks_pin_refresh', 'truncate_pinned', 'truncate_unpinned');
 " 60)
 	ck_nomatch "session A: DELETE + VACUUM raised no error and did not crash" \
 		'ERROR|FATAL|server closed' "$out"
@@ -1817,7 +1817,7 @@ SELECT name || '=' || value FROM public.memcow_backend_counters()
 		ck "the stale epoch-0 pin was detected and refreshed ($c_before -> ${c_after:-?})" 1
 	fi
 	ck_match "the truncate went through the (fresh) pinned record" '^truncate_pinned=[1-9]' "$out"
-	ck_match "the truncate never needed the allocating fallback"    '^truncate_allocated=0$' "$out"
+	ck_match "the truncate never needed the unwarmed fallback"      '^truncate_unpinned=0$' "$out"
 
 	# It landed in epoch 1 -- another backend agrees -- and the next reset
 	# takes it away again.
