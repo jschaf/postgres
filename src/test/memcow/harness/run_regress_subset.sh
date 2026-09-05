@@ -44,7 +44,7 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=./common.sh
 . "$HERE/common.sh"
 
-PGDATA_TEMPLATE= LABEL= BUILD_DIR= OUTPUTDIR=
+PGDATA_TEMPLATE='' LABEL='' BUILD_DIR='' OUTPUTDIR=''
 SUBSET=phase0
 GUCS=()
 

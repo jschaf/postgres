@@ -105,7 +105,7 @@
 #     --phase 1|2         run only that phase's cases (S1-S10, or S11-S16 + R1-R5)
 #     --list              list the cases and exit
 #     --negative-control  run the sabotage variant of each selected case and
-#                         require it to fail
+#                         verify its expected sabotage symptom
 #     --keep-going        keep running after a failing case (default)
 #     --stop-on-fail      stop at the first failing case
 #
@@ -114,6 +114,8 @@
 # Portions Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Bash 3.2 treats empty arrays as unset under nounset; use guarded expansions.
+# Cases and their helper functions are dispatched by name in the driver.
+# shellcheck disable=SC2329
 set -o pipefail
 
 MC_PROG=slice_tests.sh
@@ -152,7 +154,7 @@ while [ $# -gt 0 ]; do
 		--db)          DB=$2; shift 2 ;;
 		--case)        CASES[${#CASES[@]}]=$2; shift 2 ;;
 		--phase)       PHASE=$2; shift 2 ;;
-		--list)        printf '%s\n' $ALL_CASES; exit 0 ;;
+		--list)        printf '%s\n' "$ALL_CASES" | tr ' ' '\n'; exit 0 ;;
 		--negative-control) NEGATIVE=1; shift ;;
 		--keep-going)  STOP_ON_FAIL=0; shift ;;
 		--stop-on-fail) STOP_ON_FAIL=1; shift ;;
@@ -1489,7 +1491,7 @@ sess_wait()
 	local out="$OUTPUTDIR/sess-$name/out"
 	while ! grep -q "__MARK_${name}_${seq}__" "$out" 2>/dev/null; do
 		i=$((i + 1))
-		[ $i -lt $((timeout * 10)) ] || return 1
+		[ "$i" -lt $((timeout * 10)) ] || return 1
 		sleep 0.1
 	done
 }
@@ -1526,7 +1528,7 @@ sess_close()	# sess_close NAME FD
 	pid=$(cat "$dir/pid" 2>/dev/null)
 	while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; do
 		i=$((i + 1))
-		if [ $i -gt 100 ]; then kill "$pid" 2>/dev/null; break; fi
+		if [ "$i" -gt 100 ]; then kill "$pid" 2>/dev/null; break; fi
 		sleep 0.1
 	done
 	rm -f "$dir/in"
@@ -1543,7 +1545,7 @@ wake_until_done()
 	while ! sess_wait "$name" "$seq" 1; do
 		psql_ctl -c "SELECT injection_points_wakeup('$point')" >/dev/null 2>&1
 		i=$((i + 1))
-		[ $i -lt $timeout ] || return 1
+		[ "$i" -lt "$timeout" ] || return 1
 	done
 }
 
@@ -1556,7 +1558,7 @@ wait_for_wait_event()
 		got=$(psql_ctl -c "SELECT wait_event FROM pg_stat_activity WHERE pid = $pid")
 		[ "$got" = "$ev" ] && return 0
 		i=$((i + 1))
-		[ $i -lt $((timeout * 10)) ] || return 1
+		[ "$i" -lt $((timeout * 10)) ] || return 1
 		sleep 0.1
 	done
 }
@@ -2084,7 +2086,7 @@ wait_for_backend_at()
 		got=$(psql_ctl -c "SELECT pid FROM pg_stat_activity WHERE wait_event = '$ev' LIMIT 1")
 		[ -n "$got" ] && { printf '%s\n' "$got"; return 0; }
 		i=$((i + 1))
-		[ $i -lt $((timeout * 10)) ] || return 1
+		[ "$i" -lt $((timeout * 10)) ] || return 1
 		sleep 0.1
 	done
 }
@@ -2095,7 +2097,7 @@ wait_for_pid_gone()
 	local pid=$1 timeout=${2:-20} i=0
 	while [ "$(psql_ctl -c "SELECT count(*) FROM pg_stat_activity WHERE pid = $pid")" != 0 ]; do
 		i=$((i + 1))
-		[ $i -lt $((timeout * 10)) ] || return 1
+		[ "$i" -lt $((timeout * 10)) ] || return 1
 		sleep 0.1
 	done
 }
@@ -2125,7 +2127,7 @@ lane_buffers()
 
 S15_auth_fence()
 {
-	EXTRA_GUCS=(log_connections=authentication,authorization)
+	EXTRA_GUCS=("log_connections=authentication,authorization")
 	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
 	EXTRA_GUCS=()
 	ensure_memcow
@@ -2432,7 +2434,7 @@ R1_auth_window()
 R1_auth_window_protocol()
 {
 	local protocol=$1
-	EXTRA_GUCS=(log_connections=authentication,authorization)
+	EXTRA_GUCS=("log_connections=authentication,authorization")
 	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
 	EXTRA_GUCS=()
 	ensure_memcow
@@ -2463,8 +2465,11 @@ R1_auth_window_protocol()
 	ck_eq "a full reset completes past the parked backend -> epoch 1" 1 "$out"
 	nonce2=$(psql_ctl -c "SELECT memcow_lane_open($dboid, true)")
 	ck_match "lane reopened armed with a new nonce" '^[1-9][0-9]*$' "$nonce2"
-	[ "$nonce2" != "$nonce" ] && ck "the new nonce differs from the one the parked backend presented" 0 \
-		|| ck "the new nonce differs from the one the parked backend presented" 1
+	if [ "$nonce2" != "$nonce" ]; then
+		ck "the new nonce differs from the one the parked backend presented" 0
+	else
+		ck "the new nonce differs from the one the parked backend presented" 1
+	fi
 	out=$(sess_query A 7 "SELECT public.memcow_backend_reset()")
 	ck_eq "the retained backend adopted epoch 1" 1 "$out"
 
@@ -2558,7 +2563,11 @@ R2_stopped_straggler()
 	pid_s=$(sess_query S 9 "SELECT pg_backend_pid()")
 	seq=$(sess_send S 9 "BEGIN; UPDATE public.accounts SET balance = 0 WHERE account_id = 1; SELECT pg_sleep(60);")
 	wait_for_wait_event "$pid_s" PgSleep 20 || ck "straggler is inside its query" 1
-	kill -STOP "$pid_s" && ck "straggler SIGSTOPped" 0 || ck "straggler SIGSTOPped" 1
+	if kill -STOP "$pid_s"; then
+		ck "straggler SIGSTOPped" 0
+	else
+		ck "straggler SIGSTOPped" 1
+	fi
 
 	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 1500)")
 	ck_match "reset FAILS CLOSED on its timeout: the straggler did not exit" \
@@ -2640,7 +2649,7 @@ nc_R2_stopped_straggler()
 
 R3_cancel_inflight_io()
 {
-	EXTRA_GUCS=(io_method=worker shared_preload_libraries=memcow,test_aio)
+	EXTRA_GUCS=(io_method=worker "shared_preload_libraries=memcow,test_aio")
 	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
 	EXTRA_GUCS=()
 	ensure_memcow
@@ -2814,11 +2823,11 @@ R4_checkpoint_discard()
 			wakes=$((wakes + 1))
 		fi
 		i=$((i + 1))
-		[ $i -lt 60 ] || break
+		[ "$i" -lt 60 ] || break
 	done
 	ck_eq "reset returned epoch 1 once the checkpointer's writes were all released" 1 "$(sess_output C "$seq")"
 	sess_wait C2 "$seq2" 30 || ck "the checkpoint completed" 1
-	if [ $wakes -ge 2 ]; then
+	if [ "$wakes" -ge 2 ]; then
 		ck "the checkpointer parked on $wakes lane writes, one after absorbing the barrier" 0
 	else
 		ck "the checkpointer parked on at least two lane writes, got $wakes" 1
@@ -3063,7 +3072,7 @@ mc_banner "memcow slice tests (plan §7.1)" \
 	"bindir:   $MC_BINDIR" \
 	"database: $DB" \
 	"cases:    ${CASES[*]}" \
-	"mode:     $([ $NEGATIVE -eq 1 ] && echo 'NEGATIVE CONTROL (each case must FAIL)' || echo normal)"
+	"mode:     $([ $NEGATIVE -eq 1 ] && echo 'NEGATIVE CONTROL (expected sabotage symptoms)' || echo normal)"
 
 if [ "${MC_BUILD_CASSERT:-no}" != yes ]; then
 	mc_warn "cassert=false: S8 and S10 rely on assertions and are much weaker here"

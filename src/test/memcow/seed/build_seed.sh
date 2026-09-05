@@ -251,7 +251,7 @@ controldata_get()
 psql_do()
 {
 	local db=$1; shift
-	PGOPTIONS= "$PG_BINDIR/psql" \
+	PGOPTIONS='' "$PG_BINDIR/psql" \
 		--no-psqlrc --quiet --no-align --tuples-only \
 		-v ON_ERROR_STOP=1 \
 		-h "$SOCK_DIR" -p "$BUILD_PORT" -U "$SUPERUSER" -d "$db" "$@"
@@ -263,6 +263,8 @@ psql_do()
 
 server_running=0
 
+# Invoked by the EXIT trap.
+# shellcheck disable=SC2329
 cleanup()
 {
 	local rc=$?
@@ -279,7 +281,7 @@ cleanup()
 		printf '[build_seed] failed (exit %s); build log: %s\n' \
 			"$rc" "$BUILD_LOG" >&2
 	fi
-	return $rc
+	return "$rc"
 }
 trap cleanup EXIT
 

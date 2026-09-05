@@ -83,7 +83,7 @@ required and unavailable), 2 could not run.
 USAGE
 }
 
-OUTPUTDIR= A_TEMPLATE= B_TEMPLATE= BUILD_DIR=
+OUTPUTDIR='' A_TEMPLATE='' B_TEMPLATE='' BUILD_DIR=''
 A_NAME=a-md B_NAME=b-memcow
 SUBSET=phase0
 COLD_SB=1MB HOT_SB=512MB STRESS_TB=100
@@ -168,6 +168,8 @@ for m in $ALL_METHODS; do
 			disp=RUN; reason=
 			case " $AVAILABLE_METHODS " in
 				*" $m "*)
+					# --only intentionally accepts a glob.
+					# shellcheck disable=SC2254
 					case $id in
 						$ONLY) ;;
 						*) disp=SKIPPED-BY-FILTER; reason="does not match --only '$ONLY'" ;;
@@ -181,8 +183,8 @@ for m in $ALL_METHODS; do
 					fi ;;
 			esac
 			i=${#CELL_ID[@]}
-			CELL_ID[$i]=$id; CELL_METHOD[$i]=$m; CELL_SB[$i]=$sb; CELL_TB[$i]=$tbshow
-			CELL_DISP[$i]=$disp; CELL_REASON[$i]=$reason
+			CELL_ID[i]=$id; CELL_METHOD[i]=$m; CELL_SB[i]=$sb; CELL_TB[i]=$tbshow
+			CELL_DISP[i]=$disp; CELL_REASON[i]=$reason
 		done
 	done
 done
@@ -202,10 +204,10 @@ print_cells()	# print_cells TITLE COLUMN-HEADER RESULT-ARRAY-NAME
 	printf '%-26s %-9s %-9s %-16s %s\n' CELL io_method shared_buf temp_buffers "$col"
 	printf '%-26s %-9s %-9s %-16s %s\n' -------------------------- --------- --------- ---------------- -----------
 	for i in $(seq 0 $(( ${#CELL_ID[@]} - 1 ))); do
-		eval "r=\${$arr[$i]:-NOT-RUN}"
+		eval "r=\${${arr}[i]:-NOT-RUN}"
 		printf '%-26s %-9s %-9s %-16s %s\n' \
-			"${CELL_ID[$i]}" "${CELL_METHOD[$i]}" "${CELL_SB[$i]}" "${CELL_TB[$i]}" \
-			"$r${CELL_REASON[$i]:+  <- ${CELL_REASON[$i]}}"
+			"${CELL_ID[i]}" "${CELL_METHOD[i]}" "${CELL_SB[i]}" "${CELL_TB[i]}" \
+			"$r${CELL_REASON[i]:+  <- ${CELL_REASON[i]}}"
 	done
 	printf '\n'
 }
@@ -214,7 +216,7 @@ print_cells "MATRIX ENUMERATION (before running anything)" DISPOSITION CELL_DISP
 
 n_unavail=0
 for i in $(seq 0 $(( ${#CELL_ID[@]} - 1 ))); do
-	[ "${CELL_DISP[$i]}" = UNAVAILABLE ] && n_unavail=$((n_unavail + 1))
+	[ "${CELL_DISP[i]}" = UNAVAILABLE ] && n_unavail=$((n_unavail + 1))
 done
 if [ $n_unavail -gt 0 ]; then
 	mc_banner "!!  MATRIX COVERAGE IS INCOMPLETE ON THIS HOST  !!" "" \
@@ -342,6 +344,8 @@ diff_cell()	# diff_cell CELLDIR A_LABEL B_LABEL CELLGUC...   -> 0 pass, 1 fail
 	local allowed=" ${ALLOW[*]-} " g3=0 side label
 	for side in a b; do
 		[ $side = a ] && label=$a_label || label=$b_label
+		# Test names are whitespace-free schedule tokens.
+		# shellcheck disable=SC2013
 		for t in $(awk '$2 == "not-ok" { print $1 }' "$dir/$side/tap_status.txt"); do
 			case $allowed in
 				*" $t "*) echo "G3 note  [$label] $t differs from upstream expected output (allowed)" ;;
@@ -378,19 +382,19 @@ diff_cell()	# diff_cell CELLDIR A_LABEL B_LABEL CELLGUC...   -> 0 pass, 1 fail
 CELL_RESULT=()
 RC=0
 for i in $(seq 0 $(( ${#CELL_ID[@]} - 1 ))); do
-	id=${CELL_ID[$i]}
-	if [ "${CELL_DISP[$i]}" != RUN ]; then
-		CELL_RESULT[$i]=${CELL_DISP[$i]}
+	id=${CELL_ID[i]}
+	if [ "${CELL_DISP[i]}" != RUN ]; then
+		CELL_RESULT[i]=${CELL_DISP[i]}
 		continue
 	fi
 	celldir="$OUTPUTDIR/$(echo "$id" | tr '/' '_')"
 	mc_banner "CELL $id" "-> $celldir"
-	cellgucs=("io_method=${CELL_METHOD[$i]}" "shared_buffers=${CELL_SB[$i]}")
+	cellgucs=("io_method=${CELL_METHOD[i]}" "shared_buffers=${CELL_SB[i]}")
 	case $id in */stress) cellgucs[${#cellgucs[@]}]="temp_buffers=$STRESS_TB" ;; esac
-	if diff_cell "$celldir" "$A_NAME[$id]" "$B_NAME[$id]" "${cellgucs[@]}"; then
-		CELL_RESULT[$i]=PASS
+	if diff_cell "$celldir" "${A_NAME}[$id]" "${B_NAME}[$id]" "${cellgucs[@]}"; then
+		CELL_RESULT[i]=PASS
 	else
-		CELL_RESULT[$i]=FAIL
+		CELL_RESULT[i]=FAIL
 		RC=1
 		[ $STOP_ON_FAIL -eq 1 ] && { mc_warn "--stop-on-fail: aborting after $id"; break; }
 	fi
@@ -403,7 +407,7 @@ done
 SUMMARY="$OUTPUTDIR/summary.txt"
 n_pass=0; n_fail=0
 for i in $(seq 0 $(( ${#CELL_ID[@]} - 1 ))); do
-	case ${CELL_RESULT[$i]:-} in PASS) n_pass=$((n_pass + 1)) ;; FAIL) n_fail=$((n_fail + 1)) ;; esac
+	case ${CELL_RESULT[i]:-} in PASS) n_pass=$((n_pass + 1)) ;; FAIL) n_fail=$((n_fail + 1)) ;; esac
 done
 # Set the exit status outside the tee pipeline's subshell.
 if [ "$REQUIRE_URING" -eq 1 ] && [ "$n_unavail" -gt 0 ]; then

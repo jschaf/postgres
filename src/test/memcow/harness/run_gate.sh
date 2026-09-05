@@ -20,7 +20,7 @@
 # --allow-expected-failure, which never relaxes the A-vs-B comparison.
 #
 # Phase 2 is the lane reset, the fences and the deterministic races (§4, §5
-# I2, §7.2, §7.3): slice cases S11-S16 and R1-R5, the same under
+# I2, §7.2, §7.3): slice cases S11-S18 and R1-R5, the same under
 # --negative-control (a test that has never failed is not known to measure
 # anything), then the §7.2 soak driven through the pool (pool/pool_soak.py:
 # per reset, status, DSM segment count flat, PGDATA-minus-WAL flat, seed
@@ -49,11 +49,11 @@
 
 set -eu
 
-here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-slice=$(CDPATH= cd -- "$here/../slice" && pwd)
-pool=$(CDPATH= cd -- "$here/../pool" && pwd)
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+slice=$(CDPATH='' cd -- "$here/../slice" && pwd)
+pool=$(CDPATH='' cd -- "$here/../pool" && pwd)
 
-phase= build_dir= pgdata= extra_args=
+phase='' build_dir='' pgdata='' extra_args=''
 seed=${MEMCOW_SEED_DIR:-}
 ram_mount=${MEMCOW_RAM_MOUNT:-}
 subset=phase0
@@ -64,7 +64,6 @@ while [ $# -gt 0 ]; do
 	--phase=*)    phase=${1#*=};  shift ;;
 	--build-dir)  build_dir=$2;  shift 2 ;;
 	--build-dir=*) build_dir=${1#*=}; shift ;;
-	--source-dir|--source-dir=*) [ "$1" = --source-dir ] && shift 2 || shift ;;	# accepted, unused
 	--seed)       seed=$2; shift 2 ;;
 	--seed=*)     seed=${1#*=}; shift ;;
 	--ram-mount)  ram_mount=$2; shift 2 ;;
@@ -77,6 +76,11 @@ while [ $# -gt 0 ]; do
 	*)  extra_args="${extra_args} $1"; shift ;;
 	esac
 done
+
+if [ "$phase" != 1 ] && [ -n "$extra_args" ]; then
+	echo "run_gate.sh: extra matrix arguments are only supported in phase 1: $extra_args" >&2
+	exit 2
+fi
 
 [ -n "$phase" ] || { echo "run_gate.sh: --phase is required" >&2; exit 2; }
 [ -n "$build_dir" ] || { echo "run_gate.sh: --build-dir is required" >&2; exit 2; }
@@ -117,7 +121,7 @@ case $phase in
 		exit 2
 	fi
 	sed -n 's/^MEMCOW_TPL_/TPL_/p' "$work/make_templates.log" >"$work/templates.env"
-	# shellcheck disable=SC1090
+	# shellcheck disable=SC1090,SC1091
 	. "$work/templates.env"
 
 	# assemble_ramdir.sh writes full_page_writes=off and synchronous_commit=off
@@ -166,7 +170,7 @@ case $phase in
 	cat <<MSG
 
 ========================================================================
-PHASE 1 GATE
+PHASE 1 GATE (subset=$subset)
 ------------------------------------------------------------------------
   differential matrix (io_method x cold/hot x temp, A=md B=memcow) : $matrix
   memcow slice tests S1-S10                                        : $slice_result
@@ -199,8 +203,8 @@ MSG
 ========================================================================
 PHASE 2 GATE
 ------------------------------------------------------------------------
-  reset, fence and race cases S11-S16, R1-R5                       : $slice_result
-  their negative controls (each case must FAIL when sabotaged)     : $nc_result
+  reset, fence and race cases S11-S18, R1-R5                       : $slice_result
+  their negative controls (expected sabotage symptoms)            : $nc_result
   reset soak through the pool, $smoke : $soak_result
 ------------------------------------------------------------------------
   latency (informational; §7.4 owns the thresholds): $latency
@@ -226,12 +230,12 @@ MSG
 	leases=${MEMCOW_BENCH_LEASES:-100000}
 	resets=${MEMCOW_BENCH_RESETS:-3000}
 	sb=${MEMCOW_BENCH_SHARED_BUFFERS:-512MB}
-	bench() {	# bench OUTDIR-NAME driver args...
-		local name=$1; shift
+	bench() (	# bench OUTDIR-NAME driver args...
+		name=$1; shift
 		# shellcheck disable=SC2086
-		"$here/with_server.sh" $common --shared-buffers "$sb" --outputdir "$work/$name" -- \
+		time -p "$here/with_server.sh" $common --shared-buffers "$sb" --outputdir "$work/$name" -- \
 			python3 "$pool/bench.py" --retire-after "$retire_after" --report "$work/$name/report.json" "$@"
-	}
+	)
 	lat() {	# lat REPORT -> one summary line
 		python3 -c "
 import json
@@ -260,7 +264,7 @@ except Exception as e:
 	then reset_idle=PASS; else reset_idle=FAIL; rc=1; fi
 	if bench reset-busy-soak reset --resets "$resets" --lanes memcow_lane_00,memcow_lane_01 \
 		--busy-lanes "$busy6" --busy-mode soak --label busy-soak
-	then reset_soak=PASS; else reset_soak=FAIL; rc=1; fi
+	then reset_busy_soak=PASS; else reset_busy_soak=FAIL; rc=1; fi
 	if bench reset-busy-plpgsql reset --resets "$resets" --lanes memcow_lane_00,memcow_lane_01 \
 		--busy-lanes "$busy6" --busy-mode plpgsql --label busy-plpgsql
 	then reset_plpgsql=PASS; else reset_plpgsql=FAIL; rc=1; fi
@@ -277,7 +281,7 @@ PHASE 4 GATE  (cassert build, shared_buffers=$sb; open problem 2: option (a))
              $(lat "$work/lease-light/report.json")
   reset p99 < 25 ms, $resets resets, idle neighbours                   : $reset_idle
              $(lat "$work/reset-idle/report.json")
-  reset p99 < 25 ms, $resets resets, 6 busy lanes (DDL+DML)            : $reset_soak
+  reset p99 < 25 ms, $resets resets, 6 busy lanes (DDL+DML)            : $reset_busy_soak
              $(lat "$work/reset-busy-soak/report.json")
   reset p99 < 25 ms, $resets resets, 6 busy lanes (tight plpgsql loop) : $reset_plpgsql
              $(lat "$work/reset-busy-plpgsql/report.json")

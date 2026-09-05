@@ -25,7 +25,7 @@ build_dir=${MEMCOW_BUILD_DIR:-$root/build-memcow}
 harness=$root/src/test/memcow/harness
 seedsh=$root/src/test/memcow/seed
 
-phase= seed= ram_mount= do_build=1
+phase='' seed='' ram_mount='' do_build=1
 gate_args=()
 while [ $# -gt 0 ]; do
 	case $1 in

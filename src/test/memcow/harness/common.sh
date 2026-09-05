@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # common.sh --- shared helpers for the memcow test harness
 #
 # Sourced, never executed.  Every function is prefixed mc_.
@@ -105,7 +106,11 @@ PY
 	MC_BINDIR=$MC_BUILD_DIR/tmp_install$MC_PREFIX/bin
 	MC_LIBDIR=$MC_BUILD_DIR/tmp_install$MC_PREFIX/$MC_LIBDIR_REL
 	MC_PG_REGRESS=$MC_BUILD_DIR/src/test/regress/pg_regress
+	# Used by scripts sourcing common.sh.
+	# shellcheck disable=SC2034
 	MC_REGRESS_SRC=$MC_SRC_DIR/src/test/regress
+	# Used by scripts sourcing common.sh.
+	# shellcheck disable=SC2034
 	MC_DLPATH=$MC_BUILD_DIR/src/test/regress
 
 	[ -x "$MC_BINDIR/postgres" ] ||

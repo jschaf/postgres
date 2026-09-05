@@ -32,7 +32,7 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=./common.sh
 . "$HERE/common.sh"
 
-SEED= PGDATA= RAM_MOUNT= BUILD_DIR= OUTPUTDIR= SHARED_BUFFERS=
+SEED='' PGDATA='' RAM_MOUNT='' BUILD_DIR='' OUTPUTDIR='' SHARED_BUFFERS=''
 CONTROL_DB=${MEMCOW_CONTROL_DB:-memcow_control}
 GUCS=()
 
