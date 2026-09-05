@@ -211,7 +211,8 @@ def run_lease(args, pq, base, ctl, probe):
     }
     if args.negative_control:
         behaved = (not threshold_ok and attribution == 'starved-queue' and
-                   ws['p99'] is not None and ws['p99'] >= 0.9 * args.resetter_delay_ms)
+                   ws['p99'] is not None and ws['p99'] >= 0.9 * args.resetter_delay_ms and
+                   len(lease_ms) == args.leases and not leaks and not fails)
         summary['negative_control_behaved'] = behaved
         print('NEGATIVE CONTROL %s: cycle inflated by %.0f ms client-side -> threshold %s, '
               'attribution %s, wait p99 %.2f ms'
@@ -488,7 +489,9 @@ def run_reset(args, pq, base, ctl, probe):
             moved[k] = (summ[k]['p50'] or 0) - (bsumm[k]['p50'] or 0)
         inflated = moved['sweep_buffers'] >= 0.9 * args.nc_sweep_wait_ms
         others_flat = all(abs(v) < 1.0 for k, v in moved.items() if k != 'sweep_buffers')
-        behaved = inflated and others_flat and not threshold_ok
+        behaved = (inflated and others_flat and not threshold_ok and
+                   len(cycles) == args.resets and len(baseline) == nb and
+                   not leaks and not fails)
         summary['negative_control'] = {'sweep_wait_ms': args.nc_sweep_wait_ms, 'moved_p50_ms': moved,
                                        'baseline_cycle_ms': bsumm['cycle'], 'behaved': behaved}
         print('NEGATIVE CONTROL %s: %.0f ms parked in the sweep -> sweep_buffers p50 moved %+.2f ms, '

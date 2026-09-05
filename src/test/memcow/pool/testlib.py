@@ -201,13 +201,16 @@ def fd_count(pid):
                 if 'pg_dynshmem' in ln:
                     maps.append(os.path.basename(ln.split()[-1].replace(' (deleted)', '')))
         except OSError:
-            pass
+            return -1, [], []
         return len(names), maps, names
     try:
-        out = subprocess.run(['lsof', '-p', str(pid), '-n', '-P'], capture_output=True,
-                             text=True, timeout=60).stdout
+        result = subprocess.run(['lsof', '-p', str(pid), '-n', '-P'], capture_output=True,
+                                text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return -1, [], []
+    if result.returncode != 0 or not result.stdout.strip():
+        return -1, [], []
+    out = result.stdout
     nfd = 0
     maps = []
     names = []
@@ -265,8 +268,10 @@ class LeakProbe:
              'pinned_buffers': int(self.ctl.scalar(
                  'SELECT coalesce(sum(pinning_backends), 0) FROM pg_buffercache')),
              'fds': {}, 'dsm_mappings': {}, 'fd_names': {}}
+        started = time.monotonic()
         for name, pid in self.pids.items():
             s['fds'][name], s['dsm_mappings'][name], s['fd_names'][name] = fd_count(pid)
+        s['fd_scan_s'] = time.monotonic() - started
         return s
 
     def _dsm_listing(self):
@@ -316,6 +321,8 @@ class LeakProbe:
         exactly flat."""
         import math
         bad = []
+        if before['dsm_segments'] < 0 or after['dsm_segments'] < 0:
+            bad.append('DSM segment count unavailable')
         extra = after['dsm_segments'] - before['dsm_segments']
         if extra != 0:
             explained = 0
@@ -349,6 +356,9 @@ class LeakProbe:
         # growth by more is a leak; either way the new names are printed.
         for name, n0 in before['fds'].items():
             n1 = after['fds'].get(name, -1)
+            if n0 < 0 or n1 < 0:
+                bad.append('descriptor or DSM mapping scan unavailable for %s' % name)
+                continue
             if n0 >= 0 and n1 > n0:
                 new_names = sorted(set(after['fd_names'].get(name, [])) - set(before['fd_names'].get(name, [])))
                 msg = 'fds of %s: %d -> %d, new: %s' % (name, n0, n1, new_names)
