@@ -2,7 +2,7 @@
 """classify_diff.py --- decide whether an A-vs-B results/ difference is a
 registered, documented memcow divergence or an unexplained one.
 
-Gate G1 in diff_engines.sh used to be "the two results/ trees are byte
+Gate G1 in io_matrix.sh used to be "the two results/ trees are byte
 identical".  That is still what is required of every test the caller has not
 explicitly named, and it is still the only interesting question.  What this
 script adds is a way to say "test X is allowed to differ, but ONLY in the

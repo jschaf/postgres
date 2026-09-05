@@ -375,7 +375,7 @@ create_toy_buffer(Relation rel, BlockNumber blkno)
 }
 
 /*
- * TEMPORARY SCAFFOLDING for pgtest/memcow commit 1.2 - not for merge.
+ * Permanent test coverage for the synthetic AIO completion interface.
  *
  * Exercises pgaio_io_complete_synthetic(). Imitates what an smgr that serves
  * reads out of memory does: set up the handle exactly as bufmgr does, put the

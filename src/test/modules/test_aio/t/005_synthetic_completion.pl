@@ -1,6 +1,6 @@
 # Copyright (c) 2025-2026, PostgreSQL Global Development Group
 #
-# TEMPORARY SCAFFOLDING for pgtest/memcow commit 1.2 - not for merge.
+# Permanent test coverage for the synthetic AIO completion interface.
 #
 # Exercises pgaio_io_complete_synthetic() via
 # test_aio.read_rel_block_synthetic(), which imitates what a memory-backed

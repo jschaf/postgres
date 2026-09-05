@@ -12,7 +12,7 @@
 # allowance with a justification attached, rather than as a mystery diff that
 # whoever reads the log next has to re-derive.  A diff hunk that no rule here
 # explains fails the gate, and so does a rule that is claimed for a test but
-# never actually matches (see --allow-engine-divergence in diff_engines.sh):
+# never actually matches (see --allow-engine-divergence in io_matrix.sh):
 # a stale allowance is how a gate quietly stops testing anything.
 #
 # Format: three TAB-separated fields per line.

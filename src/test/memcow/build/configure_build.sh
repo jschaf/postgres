@@ -256,8 +256,8 @@ if [ "${tap_warning:-0}" = "1" ]; then
 	configure_build.sh: WARNING --- TAP tests are DISABLED in $build_dir.
 	    $perl_bin cannot run config/check_modules.pl (missing IPC::Run,
 	    Test::More or Time::HiRes).  pg_regress-based gates still run; any
-	    memcow gate that needs a TAP suite (notably the phase 3 injection-point
-	    race tests) will NOT be runnable until this is fixed:
+	    test that needs TAP (notably test_aio synthetic-completion
+	    and concurrent-waiter tests) will NOT be runnable until this is fixed:
 	        cpan IPC::Run          # or: cpanm IPC::Run Test::More Time::HiRes
 	    Then re-run this script.  Do not treat a TAP-less run as a green gate.
 
