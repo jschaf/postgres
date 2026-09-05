@@ -636,12 +636,9 @@ static uint32 MemcowSeenResetGen = 0;
 /* per-process event counters; read back through memcow_backend_counters() */
 static struct
 {
-	uint64		attaches;
-	uint64		detaches;
 	uint64		nblocks_pin_refresh;
 	uint64		truncate_pinned;
 	uint64		truncate_unpinned;
-	uint64		writes_discarded;
 	uint64		adopt_last_us;	/* the last memcow_backend_reset()'s server time */
 }			MemcowCounters;
 
@@ -1559,7 +1556,6 @@ memcow_overlay(Oid dbOid, bool create)
 	db->epoch = epoch;
 	db->slot = slot;
 	db->absent_gen = 0;
-	MemcowCounters.attaches++;
 
 	return db;
 }
@@ -1712,7 +1708,6 @@ memcow_detach_db(MemcowDbLocal *db)
 	db->absent_gen = 0;			/* never equals a live generation */
 
 	pg_atomic_fetch_sub_u32(&slot->attached[epoch & 1], 1);
-	MemcowCounters.detaches++;
 }
 
 /*
@@ -2338,17 +2333,8 @@ memcow_copy_block(MemcowFork *f, MemcowBlockKey *key, BlockNumber blocknum,
  * permit and which would be a change to core semantics for one test-mode smgr.
  * Being infallible is much the cheaper contract to keep.
  *
- * What it actually does is zero md's private per-fork open-segment counters,
- * exactly as mdopen() does.  This is defence in depth, and it costs nothing.
- * SMgrRelationData embeds md's private md_num_open_segs[] and md_seg_fds[]
- * arrays; smgropen() does not zero them and dynahash does not zero the entry
- * payload, so on a memcow-created relation they hold whatever was in that
- * memory before.  Every md_seg_fds[] access in md.c is gated on
- * md_num_open_segs[] being nonzero, so zeroing the counters (and only the
- * counters, which is precisely what mdopen() zeroes) is sufficient: any future
- * path that reached md on a memcow relation then finds it cleanly closed
- * instead of reading a garbage segment count and closing a garbage fd pointer.
- * A clean "not open" beats memory corruption.
+ * Storage-manager selection is fixed at preload. This relation never enters
+ * md, so its private descriptor arrays need no initialization here.
  */
 void
 memcow_open(SMgrRelation reln)
@@ -2364,9 +2350,6 @@ memcow_open(SMgrRelation reln)
 	 */
 	Assert(MemcowSeedHash != NULL);
 
-	/* mark it not open, so md can never trip over uninitialized state */
-	for (int forknum = 0; forknum <= MAX_FORKNUM; forknum++)
-		reln->md_num_open_segs[forknum] = 0;
 }
 
 /*
@@ -2839,20 +2822,10 @@ memcow_maxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 /*
  * memcow_readv() -- Read the specified blocks synchronously.
  *
- * The synchronous path: RelationCopyStorage() (storage.c) and pg_prewarm are
- * the two real callers.  Unlike smgr_startreadv there is no AIO handle to keep
- * consistent, so this can behave exactly as mdreadv() does, including
- * mdreadv()'s zero_damaged_pages special case -- reproduced here rather than
- * simplified away, because behavioural parity with md is what the differential
- * gate measures.  (md's own Assert(false) in that branch is reproduced too:
- * upstream believes the path is unreachable and wants to hear about it if it
- * is not.  What makes it unreachable for memcow is the MemcowRelEntry
- * invariant, NOT anything about the overlay not existing yet: every block in
- * [0, nblocks) is servable, from the overlay or from the seed, so a block
- * memcow cannot serve is one at or past the end of the fork, which is a read
- * past EOF and not something bufmgr issues.  The invariant is why
- * memcow_do_extend() and memcow_writev() both zero-fill the gap below the
- * block they were handed.)
+ * RelationCopyStorage() and pg_prewarm use this path. Every block below
+ * nblocks is servable from the seed or overlay; a missing block is past EOF
+ * and must error, just as the synthetic read path does. Damaged pages within
+ * the fork are still verified (and optionally zeroed) by the buffer callbacks.
  */
 void
 memcow_readv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
@@ -2869,13 +2842,6 @@ memcow_readv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		if (!memcow_copy_block(&f, &key, blocknum + i, buffers[i]))
 		{
 			RelPathStr	rel;
-
-			if (zero_damaged_pages || InRecovery)
-			{
-				Assert(false);	/* see mdreadv() */
-				memset(buffers[i], 0, BLCKSZ);
-				continue;
-			}
 
 			rel = relpath(reln->smgr_rlocator, forknum);
 
@@ -3100,7 +3066,6 @@ memcow_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		!IS_INJECTION_POINT_ATTACHED("memcow-writev-skip-discard"))
 	{
 		LWLockRelease(&re->lock);
-		MemcowCounters.writes_discarded++;
 		pg_atomic_fetch_add_u64(&db->slot->writes_discarded, 1);
 		return;
 	}
@@ -4045,12 +4010,9 @@ memcow_backend_counters_sql(PG_FUNCTION_ARGS)
 		const char *name;
 		uint64		value;
 	}			rows[] = {
-		{"attaches", MemcowCounters.attaches},
-		{"detaches", MemcowCounters.detaches},
 		{"nblocks_pin_refresh", MemcowCounters.nblocks_pin_refresh},
 		{"truncate_pinned", MemcowCounters.truncate_pinned},
 		{"truncate_unpinned", MemcowCounters.truncate_unpinned},
-		{"writes_discarded", MemcowCounters.writes_discarded},
 		{"adopt_last_us", MemcowCounters.adopt_last_us},
 	};
 
@@ -4496,8 +4458,7 @@ memcow_lane_finish(MemcowDbSlot *slot, Oid dbOid, Oid spcOid,
 		 * With it, the read fails PageIsVerified() and says so.  Assert
 		 * builds only: it walks every page of the arena.
 		 */
-		if (!IS_INJECTION_POINT_ATTACHED("memcow-reclaim-skip-poison"))
-			poisoned = memcow_poison_arena(area, old_blocks);
+		poisoned = memcow_poison_arena(area, old_blocks);
 #endif
 		MEMCOW_STEP_END(t0, t->poison_us);
 

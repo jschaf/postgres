@@ -2,7 +2,7 @@
 #
 # slice_tests.sh --- the memcow-specific half of the plan §7.1 gate.
 #
-# diff_engines.sh answers "does memcow produce the same output as md?".  It
+# io_matrix.sh answers "does memcow produce the same output as md?".  It
 # cannot answer anything that has no md counterpart, and §7.1 names four such
 # things while this project's findings log names five more.  Those nine cases
 # live here, plus a tenth (S10) written for a defect this suite found on its
@@ -113,7 +113,7 @@
 #
 # Portions Copyright (c) 2026, PostgreSQL Global Development Group
 
-# See check_leaks.sh for why there is no `set -u`.
+# Bash 3.2 treats empty arrays as unset under nounset; use guarded expansions.
 set -o pipefail
 
 MC_PROG=slice_tests.sh
@@ -844,6 +844,14 @@ S5_past_eof()
 		'ERROR:  memcow could not read block' "$out"
 	out=$(psql -c "SELECT count(*) FROM public.events")
 	ck_match "and the server is still up" '^4000$' "$out"
+
+	# The synthetic test helper first calls synchronous smgrreadv(). A
+	# past-EOF read must error even with zero_damaged_pages enabled; that
+	# setting applies to damaged pages within the fork, tested by S2.
+	out=$(psql -c "SET zero_damaged_pages = on;
+SELECT read_rel_block_synthetic('public.events', $((nblk + 1)))")
+	ck_match "synchronous past-EOF read is a catchable error even with zero_damaged_pages" \
+		'ERROR:  memcow could not read block' "$out"
 
 	ck_no_crash
 }
