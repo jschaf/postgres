@@ -2223,55 +2223,6 @@
   boot_val => 'true',
 },
 
-# Can't be set by ALTER SYSTEM: it must be turned on deliberately, on the
-# command line of a test run.  A persistent auto.conf setting combined with a
-# bad seed yields a cluster that crash-loops at startup and can only be
-# repaired by hand-editing postgresql.auto.conf.
-{ name => 'memcow_enabled', type => 'bool', context => 'PGC_POSTMASTER', group => 'DEVELOPER_OPTIONS',
-  short_desc => 'Serves relation pages from a read-only seed plus an in-memory overlay.',
-  long_desc => 'Test-mode storage manager. When on, all relation I/O is served by memcow instead of md.',
-  flags => 'GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_AUTO_FILE',
-  variable => 'memcow_enabled',
-  boot_val => 'false',
-},
-
-# Bound on one lane-epoch's overlay arena (plan CONCERN 4a).  Bound to an
-# arena by dsa_set_size_limit() when a reset creates it and when a lane is
-# opened, so a change takes effect at the next open or reset of each lane.
-# Exhaustion is ERRCODE_MEMCOW_ARENA_FULL (53MC1) on the writing statement.
-{ name => 'memcow_lane_arena_limit', type => 'int', context => 'PGC_SIGHUP', group => 'DEVELOPER_OPTIONS',
-  short_desc => 'Maximum size of one memcow lane-epoch overlay arena, 0 for no limit.',
-  long_desc => 'Applied to a lane\'s arena when the lane is opened and at every reset; exceeding it fails the writing statement with SQLSTATE 53MC1.',
-  flags => 'GUC_NOT_IN_SAMPLE | GUC_UNIT_MB',
-  variable => 'memcow_lane_arena_limit',
-  boot_val => '0',
-  min => '0',
-  max => 'MAX_KILOBYTES',
-},
-
-# PGC_BACKEND: presented once, in the startup packet (options='-c
-# memcow_lane_nonce=N'), by a connection the memcow lane pool hands out, and
-# compared against the lane's current nonce by the admission check in
-# PostgresMain() (plan §5 I2).  0 presents no nonce.
-{ name => 'memcow_lane_nonce', type => 'int', context => 'PGC_BACKEND', group => 'DEVELOPER_OPTIONS',
-  short_desc => 'Lane nonce presented by a memcow pool connection at startup.',
-  long_desc => 'Checked by the memcow lane admission fence after connection startup; 0 presents no nonce.',
-  flags => 'GUC_NOT_IN_SAMPLE',
-  variable => 'memcow_lane_nonce',
-  boot_val => '0',
-  min => '0',
-  max => 'INT_MAX',
-},
-
-# GUC_SUPERUSER_ONLY as for every other filesystem-path GUC (data_directory,
-# log_directory): the value is a host path and is not for unprivileged eyes.
-{ name => 'memcow_seed_directory', type => 'string', context => 'PGC_POSTMASTER', group => 'DEVELOPER_OPTIONS',
-  short_desc => 'Directory holding the read-only PGDATA seed that memcow serves relation pages from.',
-  flags => 'GUC_NOT_IN_SAMPLE | GUC_SUPERUSER_ONLY',
-  variable => 'memcow_seed_directory',
-  boot_val => '""',
-},
-
 { name => 'min_dynamic_shared_memory', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
   short_desc => 'Amount of dynamic shared memory reserved at startup.',
   flags => 'GUC_UNIT_MB',

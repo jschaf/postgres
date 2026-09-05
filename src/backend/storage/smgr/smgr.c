@@ -70,63 +70,12 @@
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
-#include "storage/memcow.h"
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 
 
-/*
- * This struct of function pointers defines the API between smgr.c and
- * any individual storage manager module.  Note that smgr subfunctions are
- * generally expected to report problems via elog(ERROR).  An exception is
- * that smgr_unlink should use elog(WARNING), rather than erroring out,
- * because we normally unlink relations during post-commit/abort cleanup,
- * and so it's too late to raise an error.  Also, various conditions that
- * would normally be errors should be allowed during bootstrap and/or WAL
- * recovery --- see comments in md.c for details.
- */
-typedef struct f_smgr
-{
-	void		(*smgr_init) (void);	/* may be NULL */
-	void		(*smgr_shutdown) (void);	/* may be NULL */
-	void		(*smgr_open) (SMgrRelation reln);
-	void		(*smgr_close) (SMgrRelation reln, ForkNumber forknum);
-	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
-								bool isRedo);
-	bool		(*smgr_exists) (SMgrRelation reln, ForkNumber forknum);
-	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
-								bool isRedo);
-	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
-								BlockNumber blocknum, const void *buffer, bool skipFsync);
-	void		(*smgr_zeroextend) (SMgrRelation reln, ForkNumber forknum,
-									BlockNumber blocknum, int nblocks, bool skipFsync);
-	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
-								  BlockNumber blocknum, int nblocks);
-	uint32		(*smgr_maxcombine) (SMgrRelation reln, ForkNumber forknum,
-									BlockNumber blocknum);
-	void		(*smgr_readv) (SMgrRelation reln, ForkNumber forknum,
-							   BlockNumber blocknum,
-							   void **buffers, BlockNumber nblocks);
-	void		(*smgr_startreadv) (PgAioHandle *ioh,
-									SMgrRelation reln, ForkNumber forknum,
-									BlockNumber blocknum,
-									void **buffers, BlockNumber nblocks);
-	void		(*smgr_writev) (SMgrRelation reln, ForkNumber forknum,
-								BlockNumber blocknum,
-								const void **buffers, BlockNumber nblocks,
-								bool skipFsync);
-	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
-								   BlockNumber blocknum, BlockNumber nblocks);
-	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
-	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
-								  BlockNumber old_blocks, BlockNumber nblocks);
-	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
-	void		(*smgr_registersync) (SMgrRelation reln, ForkNumber forknum);
-	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
-} f_smgr;
-
-static const f_smgr smgrsw[] = {
+static f_smgr smgrsw[16] = {
 	/* magnetic disk */
 	{
 		.smgr_init = mdinit,
@@ -149,33 +98,29 @@ static const f_smgr smgrsw[] = {
 		.smgr_immedsync = mdimmedsync,
 		.smgr_registersync = mdregistersync,
 		.smgr_fd = mdfd,
-	},
-	/* ephemeral seed + in-memory overlay, for test mode */
-	{
-		.smgr_init = memcow_init,
-		.smgr_shutdown = NULL,
-		.smgr_open = memcow_open,
-		.smgr_close = memcow_close,
-		.smgr_create = memcow_create,
-		.smgr_exists = memcow_exists,
-		.smgr_unlink = memcow_unlink,
-		.smgr_extend = memcow_extend,
-		.smgr_zeroextend = memcow_zeroextend,
-		.smgr_prefetch = memcow_prefetch,
-		.smgr_maxcombine = memcow_maxcombine,
-		.smgr_readv = memcow_readv,
-		.smgr_startreadv = memcow_startreadv,
-		.smgr_writev = memcow_writev,
-		.smgr_writeback = memcow_writeback,
-		.smgr_nblocks = memcow_nblocks,
-		.smgr_truncate = memcow_truncate,
-		.smgr_immedsync = memcow_immedsync,
-		.smgr_registersync = memcow_registersync,
-		.smgr_fd = memcow_fd,
 	}
 };
 
-static const int NSmgr = lengthof(smgrsw);
+static int NSmgr = 1;
+static int default_smgr = 0;
+
+/* Registration and global selection are fixed before any relation is opened. */
+int
+RegisterStorageManager(const f_smgr *manager, bool make_default)
+{
+	int index = NSmgr;
+
+	if (!process_shared_preload_libraries_in_progress)
+		elog(ERROR, "storage managers must be registered during shared preload");
+	if (NSmgr == lengthof(smgrsw))
+		elog(ERROR, "too many storage managers");
+	if (make_default && default_smgr != 0)
+		elog(ERROR, "default storage manager is already registered");
+	smgrsw[NSmgr++] = *manager;
+	if (make_default)
+		default_smgr = index;
+	return index;
+}
 
 /*
  * Each backend has a hashtable that stores all extant SMgrRelation objects.
@@ -297,8 +242,8 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 		reln->smgr_targblock = InvalidBlockNumber;
 		for (int i = 0; i <= MAX_FORKNUM; ++i)
 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
-		/* selection is global, fixed at postmaster start by the GUC */
-		reln->smgr_which = memcow_enabled ? 1 : 0;
+		/* Global selection is fixed during shared preload. */
+		reln->smgr_which = default_smgr;
 
 		/* it is not pinned yet */
 		reln->pincount = 0;
@@ -439,16 +384,10 @@ smgrreleaseall(void)
 	HASH_SEQ_STATUS status;
 	SMgrRelation reln;
 
-	/*
-	 * memcow test mode: this is the PROCSIGNAL_BARRIER_SMGRRELEASE handler,
-	 * and a lane reset relies on it to make every process drop its
-	 * attachment to the epoch being discarded.  The loop below reaches
-	 * memcow's smgr_close only for relations this process has open, which
-	 * can be none (the checkpointer between checkpoints) while an
-	 * attachment is still held; so memcow gets the barrier directly, first.
-	 */
-	if (memcow_enabled)
-		memcow_release_stale_epochs();
+	/* Also release process resources when no relations remain open. */
+	for (int i = 0; i < NSmgr; i++)
+		if (smgrsw[i].smgr_releaseall)
+			smgrsw[i].smgr_releaseall();
 
 	/* Nothing to do if hashtable not set up */
 	if (SMgrRelationHash == NULL)

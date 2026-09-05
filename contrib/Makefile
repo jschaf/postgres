@@ -27,7 +27,6 @@ SUBDIRS = \
 		isn		\
 		lo		\
 		ltree		\
-		memcow_lanes	\
 		oid2name	\
 		pageinspect	\
 		passwordcheck	\

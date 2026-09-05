@@ -30,18 +30,6 @@ PG_SHMEM_SUBSYSTEM(LWLockCallbacks)
 PG_SHMEM_SUBSYSTEM(dsm_shmem_callbacks)
 PG_SHMEM_SUBSYSTEM(DSMRegistryShmemCallbacks)
 
-/*
- * memcow's overlay directory.  Must follow LWLockCallbacks, whose init
- * callback has to have run before LWLockNewTrancheId() can be called; grouped
- * with the DSM/DSA subsystems above because everything it points at is a DSA
- * arena, and because if it ever does need DSM at init time the ordering is
- * already right.  (Nothing may create DSM in an init callback today --
- * dsm_postmaster_startup() runs after ShmemInitRequested() -- which is why
- * memcow creates its arenas lazily.)  Requests nothing at all when
- * memcow_enabled is off.
- */
-PG_SHMEM_SUBSYSTEM(MemcowShmemCallbacks)
-
 /* xlog, clog, and buffers */
 PG_SHMEM_SUBSYSTEM(VarsupShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(XLOGShmemCallbacks)

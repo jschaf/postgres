@@ -1,5 +1,0 @@
-# memcow_lanes extension
-comment = 'lane reset, admission and registry for the memcow test-mode storage manager'
-default_version = '1.0'
-module_pathname = '$libdir/memcow_lanes'
-relocatable = true

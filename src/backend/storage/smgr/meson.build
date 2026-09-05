@@ -3,6 +3,5 @@
 backend_sources += files(
   'bulk_write.c',
   'md.c',
-  'memcow.c',
   'smgr.c',
 )
