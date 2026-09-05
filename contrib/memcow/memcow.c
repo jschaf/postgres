@@ -1734,7 +1734,6 @@ memcow_maybe_detach_stale(void)
 	gen = pg_atomic_read_u32(&MemcowShmem->reset_generation);
 	if (gen == MemcowSeenResetGen)
 		return;
-	MemcowSeenResetGen = gen;
 
 	/*
 	 * Negative-control knob for the race tests (R3): a process that keeps a
@@ -1756,6 +1755,8 @@ memcow_maybe_detach_stale(void)
 		if (db->epoch != pg_atomic_read_u32(&db->slot->epoch))
 			memcow_detach_db(db);
 	}
+	/* A skipped or failed scan must be revisited by a retry's barrier. */
+	MemcowSeenResetGen = gen;
 }
 
 /*

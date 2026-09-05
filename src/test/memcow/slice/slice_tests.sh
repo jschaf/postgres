@@ -2762,15 +2762,18 @@ nc_R3_cancel_inflight_io()
 		'ERROR:.*still attached to epoch 0' "$out"
 	ck_eq "epoch was published" 1 "$(lane_status "$dboid" epoch)"
 	ck_eq "reclaim pending" t "$(lane_status "$dboid" reclaim_pending)"
-	# The knob is global (IS_INJECTION_POINT_ATTACHED evaluates no PID
-	# condition), so while it is set EVERY process -- the checkpointer too --
-	# skips the barrier's detach, and a retry cannot recover the lane while it
-	# is still attached: recovery is the POSITIVE case's job (R3 proper), not
-	# this control's.  Detaching the knob and dropping the backend is enough
-	# to leave nothing running; the next case restarts the postmaster.
+	# Remove the cause and retry in this postmaster. The checkpointer also
+	# skipped detach, so closing L alone is not enough: the retry's barrier
+	# must revisit every process that skipped this reset generation.
 	detach_point memcow-skip-stale-detach
 	sess_close L 7
-	wait_for_pid_gone "$pid_l" 20 || true
+	wait_for_pid_gone "$pid_l" 20 || ck "retained backend exited" 1
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid, 2000)")
+	ck_eq "retry after removing sabotage finishes the same epoch" 1 "$out"
+	ck_eq "retry drained every old attachment, including the checkpointer" 0 "$(lane_status "$dboid" attached_old)"
+	ck_eq "retry finished reclaim" f "$(lane_status "$dboid" reclaim_pending)"
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	ck_eq "reopened lane reads seed content" logout "$(psql -c "SELECT kind FROM public.events WHERE event_id = 1")"
 	ck_no_crash
 }
 
