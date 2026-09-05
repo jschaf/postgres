@@ -217,7 +217,7 @@ fi
 # ---------------------------------------------------------------------------
 
 echo "configure_build.sh: effective options in $build_dir"
-introspect_json=$(mktemp -t memcow-buildopts)
+introspect_json=$(mktemp "${TMPDIR:-/tmp}/memcow-buildopts.XXXXXX")
 trap 'rm -f "$introspect_json"' EXIT
 "$MESON" introspect "$build_dir" --buildoptions >"$introspect_json"
 rc=0
