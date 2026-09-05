@@ -34,6 +34,7 @@ the pool is in one place where a test can see it being obeyed:
 The libpq binding is ctypes over the tree's own libpq, so the pool has no
 dependency the build does not already provide, and it sees exactly the
 protocol state a real client would.  Python 3.9 (macOS's /usr/bin/python3).
+Used by pool_soak.py (the §7.2 soak), bench.py and busy_driver.py (§7.4).
 
 Portions Copyright (c) 2026, PostgreSQL Global Development Group
 """
@@ -324,10 +325,6 @@ class Wrapper:
             raise StaleWrapperError('wrapper for lane %s epoch %d was released'
                                     % (self.lane_name, self.epoch))
 
-    @property
-    def valid(self):
-        return self._valid
-
     def conn(self, i=0):
         self._check()
         return self._lane.conns[i]
@@ -344,13 +341,6 @@ class Wrapper:
     def exec_params(self, sql, params, i=0):
         self._check()
         return self._lane.conns[i].exec_params(sql, params)
-
-    def dsn(self):
-        """A connection string carrying this epoch's nonce, for a test that
-        wants a connection of its own to the lane.  Once the wrapper is
-        released the nonce is stale and the server's fences refuse it."""
-        self._check()
-        return self._pool.lane_conninfo(self._lane, self.nonce)
 
     def invalidate(self):
         self._valid = False
@@ -414,9 +404,8 @@ class LanePool:
 
     def __init__(self, pq, conninfo, lanes, conns_per_lane=2,
                  control_db='memcow_control', retire_after_epochs=50,
-                 reset_timeout_ms=5000, reset_retries=3,
-                 warmup_sql='SELECT 1', reset_on_open=True, log=None,
-                 resetters=0, lease_timeout=60.0, capture_timings=False,
+                 reset_timeout_ms=5000, reset_retries=3, log=None,
+                 resetters=0, capture_timings=False,
                  resetter_delay_ms=0, on_cycle=None):
         self.pq = pq
         self.base_conninfo = conninfo
@@ -426,15 +415,13 @@ class LanePool:
         self.retire_after = retire_after_epochs
         self.reset_timeout_ms = reset_timeout_ms
         self.reset_retries = reset_retries
-        self.warmup_sql = warmup_sql
-        self.reset_on_open = reset_on_open
         self.log = log or (lambda *a: None)
         self.ctl = None
         self.lanes = collections.OrderedDict()
         self.last_cycle = None
         # asynchronous resetting
         self.nresetters = int(resetters)
-        self.lease_timeout = lease_timeout
+        self.lease_timeout = 60.0
         self.capture_timings = capture_timings
         self.resetter_delay_ms = resetter_delay_ms
         self.on_cycle = on_cycle
@@ -490,17 +477,13 @@ class LanePool:
             self.ready.append(lane)
 
     def _open_lane(self, lane):
-        """Plan §3.3: open M connections, register them, prime caches, mark
-        ready.  With reset_on_open the lane is first brought to a fresh
-        epoch, so every lease starts from a known state."""
+        """Plan §3.3: open M connections, register them, then bring the lane
+        to a fresh epoch, so every lease starts from a known state."""
         lane.nonce = int(self.ctl.scalar('SELECT memcow_lane_open(%d, true)' % lane.oid))
         lane.epoch = int(self._status(lane)['epoch'])
         self._connect_backends(lane, self.ctl)
-        if self.reset_on_open:
-            self._drain(lane)
-            self._reset_cycle(lane, self.ctl)
-        else:
-            self._warmup(lane)
+        self._drain(lane)
+        self._reset_cycle(lane, self.ctl)
 
     def _connect_backends(self, lane, ctl):
         lane.conns = []
@@ -755,7 +738,7 @@ class LanePool:
             # DISCARD ALL in the next drain resets it, so it is re-set here
             # every cycle, after adopt, before the lane is handed back.
             c.exec('SET client_min_messages = warning')
-            c.exec(self.warmup_sql)
+            c.exec('SELECT 1')
 
     def retire(self, lane, reason='', ctl=None):
         self.log('lane %s: retiring (%s)' % (lane.name, reason))
@@ -765,13 +748,6 @@ class LanePool:
         finally:
             self._disconnect_backends(lane, ctl)
             lane.state = 'RETIRED'
-
-    def reopen(self, lane):
-        """After a refusal the caller may prefer to reopen rather than retry
-        the reset (plan Appendix B(i): 'the pool reopens or retires')."""
-        lane.nonce = int(self.ctl.scalar('SELECT memcow_lane_open(%d, true)' % lane.oid))
-        self._make_ready(lane)
-
 
 # ---------------------------------------------------------------------------
 # small helpers for drivers

@@ -1,39 +1,62 @@
 #!/usr/bin/env python3
 """
-bench_common.py --- what the plan §7.4 benchmark drivers share.
+testlib.py --- what the pool-driven soak and benchmarks share.
 
-  * summarize(): p50/p90/p99/max/mean of a latency list, the same
-    nearest-rank percentile as pool_soak.py so numbers are comparable.
+  * connect(): the server harness/with_server.sh started, from its
+    environment (PGHOST, PGPORT, PGUSER, MEMCOW_LIBDIR, MEMCOW_PGDATA,
+    MEMCOW_LOGFILE, MEMCOW_CONTROL_DB), as (LibPQ, base conninfo, control
+    connection).
+  * summarize(): p50/p90/p99/max/mean of a latency list, nearest-rank.
   * WORKLOADS / run_workload(): the per-lease work a test does between its
     first query and its release.  'query' is nothing beyond the first
     parameterized query; 'light' is one small DML transaction; 'soak' is
-    pool_soak.py's DDL+DML workload (two connections, one left in an open
-    transaction for the drain to roll back).  A benchmark states which one
-    it ran, because the cassert reclaim-poison walk scales with the overlay.
+    the §7.2 DDL+DML workload (two connections, one left in an open
+    transaction for the drain to roll back).  Statements go one per PQexec
+    (VACUUM cannot run inside the implicit transaction of a multi-statement
+    string).
+  * du_kb() / dsm_files(): PGDATA-minus-WAL in ONE walk (measuring pgdata
+    and pg_wal in two separate walks and subtracting is racy: a 16 MB WAL
+    segment recycled between them reads as growth) and the DSM segment count
+    as files under pg_dynshmem (dynamic_shared_memory_type=mmap, set by
+    with_server.sh, so the count does not trust memcow's own accounting).
   * LeakProbe: the §7.4 "zero leakage" gate, sampled before and after a run:
-    DSM segment files (dynamic_shared_memory_type=mmap), PGDATA-minus-WAL
-    in one walk, in-flight AIO handles (pg_aios), pinned shared buffers
-    (pg_buffercache), and the open-fd count of every long-lived server
-    process (postmaster, checkpointer, background writer, walwriter, the
-    IO workers) via lsof -- plus scan_log() for the cassert-only leak
-    WARNINGs and any assert/crash.
-  * A4: the plan's Appendix A.4 trigger list, so both drivers and the
-    summary name the same five items the same way.
+    DSM segment files, PGDATA-minus-WAL, in-flight AIO handles (pg_aios),
+    pinned shared buffers (pg_buffercache), and the open-fd count and DSM
+    mappings of every long-lived server process.
 
 Portions Copyright (c) 2026, PostgreSQL Global Development Group
 """
 
 import json
 import os
-import re
 import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'pool'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import memcow_pool as mp  # noqa: E402
 
 FIRST_QUERY = 'SELECT $1::int'
+
+DIGEST_SQL = ("SELECT md5(string_agg(relname || ':' || nrows || ':' || digest, ',' "
+              "ORDER BY relname)) FROM public.memcow_seed_digest")
+
+
+def connect():
+    """(pq, base conninfo, control Conn) for the server with_server.sh started."""
+    pq = mp.LibPQ(mp.libpq_path(os.environ['MEMCOW_LIBDIR']))
+    base = 'host=%s port=%s user=%s' % (os.environ['PGHOST'], os.environ['PGPORT'],
+                                        os.environ.get('PGUSER', 'postgres'))
+    ctl = mp.Conn(pq, base + ' dbname=' + control_db())
+    return pq, base, ctl
+
+
+def control_db():
+    return os.environ.get('MEMCOW_CONTROL_DB', 'memcow_control')
+
+
+def pgdata():
+    return os.environ['MEMCOW_PGDATA']
 
 
 def percentile(values, p):
@@ -97,9 +120,7 @@ WORKLOAD_NAMES = ('query', 'light', 'soak')
 
 
 def run_workload(w, name, i):
-    """Run workload `name` on wrapper w for iteration i.  Statements go one
-    per PQexec (VACUUM cannot run inside the implicit transaction of a
-    multi-statement string)."""
+    """Run workload `name` on wrapper w for iteration i."""
     if name == 'query':
         return
     if name == 'light':
@@ -118,10 +139,12 @@ def run_workload(w, name, i):
 
 
 # ---------------------------------------------------------------------------
-# leak probe
+# resource probes
 # ---------------------------------------------------------------------------
 
 def du_kb(path, exclude=()):
+    """Directory size in kB from a SINGLE walk; `exclude` names immediate
+    children of `path` to skip entirely (pg_wal)."""
     total = 0
     exclude = set(exclude)
     for root, dirs, files in os.walk(path):
@@ -133,6 +156,14 @@ def du_kb(path, exclude=()):
             except OSError:
                 pass
     return total // 1024
+
+
+def data_kb(pgdata):
+    return du_kb(pgdata, exclude=('pg_wal',))
+
+
+def wal_kb(pgdata):
+    return du_kb(os.path.join(pgdata, 'pg_wal'))
 
 
 def dsm_files(pgdata):
@@ -154,7 +185,6 @@ def fd_count(pid):
     that outlives its epoch is precisely the leak the reclaim's dsm_attach
     check exists to expose, and this counts it from outside the server."""
     procfd = '/proc/%d/fd' % pid
-    nfd = -1
     if os.path.isdir(procfd):
         names = []
         try:
@@ -163,9 +193,8 @@ def fd_count(pid):
                     names.append('%s:%s' % (f, os.readlink(os.path.join(procfd, f))))
                 except OSError:
                     names.append(f)
-            nfd = len(names)
         except OSError:
-            pass
+            return -1, [], []
         maps = []
         try:
             for ln in open('/proc/%d/maps' % pid):
@@ -173,7 +202,7 @@ def fd_count(pid):
                     maps.append(os.path.basename(ln.split()[-1].replace(' (deleted)', '')))
         except OSError:
             pass
-        return nfd, maps, names
+        return len(names), maps, names
     try:
         out = subprocess.run(['lsof', '-p', str(pid), '-n', '-P'], capture_output=True,
                              text=True, timeout=60).stdout
@@ -193,33 +222,6 @@ def fd_count(pid):
         if 'pg_dynshmem' in parts[-1]:
             maps.append(os.path.basename(parts[-1]))
     return nfd, maps, names
-
-
-def rss_kb(pid):
-    try:
-        out = subprocess.run(['ps', '-o', 'rss=', '-p', str(pid)], capture_output=True,
-                             text=True, timeout=30).stdout.strip()
-        return int(out) if out else -1
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return -1
-
-
-LOG_BAD = re.compile(r'TRAP: |PANIC:|was terminated by signal|leaked AIO handle|'
-                     r'AIO handle was not submitted|buffer refcount leak|'
-                     r'resource was not closed|open AIO batch at end|'
-                     r'No space left on device|ENOSPC')
-
-
-def scan_log(logfile):
-    hits = []
-    try:
-        with open(logfile, errors='replace') as f:
-            for n, line in enumerate(f, 1):
-                if LOG_BAD.search(line):
-                    hits.append('%d: %s' % (n, line.rstrip()))
-    except OSError as e:
-        hits.append('cannot read %s: %s' % (logfile, e))
-    return hits
 
 
 class LeakProbe:
@@ -257,8 +259,8 @@ class LeakProbe:
         s = {'dsm_segments': dsm_files(self.pgdata),
              'dsm_files': self._dsm_listing(),
              'arenas': self._arenas(),
-             'pgdata_minus_wal_kb': du_kb(self.pgdata, exclude=('pg_wal',)),
-             'wal_kb': du_kb(os.path.join(self.pgdata, 'pg_wal')),
+             'pgdata_minus_wal_kb': data_kb(self.pgdata),
+             'wal_kb': wal_kb(self.pgdata),
              'aio_handles_in_flight': int(self.ctl.scalar('SELECT count(*) FROM pg_aios')),
              'pinned_buffers': int(self.ctl.scalar(
                  'SELECT coalesce(sum(pinning_backends), 0) FROM pg_buffercache')),
@@ -286,11 +288,7 @@ class LeakProbe:
         by name, the shared catalogs as 'shared', anything else by OID."""
         out = {}
         rows = self.ctl.query("SELECT d.datname, d.oid FROM pg_database d ORDER BY d.oid")
-        try:
-            out['shared'] = int(self.ctl.scalar('SELECT arena_bytes FROM memcow_lane_status(0)'))
-        except mp.PGError:
-            pass
-        for name, oid in rows:
+        for name, oid in [('shared', 0)] + rows:
             try:
                 v = self.ctl.scalar('SELECT arena_bytes FROM memcow_lane_status(%s)' % oid)
                 if v is not None:
@@ -300,7 +298,7 @@ class LeakProbe:
         return out
 
     @staticmethod
-    def diff(before, after, pgdata_slack_kb=2048, warm=None, lanes=None):
+    def diff(before, after, pgdata_slack_kb=2048, lanes=None):
         """The growth §7.4 forbids.
 
         DSM segments are compared between two moments at which every lane
@@ -313,11 +311,9 @@ class LeakProbe:
         that growth is counted and explains as many new segments as it
         took doublings (DSA adds one segment per growth step).  A segment
         that no never-reset overlay's growth accounts for is a leak, and
-        so is a DSM mapping to a segment file that no longer exists -- the
-        leak the reclaim's dsm_attach() check exists to expose, counted
-        here from outside.  The warm sample is informational.  PGDATA-
-        minus-WAL gets the 2 MB slack pool_soak.py uses; everything else
-        must be exactly flat."""
+        so is a DSM mapping to a segment file that no longer exists.
+        PGDATA-minus-WAL gets 2 MB of slack; everything else must be
+        exactly flat."""
         import math
         bad = []
         extra = after['dsm_segments'] - before['dsm_segments']
@@ -350,8 +346,7 @@ class LeakProbe:
         # Descriptors: a long-lived process's VFD cache fills as it first
         # touches things (the checkpointer keeps the WAL segment it last
         # wrote open, for one), so growth by a couple is the cache and
-        # growth by more is a leak; either way the new names are printed,
-        # so a reader sees WHAT was opened rather than a count.
+        # growth by more is a leak; either way the new names are printed.
         for name, n0 in before['fds'].items():
             n1 = after['fds'].get(name, -1)
             if n0 >= 0 and n1 > n0:
@@ -369,24 +364,6 @@ class LeakProbe:
                           ', '.join('%s=%d' % (f, after['dsm_files'][f]) for f in new), len(gone),
                           before['arenas'], after['arenas']))
         return bad
-
-
-# ---------------------------------------------------------------------------
-# Appendix A.4
-# ---------------------------------------------------------------------------
-
-A4 = [
-    ('buffertag_generation', 'BufferTag generation',
-     'ready-queue exhaustion with the DropDatabaseBuffers header scan the dominant reset term'),
-    ('test_vfs_wal_bypass', 'Test VFS / WAL bypass',
-     'RAM-dir WAL/temp writes measurably move lease p99, or ENOSPC PANICs'),
-    ('per_lane_barrier', 'Per-lane barrier alternative',
-     "the global SMGRRELEASE barrier's absorption latency under load dominates reset p99"),
-    ('selective_cache_invalidation', 'Selective cache invalidation',
-     'post-reset warmup (adopt + warmup) dominates reset cost'),
-    ('server_side_reset_workers', 'Server-side background reset workers',
-     'client-driven reset bottlenecks on pool-thread round trips at target throughput'),
-]
 
 
 def arena_growth(before, after, lanes):

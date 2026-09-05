@@ -26,17 +26,14 @@
 #   S9  documented divergences         findings: pg_relation_size returns 0
 #   S10 truncate runs in a critical section        findings: fixed; the acceptance test
 #
-#   Phase 2 (plan §4 / §7.2), written BEFORE the reset existed, per the
-#   2026-09-01 brief -- these four are the falsification slice for
-#   memcow_lane_reset and are run by run_gate.sh --phase 2:
+#   Phase 2 (plan §4, §5 I2, §7.2, §7.3, CONCERN 4a), run by run_gate.sh
+#   --phase 2.  S11-S14 were written BEFORE the reset existed and are the
+#   falsification slice for memcow_lane_reset:
 #
 #   S11 reset reverts a written page                 plan §4, I1
 #   S12 reset reclaims blocks_high pages             ADDENDUM §P(c), §7.2 "DSM flat"
 #   S13 reset invalidates the cached record pointer  ADDENDUM §P(d)
 #   S14 reset while a truncate is in flight          plan §4.3 fence, Appendix B(i)
-#
-#   Phase 3 (plan §3, §5 I2, §7.3, CONCERN 4a), run by run_gate.sh --phase 3:
-#
 #   S15 the authentication-time fence               plan §5 I2 fence 2 of 3
 #   S16 the per-lane arena limit, a named error     CONCERN 4a
 #   R1  §7.3 (a): connection parked after auth, reset runs past it
@@ -105,8 +102,7 @@
 #     --outputdir DIR     logs and artifacts (default: <pgdata>/../slice-out)
 #     --db NAME           database to run in (default: memcow_lane_00)
 #     --case NAME         run only this case (repeatable); default: all
-#     --phase 1|2|3       run only that phase's cases (S1-S10, S11-S14, or
-#                         S15-S16 + R1-R5)
+#     --phase 1|2         run only that phase's cases (S1-S10, or S11-S16 + R1-R5)
 #     --list              list the cases and exit
 #     --negative-control  run the sabotage variant of each selected case and
 #                         require it to fail
@@ -126,17 +122,14 @@ HARNESS=$(cd -- "$HERE/../harness" && pwd)
 SEEDDIR_SCRIPTS=$(cd -- "$HERE/../seed" && pwd)
 # shellcheck source=../harness/common.sh
 . "$HARNESS/common.sh"
-# shellcheck source=../harness/sessions.sh
-. "$HARNESS/sessions.sh"
 
 PHASE1_CASES="S1_mixed_vectors S2_overlay_corruption S3_set_tablespace \
 S4_pg_prewarm S5_past_eof S6_fingerprint S7_seed_immutable S8_crash_refuses \
 S9_documented_divergences S10_truncate_crit_section"
 PHASE2_CASES="S11_reset_reverts S12_reset_reclaims S13_reset_invalidates_pin \
-S14_reset_vs_truncate"
-PHASE3_CASES="S15_auth_fence S16_arena_limit R1_auth_window R2_stopped_straggler \
-R3_cancel_inflight_io R4_checkpoint_discard R5_sinval_nailed"
-ALL_CASES="$PHASE1_CASES $PHASE2_CASES $PHASE3_CASES"
+S14_reset_vs_truncate S15_auth_fence S16_arena_limit R1_auth_window \
+R2_stopped_straggler R3_cancel_inflight_io R4_checkpoint_discard R5_sinval_nailed"
+ALL_CASES="$PHASE1_CASES $PHASE2_CASES"
 
 SEED=
 PGDATA=
@@ -191,8 +184,7 @@ if [ ${#CASES[@]} -eq 0 ]; then
 		'')  read -r -a CASES <<<"$ALL_CASES" ;;
 		1)   read -r -a CASES <<<"$PHASE1_CASES" ;;
 		2)   read -r -a CASES <<<"$PHASE2_CASES" ;;
-		3)   read -r -a CASES <<<"$PHASE3_CASES" ;;
-		*)   mc_die "unknown --phase $PHASE (expected 1, 2 or 3)" ;;
+		*)   mc_die "unknown --phase $PHASE (expected 1 or 2)" ;;
 	esac
 fi
 
@@ -223,68 +215,22 @@ EXTRA_GUCS=()
 
 pg_start()
 {
-	local seed=${SEED_OVERRIDE:-$SEED}
-	local opts
-	opts="-c shared_preload_libraries=memcow -c memcow.enabled=on"
-	opts="$opts -c memcow.seed_directory=$seed"
-	opts="$opts -c listen_addresses="
-	opts="$opts -c unix_socket_directories=$SOCKDIR"
-	opts="$opts -c log_min_messages=warning"
-	opts="$opts -c log_statement=none"
-	opts="$opts -c restart_after_crash=off"
-	opts="$opts -p $PORT"
-	local g
-	for g in ${EXTRA_GUCS[@]+"${EXTRA_GUCS[@]}"}; do
-		opts="$opts -c $g"
-	done
-	"$MC_BINDIR/pg_ctl" -D "$PGDATA" -l "$LOGFILE" -p "$MC_BINDIR/postgres" \
-		-o "$opts" -w -t 60 start >>"$LOGFILE.pg_ctl" 2>&1
+	mc_server_start "$PGDATA" "$PORT" "$SOCKDIR" "$LOGFILE" \
+		memcow.enabled=on "memcow.seed_directory=${SEED_OVERRIDE:-$SEED}" \
+		${EXTRA_GUCS[@]+"${EXTRA_GUCS[@]}"} 2>/dev/null
 }
-
-pg_stop()
-{
-	local mode=${1:-fast}
-	"$MC_BINDIR/pg_ctl" -D "$PGDATA" -m "$mode" -w -t 60 stop \
-		>>"$LOGFILE.pg_ctl" 2>&1
-}
-
-pg_running() { "$MC_BINDIR/pg_ctl" -D "$PGDATA" status >/dev/null 2>&1; }
-
-# cluster_state --- pg_control's own word for whether this PGDATA is startable.
-cluster_state()
-{
-	"$MC_BINDIR/pg_controldata" -D "$PGDATA" 2>/dev/null |
-		sed -n 's/^Database cluster state: *//p'
-}
-
-# ensure_startable --- a memcow PGDATA that needs recovery cannot be started at
-# all (that is S8's whole subject), so if a previous case or a previous run of
-# this script left one behind, re-assemble rather than reporting every
-# subsequent case as "server would not start".  This is repair, and it says so
-# in the log; it is never applied inside S8, which calls pg_start directly.
-ensure_startable()
-{
-	local st
-	st=$(cluster_state)
-	case $st in
-		"shut down"|"shut down in recovery") return 0 ;;
-		"")	mc_warn "cannot read pg_controldata for $PGDATA"; return 1 ;;
-		*)	mc_warn "PGDATA is in state '$st' (needs recovery); re-assembling"
-			reassemble ;;
-	esac
-}
+pg_stop()    { mc_server_stop "$PGDATA" "$LOGFILE" "${1:-fast}"; }
+pg_running() { mc_server_running "$PGDATA"; }
 
 # restart --- the per-case reset.  Returns non-zero if the server will not come
-# back, which every case treats as a hard failure.
+# back, which every case treats as a hard failure.  A PGDATA that needs
+# recovery (a previous case or run crashed it) is re-assembled first.
 restart()
 {
 	if pg_running; then
-		if ! pg_stop fast; then
-			mc_warn "clean shutdown failed; forcing, then re-assembling"
-			pg_stop immediate
-		fi
+		pg_stop fast || pg_stop immediate
 	fi
-	ensure_startable || return 1
+	mc_ensure_startable "$PGDATA" "$SEED" "$RAM_MOUNT" "$OUTPUTDIR" || return 1
 	: >"$LOGFILE"
 	pg_start
 }
@@ -358,15 +304,11 @@ ck_nomatch()
 
 # ck_no_crash --- the standing requirement on every case: nothing in this
 # case's slice of the server log may be an assert, a PANIC, a signal death or
-# one of the resource-leak messages core emits at backend exit.  The allowlist
-# is check_leaks.sh's; it is narrow on purpose (a clean regression run logs
-# hundreds of legitimate WARNINGs and ERRORs).
+# one of the resource-leak messages core emits at backend exit (mc_check_log).
 ck_no_crash()
 {
 	local hits
-	hits=$(grep -nE 'TRAP: |PANIC:|was terminated by signal|leaked AIO handle|AIO handle was not submitted|refcount leak|resource was not closed|open AIO batch at end' \
-		"$LOGFILE" 2>/dev/null)
-	if [ -z "$hits" ]; then
+	if hits=$(mc_check_log "$LOGFILE"); then
 		printf '    ok      no asserts, PANICs, signal deaths or leaks in the server log\n'
 	else
 		printf '    NOT OK  server log shows an assert/crash/leak:\n'
@@ -1484,8 +1426,100 @@ dsm_files()
 	find "$PGDATA/pg_dynshmem" -name 'mmap.*' 2>/dev/null | wc -l | tr -d ' '
 }
 
-# --- persistent sessions: sess_open / sess_query / ... are in
-# --- harness/sessions.sh, shared with reset_soak.sh
+# --- persistent sessions --------------------------------------------------
+#
+# A retained pool backend is a connection that stays open ACROSS a lane
+# reset, and a plain `psql -c` cannot provide it.  A session here is a psql
+# reading its input from a FIFO that the driver holds open on a fixed file
+# descriptor, driven one statement at a time with sess_query, which appends
+# a \echo marker and waits for it.  bash 3.2 compatible on purpose (macOS
+# /bin/bash), hence the explicit fd numbers and the sequence counter kept in
+# a file (a $(...) capture would lose a shell variable).
+
+# sess_open NAME FD [DB]
+sess_open()
+{
+	local name=$1 fd=$2 db=${3:-$DB}
+	local dir="$OUTPUTDIR/sess-$name"
+	rm -rf "$dir"
+	mkdir -p "$dir"
+	mkfifo "$dir/in"
+	PGHOST=$SOCKDIR PGPORT=$PORT "$MC_BINDIR/psql" -X -q -A -t -d "$db" \
+		-v ON_ERROR_STOP=0 -f "$dir/in" >"$dir/out" 2>&1 &
+	echo $! >"$dir/pid"
+	eval "exec $fd>\"$dir/in\""
+	printf '0\n' >"$dir/seq"
+}
+
+# sess_send NAME FD SQL --- send without waiting (for a command that is
+# expected to block); prints the marker sequence to sess_wait for.
+sess_send()
+{
+	local name=$1 fd=$2 sql=$3 seq
+	local seqf="$OUTPUTDIR/sess-$name/seq"
+	seq=$(( $(cat "$seqf" 2>/dev/null || echo 0) + 1 ))
+	printf '%s\n' "$seq" >"$seqf"
+	# A statement that does not end in ';' would otherwise stay in psql's
+	# query buffer while the \echo marker runs at once (a meta-command does
+	# not send the buffer), so the statement is terminated first; a lone ';'
+	# is an empty query to psql and prints nothing.  A session whose backend
+	# died (S14's straggler) has an exited psql at the other end of the FIFO;
+	# the write fails with EPIPE, which the caller sees as a marker that
+	# never appears.
+	eval "printf '%s\\n;\\n\\\\echo __MARK_%s_%s__\\n' \"\$sql\" \"$name\" \"\$seq\" >&$fd 2>/dev/null"
+	printf '%s\n' "$seq"
+}
+
+# sess_wait NAME SEQ [TIMEOUT-SECONDS] --- wait for marker SEQ; rc 1 on timeout
+sess_wait()
+{
+	local name=$1 seq=$2 timeout=${3:-30} i=0
+	local out="$OUTPUTDIR/sess-$name/out"
+	while ! grep -q "__MARK_${name}_${seq}__" "$out" 2>/dev/null; do
+		i=$((i + 1))
+		[ $i -lt $((timeout * 10)) ] || return 1
+		sleep 0.1
+	done
+}
+
+# sess_output NAME SEQ --- what the session printed for command SEQ
+sess_output()
+{
+	local name=$1 seq=$2 prev=$(( $2 - 1 ))
+	local out="$OUTPUTDIR/sess-$name/out"
+	if [ "$prev" -eq 0 ]; then
+		sed -n "1,/__MARK_${name}_${seq}__/p" "$out"
+	else
+		sed -n "/__MARK_${name}_${prev}__/,/__MARK_${name}_${seq}__/p" "$out"
+	fi | grep -v '__MARK_'
+}
+
+# sess_query NAME FD SQL [TIMEOUT] --- send, wait, print the output
+sess_query()
+{
+	local name=$1 fd=$2 sql=$3 timeout=${4:-30} seq
+	seq=$(sess_send "$name" "$fd" "$sql")
+	if ! sess_wait "$name" "$seq" "$timeout"; then
+		printf 'SESSION TIMEOUT after %ss waiting for: %s\n' "$timeout" "$sql"
+		return 1
+	fi
+	sess_output "$name" "$seq"
+}
+
+sess_close()	# sess_close NAME FD
+{
+	local name=$1 fd=$2 pid i=0
+	local dir="$OUTPUTDIR/sess-$name"
+	eval "exec $fd>&-"
+	pid=$(cat "$dir/pid" 2>/dev/null)
+	while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; do
+		i=$((i + 1))
+		if [ $i -gt 100 ]; then kill "$pid" 2>/dev/null; break; fi
+		sleep 0.1
+	done
+	rm -f "$dir/in"
+}
+
 # wake_until_done NAME SEQ POINT [TIMEOUT] --- wake POINT from the control
 # connection until session NAME's command SEQ has completed; rc 1 on timeout.
 # Repeated on purpose: a backend can reach the same point more than once in
@@ -2079,7 +2113,7 @@ lane_buffers()
 
 S15_auth_fence()
 {
-	EXTRA_GUCS=(shared_preload_libraries=memcow log_connections=authentication,authorization)
+	EXTRA_GUCS=(log_connections=authentication,authorization)
 	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
 	EXTRA_GUCS=()
 	ensure_memcow
@@ -2265,7 +2299,7 @@ R1_auth_window()
 R1_auth_window_protocol()
 {
 	local protocol=$1
-	EXTRA_GUCS=(shared_preload_libraries=memcow log_connections=authentication,authorization)
+	EXTRA_GUCS=(log_connections=authentication,authorization)
 	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
 	EXTRA_GUCS=()
 	ensure_memcow
@@ -2337,9 +2371,7 @@ nc_R1_auth_window()
 nc_R1_auth_window_protocol()
 {
 	local protocol=$1
-	EXTRA_GUCS=(shared_preload_libraries=memcow)
-	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
-	EXTRA_GUCS=()
+	restart || { ck "server started" 1; return; }
 	ensure_memcow
 	ensure_injection_points "$CONTROL_DB"
 	local dboid out nonce parked bg
@@ -2887,14 +2919,7 @@ nc_R5_sinval_nailed()
 # Stop CLEANLY on the way out.  An immediate stop would leave a PGDATA that
 # needs recovery, which under memcow is a PGDATA that cannot be started at all
 # -- so a tidy-looking cleanup would silently cost the next run its cluster.
-cleanup()
-{
-	if pg_running; then
-		pg_stop fast || pg_stop immediate
-	fi
-	rm -rf "$SOCKDIR"
-}
-trap cleanup EXIT INT TERM
+trap 'mc_server_cleanup "$PGDATA" "$LOGFILE" "$SOCKDIR"' EXIT INT TERM
 
 : >"$LOGFILE"
 : >"$LOGFILE.pg_ctl"
