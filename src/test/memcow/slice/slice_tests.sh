@@ -127,7 +127,7 @@ PHASE1_CASES="S1_mixed_vectors S2_overlay_corruption S3_set_tablespace \
 S4_pg_prewarm S5_past_eof S6_fingerprint S7_seed_immutable S8_crash_refuses \
 S9_documented_divergences S10_truncate_crit_section"
 PHASE2_CASES="S11_reset_reverts S12_reset_reclaims S13_reset_invalidates_pin \
-S14_reset_vs_truncate S15_auth_fence S16_arena_limit R1_auth_window \
+S14_reset_vs_truncate S15_auth_fence S16_arena_limit S17_retired S18_reset_retry R1_auth_window \
 R2_stopped_straggler R3_cancel_inflight_io R4_checkpoint_discard R5_sinval_nailed"
 ALL_CASES="$PHASE1_CASES $PHASE2_CASES"
 
@@ -1334,10 +1334,14 @@ DELETE FROM s10_trunc;
 	ck_nomatch "session 1 built a large multi-segment overlay" '^ERROR' "$out"
 
 	# A FRESH backend: it has not mapped the DSA segments session 1 allocated.
-	out=$(psql -c "VACUUM (TRUNCATE on) s10_trunc")
+	out=$(psql -c "VACUUM (TRUNCATE on) s10_trunc" \
+		-c "SELECT name || '=' || value FROM public.memcow_backend_counters()
+ WHERE name IN ('truncate_pinned', 'truncate_unpinned')")
 	ck_nomatch "VACUUM truncate from a second backend does not lose the connection" \
 		'server closed the connection|connection to server was lost' "$out"
 	ck_nomatch "... and does not raise" '^ERROR' "$out"
+	ck_match "the fresh backend used the warmed record" '^truncate_pinned=[1-9]' "$out"
+	ck_match "the fresh backend never used the allocating fallback" '^truncate_unpinned=0$' "$out"
 
 	if pg_running; then
 		ck "the cluster survived the truncate" 0
@@ -2274,6 +2278,127 @@ nc_S16_arena_limit()
 		-c "SELECT 'big', count(*) FROM s16_big")
 	ck_match "sabotage detected: without a limit the 25 MB write succeeds" '^big\|60000$' "$out"
 	ck_nomatch "... and no 53MC1 is raised" '53MC1|is full' "$out"
+	ck_no_crash
+}
+
+# ===========================================================================
+# S17 -- retirement is permanent, through both the API and relmapper guard.
+# The map is changed only in the runtime copy and restored before shutdown.
+# ===========================================================================
+
+S17_retired()
+{
+	local dboid out mode
+	for mode in explicit map; do
+		restart || { ck "server started" 1; return; }
+		ensure_memcow
+		dboid=$(lane_oid)
+		psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+		if [ "$mode" = explicit ]; then
+			out=$(psql_ctl -c "SELECT memcow_lane_retire($dboid)")
+			ck_nomatch "explicit retirement succeeds" 'ERROR' "$out"
+		else
+			# No lane backend is alive to read this deliberately invalid map.
+			python3 - "$PGDATA/base/$dboid/pg_filenode.map" <<'PY'
+import sys
+with open(sys.argv[1], 'r+b') as f:
+    first = f.read(1)
+    f.seek(0)
+    f.write(bytes([first[0] ^ 1]))
+PY
+			ck "changed one runtime map byte" "$?"
+			out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
+			cp "$SEED/base/$dboid/pg_filenode.map" "$PGDATA/base/$dboid/pg_filenode.map"
+			ck "restored runtime map before shutdown" "$?"
+			ck_match "the map mismatch retires the lane" 'ERROR:.*retired:.*differs from the seed' "$out"
+			ck_eq "map failure occurred after publication" 1 "$(lane_status "$dboid" epoch)"
+			ck_eq "map failure leaves reclaim pending" t "$(lane_status "$dboid" reclaim_pending)"
+		fi
+		ck_eq "$mode: state is RETIRED" RETIRED "$(lane_status "$dboid" state)"
+		out=$(psql_ctl -c "SELECT memcow_lane_open($dboid, false)")
+		ck_match "$mode: cannot reopen" 'ERROR:.*retired' "$out"
+		out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
+		ck_match "$mode: cannot reset" 'ERROR:.*retired' "$out"
+		out=$(psql -c "SELECT 'dispatched'")
+		ck_match "$mode: admission stays closed" 'FATAL:.*not open' "$out"
+		ck_nomatch "$mode: first command never dispatched" '^dispatched$' "$out"
+		ck_no_crash
+	done
+}
+
+nc_S17_retired()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow
+	local dboid out
+	dboid=$(lane_oid)
+	# Omit retirement and leave the map intact: the same lane stays usable.
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
+	ck_eq "control: intact map permits reset" 1 "$out"
+	out=$(psql_ctl -c "SELECT memcow_lane_open($dboid, false)")
+	ck_eq "control: no retirement permits reopen" 0 "$out"
+	ck_eq "control: state is OPEN" OPEN "$(lane_status "$dboid" state)"
+	ck_eq "control: first command executes" dispatched "$(psql -c "SELECT 'dispatched'")"
+	ck_no_crash
+}
+
+# ===========================================================================
+# S18 -- retry after publication repeats finish without publishing twice.
+# An existing injection point raises ERROR after the barrier and before sweep.
+# Unlike nc_R3's global stale-detach sabotage, no process is prevented from
+# releasing its old attachment on the retry.
+# ===========================================================================
+
+S18_reset_retry()
+{
+	EXTRA_GUCS=(dynamic_shared_memory_type=mmap)
+	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
+	EXTRA_GUCS=()
+	ensure_memcow
+	ensure_injection_points "$CONTROL_DB"
+	local dboid out pid baseline
+	dboid=$(lane_oid)
+	psql_ctl -c "SELECT memcow_lane_reset($dboid); SELECT memcow_lane_open($dboid, false)" >/dev/null
+	sess_open A 7
+	pid=$(sess_query A 7 "SELECT pg_backend_pid()")
+	psql_ctl -c "SELECT memcow_lane_register($dboid, $pid)" >/dev/null
+	baseline=$(dsm_files)
+	out=$(sess_query A 7 "UPDATE public.events SET kind = 'retry-old' WHERE event_id = 1; CHECKPOINT;")
+	ck_nomatch "old epoch workload succeeded" 'ERROR' "$out"
+	attach_point memcow-lane-reset-in-sweep error >/dev/null
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
+	ck_match "failure names only the injected sweep error" 'ERROR:.*memcow-lane-reset-in-sweep' "$out"
+	ck_eq "publication already advanced to epoch 2" 2 "$(lane_status "$dboid" epoch)"
+	ck_eq "failure leaves the lane closed" RESETTING "$(lane_status "$dboid" state)"
+	ck_eq "old arena still awaits reclaim" t "$(lane_status "$dboid" reclaim_pending)"
+	out=$(psql_ctl -c "SELECT memcow_lane_open($dboid, false)")
+	ck_match "cannot reopen an unfinished reset" 'ERROR:.*did not complete' "$out"
+	detach_point memcow-lane-reset-in-sweep
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
+	ck_eq "retry finishes the same epoch, without another publish" 2 "$out"
+	ck_eq "retry drained old attachments" 0 "$(lane_status "$dboid" attached_old)"
+	ck_eq "retry finished reclaim" f "$(lane_status "$dboid" reclaim_pending)"
+	ck_eq "retry destroyed the old DSM segments" "$baseline" "$(dsm_files)"
+	ck_eq "retained backend adopts epoch 2" 2 "$(sess_query A 7 "SELECT public.memcow_backend_reset()")"
+	ck_eq "retained backend reads seed content" logout "$(sess_query A 7 "SELECT kind FROM public.events WHERE event_id = 1")"
+	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	ck_eq "fresh backend reads seed content" logout "$(psql -c "SELECT kind FROM public.events WHERE event_id = 1")"
+	sess_close A 7
+	ck_no_crash
+}
+
+nc_S18_reset_retry()
+{
+	restart || { ck "server started" 1; return; }
+	ensure_memcow
+	local dboid out
+	dboid=$(lane_oid)
+	# Omit the injected error: there is no pending finish to retry.
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
+	ck_eq "control: first reset succeeds" 1 "$out"
+	ck_eq "control: no reclaim pending" f "$(lane_status "$dboid" reclaim_pending)"
+	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
+	ck_eq "control: another call publishes a new epoch" 2 "$out"
 	ck_no_crash
 }
 
