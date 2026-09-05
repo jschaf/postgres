@@ -123,7 +123,7 @@ def main():
         fence_iter = args.fence_every > 0 and i % args.fence_every == 0
         if fence_iter:
             # (a) a busy registered backend: the reset must be refused
-            w.conn(0).send('SELECT pg_sleep(1.0)')
+            w.send('SELECT pg_sleep(1.0)')
             time.sleep(0.2)
             try:
                 pool.reset_lane_raw(lane, timeout_ms=500)
@@ -132,7 +132,7 @@ def main():
                 if 'not idle' not in str(e):
                     fail('iteration %d: refusal text unexpected: %s' % (i, e))
                 fence_refusals += 1
-            w.conn(0).get_results(timeout=30)
+            w.get_results(timeout=30)
             # A refused reset leaves the lane CLOSED (RESETTING); reopen it
             # unarmed so the straggler can connect with no nonce -- exactly
             # the connection string that escaped the pool.  The release()
@@ -156,11 +156,16 @@ def main():
         lat_cycle.append(t['cycle_ms'])
 
         # the wrapper is dead, in process
-        try:
-            w.exec('SELECT 1')
-            fail('iteration %d: released wrapper still usable' % i)
-        except mp.StaleWrapperError:
-            pass
+        for name, call in (
+                ('exec', lambda: w.exec('SELECT 1')),
+                ('exec_params', lambda: w.exec_params(tl.FIRST_QUERY, ['1'])),
+                ('send', lambda: w.send('SELECT 1')),
+                ('get_results', w.get_results)):
+            try:
+                call()
+                fail('iteration %d: released wrapper still usable through %s' % (i, name))
+            except mp.StaleWrapperError:
+                pass
 
         if fence_iter:
             alive = ctl.scalar('SELECT count(*) FROM pg_stat_activity WHERE pid = %d' % straggler.pid)

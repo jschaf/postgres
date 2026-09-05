@@ -45,7 +45,6 @@ import os
 import platform
 import queue
 import re
-import sys
 import threading
 import time
 
@@ -124,12 +123,10 @@ class LibPQ:
         f('PQgetResult', P, P)
         f('PQconsumeInput', I, P)
         f('PQisBusy', I, P)
-        f('PQsocket', I, P)
         f('PQcancelCreate', P, P)
         f('PQcancelBlocking', I, P)
         f('PQcancelErrorMessage', S, P)
         f('PQcancelFinish', None, P)
-        f('PQlibVersion', I)
 
 
 class PGError(Exception):
@@ -325,9 +322,13 @@ class Wrapper:
             raise StaleWrapperError('wrapper for lane %s epoch %d was released'
                                     % (self.lane_name, self.epoch))
 
-    def conn(self, i=0):
+    def send(self, sql, i=0):
         self._check()
-        return self._lane.conns[i]
+        return self._lane.conns[i].send(sql)
+
+    def get_results(self, timeout=30, i=0):
+        self._check()
+        return self._lane.conns[i].get_results(timeout=timeout)
 
     @property
     def nconns(self):
