@@ -77,6 +77,12 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
+case " $extra_args " in
+*" --only "*|*" --only="*|*" --dry-run "*)
+	echo "run_gate.sh: use io_matrix.sh directly for filtered or dry runs; a gate must run every cell" >&2
+	exit 2 ;;
+esac
+
 if [ "$phase" != 1 ] && [ -n "$extra_args" ]; then
 	echo "run_gate.sh: extra matrix arguments are only supported in phase 1: $extra_args" >&2
 	exit 2
