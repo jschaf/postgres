@@ -111,7 +111,7 @@
 # runs two things and requires both:
 #
 #   (1) io_matrix.sh, with side A = stock md and side B = THE SAME BINARY with
-#       memcow_enabled=on.  A runs on a PGDATA holding the seed's relation
+#       memcow.enabled=on.  A runs on a PGDATA holding the seed's relation
 #       files; B runs on one holding none, so a page B serves cannot have come
 #       from md.
 #   (2) slice/slice_tests.sh -- the memcow-specific cases.
@@ -315,8 +315,9 @@ case $phase in
 		--build-dir "$build_dir" \
 		--subset "$subset" \
 		--a-name a-md --b-name b-memcow \
-		--b-guc memcow_enabled=on \
-		--b-guc "memcow_seed_directory=$seed" \
+		--b-guc shared_preload_libraries=memcow \
+		--b-guc memcow.enabled=on \
+		--b-guc "memcow.seed_directory=$seed" \
 		--guc synchronous_commit=on \
 		--guc full_page_writes=on \
 		--guc autovacuum=off \

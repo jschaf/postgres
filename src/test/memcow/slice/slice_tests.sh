@@ -8,7 +8,7 @@
 # live here, plus a tenth (S10) written for a defect this suite found on its
 # first differential run.  Each one drives a real cluster: the seed built by
 # seed/build_seed.sh, the RAM-backed runtime PGDATA assembled by
-# seed/assemble_ramdir.sh, and a postmaster started with memcow_enabled=on on
+# seed/assemble_ramdir.sh, and a postmaster started with memcow.enabled=on on
 # its COMMAND LINE (contract ADDENDUM §O -- there is no other way to set it).
 #
 # ---------------------------------------------------------------------------
@@ -210,7 +210,7 @@ LOGFILE="$OUTPUTDIR/postmaster.log"
 # ---------------------------------------------------------------------------
 # server control
 #
-# memcow_enabled and memcow_seed_directory go on the postmaster COMMAND LINE.
+# memcow.enabled and memcow.seed_directory go on the postmaster COMMAND LINE.
 # That is not a stylistic choice: ALTER SYSTEM is refused
 # (GUC_DISALLOW_IN_AUTO_FILE), initdb -c leaks the setting into the seed's
 # postgresql.conf which assemble_ramdir then copies into the RAM dir, and
@@ -225,8 +225,8 @@ pg_start()
 {
 	local seed=${SEED_OVERRIDE:-$SEED}
 	local opts
-	opts="-c memcow_enabled=on"
-	opts="$opts -c memcow_seed_directory=$seed"
+	opts="-c shared_preload_libraries=memcow -c memcow.enabled=on"
+	opts="$opts -c memcow.seed_directory=$seed"
 	opts="$opts -c listen_addresses="
 	opts="$opts -c unix_socket_directories=$SOCKDIR"
 	opts="$opts -c log_min_messages=warning"
@@ -1431,10 +1431,10 @@ nc_S10_truncate_crit_section()
 #
 # memcow_lane_reset(D) runs on a CONTROL connection that is never connected
 # to D (plan §4).  The seed builds a control database for exactly this
-# (build_seed.sh, $CONTROL_DB, cloned from template0); the memcow_lanes
+# (build_seed.sh, $CONTROL_DB, cloned from template0); the memcow
 # extension is created there at test time -- the control database's overlay
 # is permanent (plan §6), so that survives every reset, but not a restart,
-# hence ensure_memcow_lanes per case.  The lane-side half of the extension
+# hence ensure_memcow per case.  The lane-side half of the extension
 # (memcow_backend_reset) lives in the SEED's lane databases, because anything
 # created in a lane at test time is overlay content that the reset discards.
 #
@@ -1452,9 +1452,9 @@ psql_ctl()
 		-d "$CONTROL_DB" -v ON_ERROR_STOP=0 "$@" 2>&1
 }
 
-ensure_memcow_lanes()
+ensure_memcow()
 {
-	psql_ctl -c "CREATE EXTENSION IF NOT EXISTS memcow_lanes" >/dev/null 2>&1
+	psql_ctl -c "CREATE EXTENSION IF NOT EXISTS memcow" >/dev/null 2>&1
 }
 
 ensure_injection_points()	# ensure_injection_points [DB]
@@ -1536,7 +1536,7 @@ wait_for_wait_event()
 S11_reset_reverts()
 {
 	restart || { ck "server started" 1; return; }
-	ensure_memcow_lanes
+	ensure_memcow
 	local dboid out epoch nonce pid digest_seed digest_after
 	dboid=$(lane_oid)
 	ck_match "lane database oid resolved" '^[0-9]+$' "$dboid"
@@ -1632,9 +1632,9 @@ SELECT 'staging', count(*) FROM public.staging;
 	ck_match "memcow_lane_open(D, arm => true) returns a nonce" '^[1-9][0-9]*$' "$nonce"
 	out=$(psql -c "SELECT 1")
 	ck_match "armed lane: a connection without the nonce is refused" 'FATAL:.*nonce' "$out"
-	out=$(PGOPTIONS="-c memcow_lane_nonce=$((nonce + 1))" psql -c "SELECT 1")
+	out=$(PGOPTIONS="-c memcow.lane_nonce=$((nonce + 1))" psql -c "SELECT 1")
 	ck_match "armed lane: a connection with a stale nonce is refused" 'FATAL:.*nonce' "$out"
-	out=$(PGOPTIONS="-c memcow_lane_nonce=$nonce" psql -c "SELECT 1")
+	out=$(PGOPTIONS="-c memcow.lane_nonce=$nonce" psql -c "SELECT 1")
 	ck_match "armed lane: a connection with the current nonce is admitted" '^1$' "$out"
 	# The retained backend was admitted at epoch 0 and stays: the fence is
 	# for NEW connections; retained ones are the registry's business.
@@ -1651,7 +1651,7 @@ SELECT 'staging', count(*) FROM public.staging;
 nc_S11_reset_reverts()
 {
 	restart || { ck "server started" 1; return; }
-	ensure_memcow_lanes
+	ensure_memcow
 	local dboid out
 	dboid=$(lane_oid)
 	psql -c "UPDATE public.events SET kind = 'epoch-zero' WHERE event_id = 1; CHECKPOINT;" >/dev/null
@@ -1682,7 +1682,7 @@ S12_reset_reclaims()
 	EXTRA_GUCS=(dynamic_shared_memory_type=mmap)
 	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
 	EXTRA_GUCS=()
-	ensure_memcow_lanes
+	ensure_memcow
 	local dboid out n1 n2 n3 bytes
 	dboid=$(lane_oid)
 
@@ -1743,7 +1743,7 @@ nc_S12_reset_reclaims()
 	EXTRA_GUCS=(dynamic_shared_memory_type=mmap)
 	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
 	EXTRA_GUCS=()
-	ensure_memcow_lanes
+	ensure_memcow
 	local dboid n1 n2
 	dboid=$(lane_oid)
 	psql_ctl -c "SELECT memcow_lane_reset($dboid)" >/dev/null
@@ -1777,7 +1777,7 @@ nc_S12_reset_reclaims()
 S13_reset_invalidates_pin()
 {
 	restart || { ck "server started" 1; return; }
-	ensure_memcow_lanes
+	ensure_memcow
 	local dboid out pid c_before c_after
 	dboid=$(lane_oid)
 
@@ -1840,7 +1840,7 @@ SELECT name || '=' || value FROM public.memcow_backend_counters()
 nc_S13_reset_invalidates_pin()
 {
 	restart || { ck "server started" 1; return; }
-	ensure_memcow_lanes
+	ensure_memcow
 	local out c_before c_after
 	sess_open A 7
 	ensure_pg_prewarm
@@ -1887,7 +1887,7 @@ SELECT name || '=' || value FROM public.memcow_backend_counters()
 S14_reset_vs_truncate()
 {
 	restart || { ck "server started" 1; return; }
-	ensure_memcow_lanes
+	ensure_memcow
 	ensure_injection_points
 	ensure_injection_points "$CONTROL_DB"
 	local dboid out pid seq
@@ -1988,7 +1988,7 @@ DELETE FROM public.events;
 nc_S14_reset_vs_truncate()
 {
 	restart || { ck "server started" 1; return; }
-	ensure_memcow_lanes
+	ensure_memcow
 	local dboid out pid
 	dboid=$(lane_oid)
 	sess_open B 8
@@ -2066,7 +2066,7 @@ lane_buffers()
 # ===========================================================================
 # S15 -- the authentication-time fence (plan §5 I2, fence 2 of 3)
 #
-# With contrib/memcow_lanes in shared_preload_libraries, its
+# With contrib/memcow in shared_preload_libraries, its
 # ClientAuthentication_hook reads the database name out of the startup packet,
 # finds the lane by that name, and refuses an ARMED lane's stale or absent
 # nonce at authentication -- before "connection authorized" is logged, before
@@ -2079,10 +2079,10 @@ lane_buffers()
 
 S15_auth_fence()
 {
-	EXTRA_GUCS=(shared_preload_libraries=memcow_lanes log_connections=authentication,authorization)
+	EXTRA_GUCS=(shared_preload_libraries=memcow log_connections=authentication,authorization)
 	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
 	EXTRA_GUCS=()
-	ensure_memcow_lanes
+	ensure_memcow
 	local dboid out nonce pid lines
 	dboid=$(lane_oid)
 
@@ -2096,12 +2096,12 @@ S15_auth_fence()
 	nonce=$(psql_ctl -c "SELECT memcow_lane_open($dboid, true)")
 	ck_match "lane opened armed with a nonce" '^[1-9][0-9]*$' "$nonce"
 
-	out=$(PGOPTIONS="-c memcow_lane_nonce=$((nonce + 1))" psql -c "SELECT 1")
+	out=$(PGOPTIONS="-c memcow.lane_nonce=$((nonce + 1))" psql -c "SELECT 1")
 	ck_match "armed lane: a stale nonce is refused" 'FATAL:.*nonce mismatch' "$out"
 	pid=$(grep -E 'FATAL:.*nonce mismatch' "$LOGFILE" | tail -1 | sed -n 's/.*\[\([0-9][0-9]*\)\].*/\1/p')
 	ck_match "the refusal is in the log with a PID" '^[0-9]+$' "$pid"
 	lines=$(log_for_pid "$pid")
-	ck_match "the log names the fence: the memcow_lanes authentication fence" \
+	ck_match "the log names the fence: the memcow authentication fence" \
 		'authentication fence' "$lines"
 	ck_match "the PID was authenticated (auth proper completed first)" \
 		'connection authenticated' "$lines"
@@ -2116,13 +2116,13 @@ S15_auth_fence()
 	ck_match "absent nonce: refused by the authentication fence too" \
 		'authentication fence' "$(log_for_pid "$pid")"
 
-	out=$(PGOPTIONS="-c memcow_lane_nonce=$nonce" psql -c "SELECT 1")
+	out=$(PGOPTIONS="-c memcow.lane_nonce=$nonce" psql -c "SELECT 1")
 	ck_match "armed lane: the current nonce passes both fences" '^1$' "$out"
 
 	# --- armed and closed: refused at auth as well (plan §4.1) -----------------
 	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")
 	ck_eq "reset -> epoch 1 (lane now RESETTING, still armed)" 1 "$out"
-	out=$(PGOPTIONS="-c memcow_lane_nonce=$nonce" psql -c "SELECT 1")
+	out=$(PGOPTIONS="-c memcow.lane_nonce=$nonce" psql -c "SELECT 1")
 	ck_match "armed RESETTING lane: refused even with the current nonce" 'FATAL:.*not open' "$out"
 	pid=$(grep -E 'FATAL:.*not open' "$LOGFILE" | tail -1 | sed -n 's/.*\[\([0-9][0-9]*\)\].*/\1/p')
 	ck_match "... by the authentication fence" 'authentication fence' "$(log_for_pid "$pid")"
@@ -2132,37 +2132,47 @@ S15_auth_fence()
 	ck_match "the control database is not a lane and is never fenced" '^1$' "$out"
 
 	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	out=$(PGOPTIONS="-c memcow.lane_nonce=$nonce -c event_triggers=off" psql -c "SELECT 'bypass'")
+	ck_match "startup event_triggers=off cannot bypass the login fence" 'FATAL:.*requires event_triggers=on' "$out"
+
+	out=$(PGOPTIONS="-c memcow.lane_nonce=$nonce" psql -c "ALTER EVENT TRIGGER memcow_admission DISABLE")
+	ck_match "the seed admission trigger cannot be disabled" 'ERROR:.*cannot modify memcow' "$out"
+	out=$(PGOPTIONS="-c memcow.lane_nonce=$nonce" psql -c "DROP EXTENSION memcow CASCADE")
+	ck_match "the admission trigger cannot be dropped through its extension" 'ERROR:.*cannot modify memcow' "$out"
 	ck_no_crash
 }
 
-# The sabotage: the library is NOT preloaded.  Every SQL function still works
-# (that is a requirement), but the stale nonce is now caught by the admission
-# fence in PostgresMain, i.e. AFTER "connection authorized", and the log says
+# The sabotage disables only the authentication hook through an injection
+# point. The storage manager remains registered, and fence 3 still catches it
+# fence in the login event trigger, i.e. AFTER "connection authorized", and the log says
 # so.  The case's "authentication fence, never authorized" assertions must
 # therefore fail here.
 nc_S15_auth_fence()
 {
 	restart || { ck "server started" 1; return; }
-	ensure_memcow_lanes
+	ensure_memcow
+	ensure_injection_points "$CONTROL_DB"
+	attach_point memcow-skip-auth notice >/dev/null
 	local dboid out nonce pid lines
 	dboid=$(lane_oid)
 	nonce=$(psql_ctl -c "SELECT memcow_lane_open($dboid, true)")
-	ck_match "every SQL function works without the preload (open returned a nonce)" '^[1-9][0-9]*$' "$nonce"
-	out=$(PGOPTIONS="-c memcow_lane_nonce=$((nonce + 1))" psql -c "SELECT 1")
+	ck_match "every SQL function works with the auth hook disabled (open returned a nonce)" '^[1-9][0-9]*$' "$nonce"
+	out=$(PGOPTIONS="-c memcow.lane_nonce=$((nonce + 1))" psql -c "SELECT 1")
 	ck_match "a stale nonce is still refused" 'FATAL:.*nonce mismatch' "$out"
 	pid=$(grep -E 'FATAL:.*nonce mismatch' "$LOGFILE" | tail -1 | sed -n 's/.*\[\([0-9][0-9]*\)\].*/\1/p')
 	lines=$(log_for_pid "$pid")
-	ck_match "sabotage detected: without the preload the refusal comes from the admission fence" \
+	ck_match "sabotage detected: with the auth hook disabled the refusal comes from the admission fence" \
 		'admission fence' "$lines"
 	ck_nomatch "... and not from the authentication fence" 'authentication fence' "$lines"
 	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
+	detach_point memcow-skip-auth
 	ck_no_crash
 }
 
 # ===========================================================================
 # S16 -- the per-lane arena limit (CONCERN 4a): exhaustion is a named error
 #
-# memcow_lane_arena_limit bounds one lane-epoch's arena through
+# memcow.lane_arena_limit bounds one lane-epoch's arena through
 # dsa_set_size_limit(), bound when the lane is opened and at every reset.
 # Filling it fails the WRITING STATEMENT with SQLSTATE 53MC1
 # (ERRCODE_MEMCOW_ARENA_FULL) and a message that names memcow -- not dsa's
@@ -2173,10 +2183,10 @@ nc_S15_auth_fence()
 
 S16_arena_limit()
 {
-	EXTRA_GUCS=(memcow_lane_arena_limit=4MB)
+	EXTRA_GUCS=(memcow.lane_arena_limit=4MB)
 	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
 	EXTRA_GUCS=()
-	ensure_memcow_lanes
+	ensure_memcow
 	local dboid out bytes
 	dboid=$(lane_oid)
 
@@ -2187,7 +2197,7 @@ S16_arena_limit()
 		-c "CREATE TABLE s16_big AS SELECT i, repeat('x', 400) AS pad FROM generate_series(1, 60000) i")
 	ck_match "a 25 MB write into a 4 MB arena fails with SQLSTATE 53MC1" '53MC1' "$out"
 	ck_match "... with memcow's own message, not dsa's" 'memcow overlay for database [0-9]+ is full' "$out"
-	ck_match "... naming the limit" 'memcow_lane_arena_limit is 4 MB' "$out"
+	ck_match "... naming the limit" 'memcow.lane_arena_limit is 4 MB' "$out"
 	bytes=$(lane_status "$dboid" arena_bytes)
 	if [ "${bytes:-0}" -le 4194304 ]; then
 		ck "the arena never exceeded the limit ($bytes bytes)" 0
@@ -2221,7 +2231,7 @@ S16_arena_limit()
 nc_S16_arena_limit()
 {
 	restart || { ck "server started" 1; return; }
-	ensure_memcow_lanes
+	ensure_memcow
 	local dboid out
 	dboid=$(lane_oid)
 	psql_ctl -c "SELECT memcow_lane_open($dboid, false)" >/dev/null
@@ -2241,20 +2251,28 @@ nc_S16_arena_limit()
 # taken the database startup lock nor advertised its database in the
 # ProcArray, so the reset's fence cannot see it.  The reset must complete
 # past it, and when the backend resumes it must die at the admission fence
-# in PostgresMain -- fence 3 of 3, the only one that can still catch it --
+# in the login event trigger -- fence 3 of 3, the only one that can still catch it --
 # before its first command is dispatched.  Parked at the memcow-lanes-post-auth
 # injection point, which the preloaded auth hook fires for lane databases.
 # ===========================================================================
 
 R1_auth_window()
 {
-	EXTRA_GUCS=(shared_preload_libraries=memcow_lanes log_connections=authentication,authorization)
+	R1_auth_window_protocol simple
+	R1_auth_window_protocol extended
+}
+
+R1_auth_window_protocol()
+{
+	local protocol=$1
+	EXTRA_GUCS=(shared_preload_libraries=memcow log_connections=authentication,authorization)
 	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
 	EXTRA_GUCS=()
-	ensure_memcow_lanes
+	ensure_memcow
 	ensure_injection_points "$CONTROL_DB"
 	local dboid out nonce nonce2 pid_a parked bg lines
 	dboid=$(lane_oid)
+	psql_ctl -c "ALTER DATABASE \"$DB\" SET event_triggers=off" >/dev/null
 
 	sess_open A 7
 	pid_a=$(sess_query A 7 "SELECT pg_backend_pid()")
@@ -2265,8 +2283,8 @@ R1_auth_window()
 
 	attach_point memcow-lanes-post-auth wait >/dev/null
 	# the escaped connection string: current nonce, so the auth fence admits it
-	( PGOPTIONS="-c memcow_lane_nonce=$nonce" PGHOST=$SOCKDIR PGPORT=$PORT \
-	  "$MC_BINDIR/psql" -X -q -A -t -d "$DB" -c "SELECT 'r1-cmd-ran'" \
+	( PGOPTIONS="-c memcow.lane_nonce=$nonce -c session_replication_role=replica" PGHOST=$SOCKDIR PGPORT=$PORT \
+	  python3 "$(dirname "$0")/startup_probe.py" --dbname "$DB" --protocol "$protocol" \
 	  >"$OUTPUTDIR/r1.out" 2>&1; echo "rc=$?" >>"$OUTPUTDIR/r1.out" ) &
 	bg=$!
 	parked=$(wait_for_backend_at memcow-lanes-post-auth 20)
@@ -2290,7 +2308,7 @@ R1_auth_window()
 	ck_nomatch "resumed backend: the command never ran" 'r1-cmd-ran' "$out"
 	lines=$(log_for_pid "$parked")
 	ck_match "which fence: it had been AUTHORIZED (the auth fence admitted it)" 'connection authorized' "$lines"
-	ck_match "which fence: the PostgresMain admission fence (3 of 3) caught it" 'admission fence' "$lines"
+	ck_match "which fence: the login event trigger admission fence (3 of 3) caught it" 'admission fence' "$lines"
 	ck_nomatch "which fence: not the authentication fence" 'authentication fence' "$lines"
 
 	# the park point stays attached until here: a later lane connection would
@@ -2298,9 +2316,10 @@ R1_auth_window()
 	detach_point memcow-lanes-post-auth
 	out=$(psql -c "SELECT 1")
 	ck_match "afterwards a connection without the nonce is still refused" 'FATAL' "$out"
-	out=$(PGOPTIONS="-c memcow_lane_nonce=$nonce2" psql -c "SELECT 'kind', kind FROM public.events WHERE event_id = 1")
+	out=$(PGOPTIONS="-c memcow.lane_nonce=$nonce2" psql -c "SELECT 'kind', kind FROM public.events WHERE event_id = 1")
 	ck_match "and one with the new nonce sees the seed" '^kind\|logout$' "$out"
 
+	psql_ctl -c "ALTER DATABASE \"$DB\" RESET event_triggers" >/dev/null
 	sess_close A 7
 	ck_no_crash
 }
@@ -2311,18 +2330,25 @@ R1_auth_window()
 # assertion fails.
 nc_R1_auth_window()
 {
-	EXTRA_GUCS=(shared_preload_libraries=memcow_lanes)
+	nc_R1_auth_window_protocol simple
+	nc_R1_auth_window_protocol extended
+}
+
+nc_R1_auth_window_protocol()
+{
+	local protocol=$1
+	EXTRA_GUCS=(shared_preload_libraries=memcow)
 	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
 	EXTRA_GUCS=()
-	ensure_memcow_lanes
+	ensure_memcow
 	ensure_injection_points "$CONTROL_DB"
 	local dboid out nonce parked bg
 	dboid=$(lane_oid)
 	nonce=$(psql_ctl -c "SELECT memcow_lane_open($dboid, true)")
 	attach_point memcow-skip-admission notice >/dev/null
 	attach_point memcow-lanes-post-auth wait >/dev/null
-	( PGOPTIONS="-c memcow_lane_nonce=$nonce" PGHOST=$SOCKDIR PGPORT=$PORT \
-	  "$MC_BINDIR/psql" -X -q -A -t -d "$DB" -c "SELECT 'r1-cmd-ran'" \
+	( PGOPTIONS="-c memcow.lane_nonce=$nonce" PGHOST=$SOCKDIR PGPORT=$PORT \
+	  python3 "$(dirname "$0")/startup_probe.py" --dbname "$DB" --protocol "$protocol" \
 	  >"$OUTPUTDIR/r1nc.out" 2>&1 ) &
 	bg=$!
 	parked=$(wait_for_backend_at memcow-lanes-post-auth 20)
@@ -2354,7 +2380,7 @@ nc_R1_auth_window()
 R2_stopped_straggler()
 {
 	restart || { ck "server started" 1; return; }
-	ensure_memcow_lanes
+	ensure_memcow
 	local dboid out pid_a pid_s seq
 	dboid=$(lane_oid)
 
@@ -2411,7 +2437,7 @@ R2_stopped_straggler()
 nc_R2_stopped_straggler()
 {
 	restart || { ck "server started" 1; return; }
-	ensure_memcow_lanes
+	ensure_memcow
 	local dboid out pid_s seq
 	dboid=$(lane_oid)
 	sess_open S 9
@@ -2449,10 +2475,10 @@ nc_R2_stopped_straggler()
 
 R3_cancel_inflight_io()
 {
-	EXTRA_GUCS=(io_method=worker shared_preload_libraries=test_aio)
+	EXTRA_GUCS=(io_method=worker shared_preload_libraries=memcow,test_aio)
 	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
 	EXTRA_GUCS=()
-	ensure_memcow_lanes
+	ensure_memcow
 	ensure_pg_buffercache
 	local dboid out pid_l seq relfilenode st
 	dboid=$(lane_oid)
@@ -2518,7 +2544,7 @@ R3_cancel_inflight_io()
 nc_R3_cancel_inflight_io()
 {
 	restart || { ck "server started" 1; return; }
-	ensure_memcow_lanes
+	ensure_memcow
 	ensure_injection_points "$CONTROL_DB"
 	local dboid out pid_l
 	dboid=$(lane_oid)
@@ -2567,7 +2593,7 @@ R4_checkpoint_discard()
 	EXTRA_GUCS=(bgwriter_lru_maxpages=0)
 	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
 	EXTRA_GUCS=()
-	ensure_memcow_lanes
+	ensure_memcow
 	ensure_injection_points "$CONTROL_DB"
 	ensure_pg_buffercache
 	local dboid out pid_l pid_c seq seq2 ckpt st
@@ -2678,7 +2704,7 @@ nc_R4_checkpoint_discard()
 	EXTRA_GUCS=(bgwriter_lru_maxpages=0)
 	restart || { EXTRA_GUCS=(); ck "server started" 1; return; }
 	EXTRA_GUCS=()
-	ensure_memcow_lanes
+	ensure_memcow
 	ensure_injection_points "$CONTROL_DB"
 	local dboid out pid_l pid_c seq seq2 ckpt
 	dboid=$(lane_oid)
@@ -2742,7 +2768,7 @@ nc_R4_checkpoint_discard()
 R5_sinval_nailed()
 {
 	restart || { ck "server started" 1; return; }
-	ensure_memcow_lanes
+	ensure_memcow
 	ensure_injection_points "$CONTROL_DB"
 	ensure_pg_buffercache
 	local dboid out pid_a pid_b pid_c seq n i
@@ -2832,7 +2858,7 @@ R5_sinval_nailed()
 nc_R5_sinval_nailed()
 {
 	restart || { ck "server started" 1; return; }
-	ensure_memcow_lanes
+	ensure_memcow
 	ensure_injection_points "$CONTROL_DB"
 	ensure_pg_buffercache
 	local dboid out pid_a

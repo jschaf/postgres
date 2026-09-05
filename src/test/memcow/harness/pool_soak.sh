@@ -8,7 +8,7 @@
 # The server is started as reset_soak.sh starts it (mmap DSM so segments can
 # be counted from outside, track_counts off, no parallel query, no prepared
 # transactions, autovacuum off, bounded WAL), plus shared_preload_libraries=
-# memcow_lanes so that the authentication-time fence is live: every fresh
+# memcow so that the authentication-time fence is live: every fresh
 # connection the soak opens presents the lane's current nonce and passes
 # both fences, every iteration.
 #
@@ -88,8 +88,8 @@ pg_start()
 	local extra=
 	[ -n "$SHARED_BUFFERS" ] && extra="-c shared_buffers=$SHARED_BUFFERS"
 	"$MC_BINDIR/pg_ctl" -D "$PGDATA" -l "$LOGFILE" -p "$MC_BINDIR/postgres" \
-		-o "-c memcow_enabled=on -c memcow_seed_directory=$SEED \
-		    -c shared_preload_libraries=memcow_lanes \
+		-o "-c memcow.enabled=on -c memcow.seed_directory=$SEED \
+		    -c shared_preload_libraries=memcow \
 		    -c listen_addresses= -c unix_socket_directories=$SOCKDIR \
 		    -c log_min_messages=warning -c log_statement=none \
 		    -c restart_after_crash=off -c dynamic_shared_memory_type=mmap \

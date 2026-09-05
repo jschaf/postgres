@@ -108,7 +108,7 @@ LOGFILE="$OUTPUTDIR/postmaster.log"
 pg_start()
 {
 	"$MC_BINDIR/pg_ctl" -D "$PGDATA" -l "$LOGFILE" -p "$MC_BINDIR/postgres" \
-		-o "-c memcow_enabled=on -c memcow_seed_directory=$SEED \
+		-o "-c shared_preload_libraries=memcow -c memcow.enabled=on -c memcow.seed_directory=$SEED \
 		    -c listen_addresses= -c unix_socket_directories=$SOCKDIR \
 		    -c log_min_messages=warning -c log_statement=none \
 		    -c restart_after_crash=off -c dynamic_shared_memory_type=mmap \
@@ -170,7 +170,7 @@ mc_banner "memcow reset soak (plan §7.2)" \
 	"iterations: $ITER   fence every: $FENCE_EVERY   fresh every: $FRESH_EVERY" \
 	"logs:       $OUTPUTDIR"
 
-psql_ctl -c "CREATE EXTENSION IF NOT EXISTS memcow_lanes" >/dev/null
+psql_ctl -c "CREATE EXTENSION IF NOT EXISTS memcow" >/dev/null
 DBOID=$(psql_ctl -c "SELECT oid FROM pg_database WHERE datname = '$DB'")
 [ -n "$DBOID" ] || mc_die "cannot resolve the lane's oid"
 

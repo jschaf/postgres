@@ -130,7 +130,7 @@ def main():
     os.makedirs(args.workdir, exist_ok=True)
 
     ctl = mp.Conn(pq, base + ' dbname=' + args.control_db)
-    ctl.exec('CREATE EXTENSION IF NOT EXISTS memcow_lanes')
+    ctl.exec('CREATE EXTENSION IF NOT EXISTS memcow')
     ctl.exec('CREATE EXTENSION IF NOT EXISTS injection_points')
     probe = bc.LeakProbe(args.pgdata, ctl)
 
@@ -257,7 +257,9 @@ def main():
     cycles = run(args.resets, 'reset')
 
     if waker_stop is not None:
-        waker_stop.set()
+        # Detaching prevents new waits but does not release parked neighbours.
+        # Keep waking them until their current reset and shutdown complete.
+        cycle_gate.set()
         try:
             ctl.exec("SELECT injection_points_detach('%s')" % NC_POINT)
         except mp.PGError:
@@ -278,6 +280,10 @@ def main():
             busy_reports.append(json.load(open(rep)))
         except Exception as e:  # noqa: BLE001
             busy_reports.append({'error': str(e)})
+    if waker_stop is not None:
+        waker_stop.set()
+        th.join()
+        waker_ctl.close()
     time.sleep(0.2)
     after = probe.sample()
     leaks = bc.LeakProbe.diff(before, after, warm=warm[0], lanes=set(lanes) | set(busy_lanes))

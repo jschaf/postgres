@@ -84,7 +84,7 @@ def main():
     lanes = args.lanes.split(',')
 
     ctl = mp.Conn(pq, base + ' dbname=' + args.control_db)
-    ctl.exec('CREATE EXTENSION IF NOT EXISTS memcow_lanes')
+    ctl.exec('CREATE EXTENSION IF NOT EXISTS memcow')
     probe = bc.LeakProbe(args.pgdata, ctl)
 
     cycles = []

@@ -130,7 +130,7 @@ SHARED_BUFFERS=${MEMCOW_SHARED_BUFFERS:-128MB}
 MAX_CONNECTIONS=${MEMCOW_MAX_CONNECTIONS:-200}
 WAL_LEVEL=${MEMCOW_WAL_LEVEL:-replica}
 
-MEMCOW_GUC_NAME=${MEMCOW_GUC_NAME:-memcow_enabled}
+MEMCOW_GUC_NAME=${MEMCOW_GUC_NAME:-memcow.enabled}
 
 MARKER_BASENAME=.memcow_ramdir
 CONF_BEGIN='# --- BEGIN memcow runtime settings (assemble_ramdir.sh; generated) ---'

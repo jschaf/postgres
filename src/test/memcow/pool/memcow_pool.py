@@ -454,7 +454,7 @@ class LanePool:
     # --- connection strings ------------------------------------------------
 
     def lane_conninfo(self, lane, nonce):
-        opts = "options='-c memcow_lane_nonce=%d'" % nonce if nonce else ''
+        opts = "options='-c memcow.lane_nonce=%d'" % nonce if nonce else ''
         return '%s dbname=%s %s' % (self.base_conninfo, lane.name, opts)
 
     def control_conninfo(self):
@@ -464,7 +464,7 @@ class LanePool:
 
     def open(self):
         self.ctl = Conn(self.pq, self.control_conninfo())
-        self.ctl.exec('CREATE EXTENSION IF NOT EXISTS memcow_lanes')
+        self.ctl.exec('CREATE EXTENSION IF NOT EXISTS memcow')
         for name in self.lane_names:
             oid = self.ctl.scalar("SELECT oid FROM pg_database WHERE datname = '%s'" % name)
             if oid is None:

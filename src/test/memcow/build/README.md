@@ -252,7 +252,7 @@ Folded-in measurements: barrier absorption latency under a CFI-starved backend
 | --- | --- | --- |
 | Phase 0 (build) | **yes** | — |
 | Phase 1 (§7.1) | no | `memcow.c`, the GUC, the `smgrsw` row and `pgaio_io_complete_synthetic()` do not exist (plan §2); harness absent |
-| Phase 2 (§7.2) | no | Phase 1, plus `contrib/memcow_lanes/`; harness absent |
+| Phase 2 (§7.2) | no | Phase 1, plus `contrib/memcow/`; harness absent |
 | Phase 3 (§7.3) | no | Phase 2; harness absent; TAP tests currently disabled on this machine |
 | Phase 4 (§7.4) | no | Phase 2; harness absent |
 
@@ -289,7 +289,7 @@ MEMCOW-CI: FAIL phase=1 stage=harness-check tap=disabled elapsed=3s build-dir=..
 - **No meson wiring.** `src/test/memcow/` is not in `src/test/meson.build`, and
   nothing under `src/backend/`, `src/include/` or `contrib/` was touched. The
   scripts here need no meson integration (they are invoked by path), and
-  `memcow.c` / `contrib/memcow_lanes/` do not exist yet, so there is nothing
+  `memcow.c` / `contrib/memcow/` do not exist yet, so there is nothing
   legitimate to register.
 - Meson integration that Phase 1 **will** need is listed below so it can be
   briefed, not so it can be done here.
@@ -305,8 +305,8 @@ MEMCOW-CI: FAIL phase=1 stage=harness-check tap=disabled elapsed=3s build-dir=..
    (`src/include/utils/meson.build`, generating `guc_tables.inc.c`), so the new
    `PGC_POSTMASTER` bool is picked up and correctly re-generated on incremental
    builds. Nothing to add.
-3. `contrib/meson.build` — add `subdir('memcow_lanes')`, plus a new
-   `contrib/memcow_lanes/meson.build` following the shape of an existing
+3. `contrib/meson.build` — add `subdir('memcow')`, plus a new
+   `contrib/memcow/meson.build` following the shape of an existing
    contrib module with a `_PG_init` and SQL functions: `shared_module(...,
    kwargs: contrib_mod_args)` + `contrib_targets += ...` (see
    `contrib/auth_delay/meson.build` for the hook-only minimum), plus

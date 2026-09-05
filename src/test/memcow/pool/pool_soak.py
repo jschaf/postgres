@@ -158,7 +158,7 @@ def main():
 
     # a control connection of the soak's own, beside the pool's
     ctl = mp.Conn(pq, base + ' dbname=' + args.control_db)
-    ctl.exec('CREATE EXTENSION IF NOT EXISTS memcow_lanes')
+    ctl.exec('CREATE EXTENSION IF NOT EXISTS memcow')
 
     role_user = args.user
     if args.measure_shdepend:

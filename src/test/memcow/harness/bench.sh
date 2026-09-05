@@ -4,7 +4,7 @@
 # driver (bench/bench_lease.py or bench/bench_reset.py).  The server is
 # started as pool_soak.sh starts it (mmap DSM so segments can be counted
 # from outside, no parallel query, no prepared transactions, autovacuum off,
-# bounded WAL, shared_preload_libraries=memcow_lanes so both admission
+# bounded WAL, shared_preload_libraries=memcow so both admission
 # fences are live) at the shared_buffers the caller asks for -- §7.4 says
 # 512MB -- and the leak scan of the log runs after the driver.
 #
@@ -67,8 +67,8 @@ LOGFILE="$OUTPUTDIR/postmaster.log"
 pg_start()
 {
 	"$MC_BINDIR/pg_ctl" -D "$PGDATA" -l "$LOGFILE" -p "$MC_BINDIR/postgres" \
-		-o "-c memcow_enabled=on -c memcow_seed_directory=$SEED \
-		    -c shared_preload_libraries=memcow_lanes \
+		-o "-c memcow.enabled=on -c memcow.seed_directory=$SEED \
+		    -c shared_preload_libraries=memcow \
 		    -c listen_addresses= -c unix_socket_directories=$SOCKDIR \
 		    -c log_min_messages=warning -c log_statement=none \
 		    -c restart_after_crash=off -c dynamic_shared_memory_type=mmap \
@@ -99,7 +99,7 @@ esac
 pg_start || mc_die "server did not start; see $LOGFILE"
 
 PGHOST=$SOCKDIR PGPORT=$PORT "$MC_BINDIR/psql" -X -q -d "$CONTROL_DB" \
-	-c "CREATE EXTENSION IF NOT EXISTS memcow_lanes" \
+	-c "CREATE EXTENSION IF NOT EXISTS memcow" \
 	-c "CREATE EXTENSION IF NOT EXISTS injection_points" \
 	-c "CREATE EXTENSION IF NOT EXISTS pg_buffercache" >/dev/null 2>&1 ||
 	mc_die "cannot create the control-database extensions"

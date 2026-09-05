@@ -147,7 +147,7 @@ QUIET=0
 
 # The PGC_POSTMASTER bool from plan.md §2.  It does not exist yet in Phase 0;
 # step_force_memcow_guc_off() below handles both worlds.
-MEMCOW_GUC_NAME=${MEMCOW_GUC_NAME:-memcow_enabled}
+MEMCOW_GUC_NAME=${MEMCOW_GUC_NAME:-memcow.enabled}
 
 # Lane database naming convention.  Two decimal digits, zero padded, from 00.
 LANE_DB_PREFIX=${MEMCOW_LANE_DB_PREFIX:-memcow_lane_}
@@ -329,6 +329,17 @@ step_validate_build()
 	PG_BINARY_SHA256=$(sha256_of "$PG_BINARY")
 	PG_BINARY_BYTES=$(file_bytes "$PG_BINARY")
 
+	MEMCOW_MODULE_BYTES=0
+	MEMCOW_MODULE_SHA256=
+	for suffix in so dylib dll; do
+		module="$("$PG_BINDIR/pg_config" --pkglibdir)/memcow.$suffix"
+		if [ -f "$module" ]; then
+			MEMCOW_MODULE_BYTES=$(file_bytes "$module")
+			MEMCOW_MODULE_SHA256=$(sha256_of "$module")
+			break
+		fi
+	done
+
 	# The recipe hash: everything that changes what the seed contains.
 	RECIPE_SHA256=$(
 		{
@@ -338,6 +349,7 @@ step_validate_build()
 			printf 'lane_prefix=%s\n' "$LANE_DB_PREFIX"
 			printf 'control_db=%s\n' "$CONTROL_DB"
 			printf 'script=%s\n'  "$(sha256_of "$SCRIPT_PATH")"
+			printf 'module=%s\n' "$MEMCOW_MODULE_SHA256"
 			printf 'schema=%s\n'  "$(sha256_of "$SCHEMA_SQL")"
 		} | sha256_of_stdin
 	)
@@ -365,6 +377,12 @@ MEMCOW_GUC_OFF_OPTS=
 step_force_memcow_guc_off()
 {
 	local boot
+
+	if [ -f "$("$PG_BINDIR/pg_config" --sharedir)/extension/memcow.control" ]; then
+		MEMCOW_GUC_OFF_OPTS="-c shared_preload_libraries=memcow -c $MEMCOW_GUC_NAME=off"
+		log "guc-off: preloading memcow with $MEMCOW_GUC_NAME=off for the seed"
+		return 0
+	fi
 
 	boot=$("$PG_BINARY" --describe-config 2>/dev/null \
 		| awk -F'\t' -v n="$MEMCOW_GUC_NAME" '$1 == n { print $5; exit }')
@@ -488,19 +506,19 @@ step_apply_schema()
 	psql_do template1 -f "$SCHEMA_SQL" >>"$BUILD_LOG" 2>&1 \
 		|| die "schema.sql failed; see $BUILD_LOG"
 
-	# Phase 2: the lane half of contrib/memcow_lanes (memcow_backend_reset,
+	# Phase 2: the lane half of contrib/memcow (memcow_backend_reset,
 	# memcow_backend_counters) has to exist in every lane database, and
 	# anything created in a lane at run time is overlay content that the
 	# next reset discards -- the extension's own pg_proc rows included.  So
 	# it goes into the seed, through template1, and it is part of the seed
 	# recipe.  Skipped only when the module is not installed beside this
 	# binary, and loudly, because a seed without it cannot run Phase 2.
-	if [ -f "$("$PG_BINDIR/pg_config" --sharedir)/extension/memcow_lanes.control" ]; then
-		log "creating extension memcow_lanes in template1"
-		psql_do template1 -c "CREATE EXTENSION memcow_lanes;" >>"$BUILD_LOG" 2>&1 \
-			|| die "CREATE EXTENSION memcow_lanes failed; see $BUILD_LOG"
+	if [ -f "$("$PG_BINDIR/pg_config" --sharedir)/extension/memcow.control" ]; then
+		log "creating extension memcow in template1"
+		psql_do template1 -c "CREATE EXTENSION memcow;" >>"$BUILD_LOG" 2>&1 \
+			|| die "CREATE EXTENSION memcow failed; see $BUILD_LOG"
 	else
-		log "WARNING: memcow_lanes.control not found beside $PG_BINDIR; the seed will not support lane reset"
+		log "WARNING: memcow.control not found beside $PG_BINDIR; the seed will not support lane reset"
 	fi
 }
 
@@ -664,6 +682,7 @@ step_write_fingerprint()
 		printf 'wal_block_size=%s\n'            "$(controldata_get "$BUILD_DIR" 'WAL block size')"
 		printf 'wal_segment_bytes=%s\n'         "$(controldata_get "$BUILD_DIR" 'Bytes per WAL segment')"
 		printf 'data_page_checksum_version=%s\n' "$(controldata_get "$BUILD_DIR" 'Data page checksum version')"
+		printf 'memcow_module_bytes=%s\n' "$MEMCOW_MODULE_BYTES"
 		printf 'postgres_binary_bytes=%s\n'     "$PG_BINARY_BYTES"
 		printf 'postgres_binary_sha256=%s\n'    "$PG_BINARY_SHA256"
 		printf 'seed_recipe_sha256=%s\n'        "$RECIPE_SHA256"

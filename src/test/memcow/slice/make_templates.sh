@@ -14,8 +14,8 @@
 #               what side A runs on.
 #
 #   tpl-memcow  the same thing with NO relation files at all -- literally the
-#               assembled RAM dir.  Side B runs on this with memcow_enabled=on
-#               and memcow_seed_directory pointing at the seed.
+#               assembled RAM dir.  Side B runs on this with memcow.enabled=on
+#               and memcow.seed_directory pointing at the seed.
 #
 # Giving side B a PGDATA with zero relation files is the point of the exercise
 # and not an optimisation: it is what turns "memcow produced the right answer"

@@ -235,12 +235,12 @@ do
 	echo "$g=$v" >>"$ENGINE_INFO"
 done
 # Phase 1: the memcow switch, if this build has one.  Absent in Phase 0.
-# NB: the GUC is memcow_enabled, not memcow -- an earlier version of this file
+# NB: the GUC is memcow.enabled, not memcow -- an earlier version of this file
 # probed the wrong name and therefore reported <absent> even with memcow on,
 # which is exactly the sort of thing that makes an A/B record worthless.
-# memcow_seed_directory is GUC_SUPERUSER_ONLY, so this must be a superuser
+# memcow.seed_directory is GUC_SUPERUSER_ONLY, so this must be a superuser
 # connection; it is (the harness connects as the bootstrap superuser).
-for g in memcow_enabled memcow_seed_directory
+for g in memcow.enabled memcow.seed_directory
 do
 	v=$(mc_psql "$SOCKDIR" "$PORT" postgres \
 		"SELECT coalesce((SELECT setting FROM pg_settings WHERE name = '$g'), '<absent>')" 2>/dev/null) ||

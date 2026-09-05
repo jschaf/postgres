@@ -91,7 +91,7 @@ Usage: io_matrix.sh --outputdir DIR --pgdata-template DIR [options]
   --guc NAME=VALUE          extra GUC for BOTH sides of every cell (repeatable)
   --a-guc NAME=VALUE        extra GUC for side A only (repeatable)
   --b-guc NAME=VALUE        extra GUC for side B only
-                            (Phase 1: memcow_enabled=on, memcow_seed_directory=)
+                            (Phase 1: memcow.enabled=on, memcow.seed_directory=)
   --a-name / --b-name NAME  label prefix for each side (default a-stock /
                             b-under-test)
   --allow-expected-failure T  passed through to diff_engines.sh (repeatable)
@@ -211,7 +211,7 @@ SERVER_VERSION=$(mc_psql "$PROBE_SOCK" "$PROBE_PORT" postgres "SHOW server_versi
 DEBUG_ASSERTIONS=$(mc_psql "$PROBE_SOCK" "$PROBE_PORT" postgres "SHOW debug_assertions")
 DEFAULT_TB=$(mc_psql "$PROBE_SOCK" "$PROBE_PORT" postgres "SHOW temp_buffers")
 HAS_MEMCOW=$(mc_psql "$PROBE_SOCK" "$PROBE_PORT" postgres \
-	"SELECT count(*) FROM pg_settings WHERE name = 'memcow_enabled'")
+	"SELECT count(*) FROM pg_settings WHERE name = 'memcow.enabled'")
 
 mc_server_stop "$PROBE_DIR/pgdata" "$PROBE_DIR/postmaster.log"
 rm -rf "$PROBE_SOCK" "$PROBE_DIR/pgdata"

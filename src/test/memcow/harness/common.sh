@@ -218,7 +218,7 @@ mc_server_start()
 	shift 4
 
 	local opts
-	opts="-c listen_addresses="
+	opts="-c shared_preload_libraries=memcow -c listen_addresses="
 	opts="$opts -c unix_socket_directories=$sockdir"
 	opts="$opts -c fsync=off"
 	opts="$opts -c log_min_messages=warning"
