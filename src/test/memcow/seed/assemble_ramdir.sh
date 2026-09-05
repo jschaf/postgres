@@ -15,8 +15,9 @@
 #     4. appends the runtime settings block: fsync=off, bounded max_wal_size,
 #        temp_file_limit, plus the plan.md §6 preconditions
 #
-# It does NOT start a postmaster and it does NOT turn the memcow GUC on --
-# both belong to the harness.
+# It does NOT start a postmaster and it does NOT turn memcow on -- both
+# belong to the harness, which puts memcow.enabled on the postmaster
+# command line.
 #
 # ---------------------------------------------------------------------------
 # What counts as a "relation file"
@@ -86,7 +87,7 @@
 # ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
-#   assemble_ramdir.sh [-s SEEDDIR] [-m MOUNT] [-z MB] [-p PORT] [-b BINDIR] [-R] [-f]
+#   assemble_ramdir.sh [-s SEEDDIR] [-m MOUNT] [-z MB] [-p PORT] [-b BINDIR] [-f]
 #   assemble_ramdir.sh --detach [-m MOUNT] [-f]
 #   assemble_ramdir.sh --status [-m MOUNT]
 #
@@ -96,12 +97,6 @@
 #   -p PORT      port to write into postgresql.conf (default $MEMCOW_PORT or 5599)
 #   -b BINDIR    bindir, for pg_controldata         (default $MEMCOW_BINDIR or
 #                                                    /opt/p/postgres-install/bin)
-#   -R, --with-relations
-#                ALSO copy the relation files in, producing a startable stock
-#                cluster in RAM.  Phase 0 only: until memcow exists nothing
-#                serves relation blocks out of the seed, so this is the only
-#                way to boot the assembled directory.  Costs the seed's full
-#                size in RAM.
 #   -f           force: re-assemble over an existing ram dir, and on --detach
 #                stop a postmaster that is still running on it
 #   --detach     unmount and free the RAM disk
@@ -120,7 +115,6 @@ PGPORT_SETTING=${MEMCOW_PORT:-5599}
 VOLNAME=${MEMCOW_RAM_VOLNAME:-memcow_ram}
 FORCE=0
 MODE=assemble
-WITH_RELATIONS=0
 
 # Runtime settings knobs (see the generated block for what each is for).
 MAX_WAL_SIZE=${MEMCOW_MAX_WAL_SIZE:-256MB}
@@ -129,8 +123,6 @@ TEMP_FILE_LIMIT=${MEMCOW_TEMP_FILE_LIMIT:-256MB}
 SHARED_BUFFERS=${MEMCOW_SHARED_BUFFERS:-128MB}
 MAX_CONNECTIONS=${MEMCOW_MAX_CONNECTIONS:-200}
 WAL_LEVEL=${MEMCOW_WAL_LEVEL:-replica}
-
-MEMCOW_GUC_NAME=${MEMCOW_GUC_NAME:-memcow.enabled}
 
 MARKER_BASENAME=.memcow_ramdir
 CONF_BEGIN='# --- BEGIN memcow runtime settings (assemble_ramdir.sh; generated) ---'
@@ -142,24 +134,22 @@ for a in "$@"; do
 	case $a in
 		--detach) MODE=detach ;;
 		--status) MODE=status ;;
-		--with-relations) WITH_RELATIONS=1 ;;
 		--help)   awk '/^set -euo pipefail/{exit} NR>1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		*)        args+=("$a") ;;
 	esac
 done
 set -- ${args+"${args[@]}"}
 
-while getopts 's:m:z:p:b:Rfh' opt; do
+while getopts 's:m:z:p:b:fh' opt; do
 	case $opt in
 		s) SEED_DIR=$OPTARG ;;
 		m) RAM_MOUNT=$OPTARG ;;
 		z) RAMDISK_MB=$OPTARG ;;
 		p) PGPORT_SETTING=$OPTARG ;;
 		b) PG_BINDIR=$OPTARG ;;
-		R) WITH_RELATIONS=1 ;;
 		f) FORCE=1 ;;
 		h) awk '/^set -euo pipefail/{exit} NR>1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-		*) echo "usage: $0 [-s SEEDDIR] [-m MOUNT] [-z MB] [-p PORT] [-b BINDIR] [-R] [-f] [--detach|--status]" >&2
+		*) echo "usage: $0 [-s SEEDDIR] [-m MOUNT] [-z MB] [-p PORT] [-b BINDIR] [-f] [--detach|--status]" >&2
 		   exit 2 ;;
 	esac
 done
@@ -378,26 +368,6 @@ is_relation_file()
 	[[ $base =~ ^[0-9]+(_fsm|_vm|_init)?(\.[0-9]+)?$ ]]
 }
 
-# Phase 0 escape hatch.  Until memcow exists there is nothing to serve the
-# relation blocks out of the seed, so the assembled directory is not a
-# startable cluster.  --with-relations copies them in too, producing an
-# ordinary stock cluster that happens to live in RAM.  That is what makes the
-# assembled tree and the generated postgresql.conf testable today; it is NOT
-# how the engine runs (plan.md §3.2 leaves the relation files in the seed and
-# mmaps them PROT_READ), and it costs the size of the whole seed in RAM.
-copy_relation_files()
-{
-	local rel copied=0
-
-	log "--with-relations: copying relation files too (Phase 0 smoke-test mode)"
-	while IFS= read -r rel; do
-		is_relation_file "$rel" || continue
-		cp -p "$SEED_DIR/${rel#./}" "$PGDATA_DIR/${rel#./}"
-		copied=$((copied + 1))
-	done < <(cd "$SEED_DIR" && find . -type f -print)
-	log "--with-relations: copied $copied relation files"
-}
-
 copy_nonrelation_files()
 {
 	local rel dst copied=0 skipped=0 bytes=0
@@ -433,14 +403,6 @@ write_runtime_conf()
 {
 	local conf=$PGDATA_DIR/postgresql.conf
 	local senders=10
-
-	# The seed's postgresql.conf must not be able to turn memcow off (or on):
-	# that is the harness's decision, made on the postmaster command line.
-	if grep -qE "^[[:space:]]*$MEMCOW_GUC_NAME[[:space:]]*=" "$conf" 2>/dev/null; then
-		log "neutralising a $MEMCOW_GUC_NAME setting inherited from the seed's postgresql.conf"
-		sed -i.memcowbak -E "s/^([[:space:]]*$MEMCOW_GUC_NAME[[:space:]]*=)/#inherited-from-seed# \\1/" "$conf"
-		rm -f "$conf.memcowbak"
-	fi
 
 	# wal_level = minimal is incompatible with walsenders.
 	[ "$WAL_LEVEL" = minimal ] && senders=0
@@ -546,7 +508,6 @@ do_assemble()
 
 	mkdir -p "$PGDATA_DIR"
 	copy_nonrelation_files
-	[ "$WITH_RELATIONS" = 1 ] && copy_relation_files
 	write_runtime_conf
 	write_marker
 

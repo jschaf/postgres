@@ -13,7 +13,7 @@
 #
 # Sequence:
 #     1.  resolve + validate the build (bindir)
-#     2.  force the memcow GUC off                     <- named step, see below
+#     2.  preload memcow with memcow.enabled=off       <- named step, see below
 #     3.  initdb
 #     4.  start the postmaster
 #     5.  apply schema.sql to template1
@@ -145,9 +145,8 @@ SUPERUSER=${MEMCOW_SUPERUSER:-postgres}
 FORCE=0
 QUIET=0
 
-# The PGC_POSTMASTER bool from plan.md §2.  It does not exist yet in Phase 0;
-# step_force_memcow_guc_off() below handles both worlds.
-MEMCOW_GUC_NAME=${MEMCOW_GUC_NAME:-memcow.enabled}
+# The PGC_POSTMASTER bool from plan.md §2, defined by contrib/memcow.
+MEMCOW_GUC_NAME=memcow.enabled
 
 # Lane database naming convention.  Two decimal digits, zero padded, from 00.
 LANE_DB_PREFIX=${MEMCOW_LANE_DB_PREFIX:-memcow_lane_}
@@ -339,6 +338,7 @@ step_validate_build()
 			break
 		fi
 	done
+	[ -n "$MEMCOW_MODULE_SHA256" ] || die "no memcow module under $("$PG_BINDIR/pg_config" --pkglibdir); install contrib/memcow first"
 
 	# The recipe hash: everything that changes what the seed contains.
 	RECIPE_SHA256=$(
@@ -361,45 +361,25 @@ step_validate_build()
 }
 
 # ---------------------------------------------------------------------------
-# Step 2: force the memcow GUC off  (NAMED STEP -- see plan.md §1, §3.1)
+# Step 2: memcow preloaded but OFF  (NAMED STEP -- see plan.md §1, §3.1)
 #
-# The seed must be written by stock md.c.  Today the GUC does not exist, so
-# this resolves to "nothing to do"; once §2's guc_parameters.dat row lands,
-# the same call starts passing -c <guc>=off to the postmaster and asserts that
-# the *boot* default is off (which is what initdb's bootstrap backend uses --
+# The seed must be written by stock md.c, so the module is preloaded (its
+# GUCs must exist for CREATE EXTENSION and for the lane databases to inherit
+# the extension) with memcow.enabled=off on the postmaster command line.
 # initdb has no way to pass a GUC without also writing it into the seed's
-# postgresql.conf, which would then be copied into the RAM dir by
-# assemble_ramdir.sh and wrongly disable memcow at run time).
+# postgresql.conf, which assemble_ramdir.sh would then copy into the RAM
+# dir; the GUC's boot default is off, which is what initdb's bootstrap
+# backend uses.
 # ---------------------------------------------------------------------------
 
 MEMCOW_GUC_OFF_OPTS=
 
 step_force_memcow_guc_off()
 {
-	local boot
-
-	if [ -f "$("$PG_BINDIR/pg_config" --sharedir)/extension/memcow.control" ]; then
-		MEMCOW_GUC_OFF_OPTS="-c shared_preload_libraries=memcow -c $MEMCOW_GUC_NAME=off"
-		log "guc-off: preloading memcow with $MEMCOW_GUC_NAME=off for the seed"
-		return 0
-	fi
-
-	boot=$("$PG_BINARY" --describe-config 2>/dev/null \
-		| awk -F'\t' -v n="$MEMCOW_GUC_NAME" '$1 == n { print $5; exit }')
-
-	if [ -z "$boot" ]; then
-		MEMCOW_GUC_OFF_OPTS=
-		log "guc-off: '$MEMCOW_GUC_NAME' absent from this build (Phase 0) -- plain initdb, stock md"
-		return 0
-	fi
-
-	case $boot in
-		FALSE|false|off|OFF|0) ;;
-		*) die "guc-off: '$MEMCOW_GUC_NAME' boot default is '$boot', not off; initdb's bootstrap backend would write memcow pages into the seed" ;;
-	esac
-
-	MEMCOW_GUC_OFF_OPTS="-c $MEMCOW_GUC_NAME=off"
-	log "guc-off: forcing $MEMCOW_GUC_NAME=off for the seed postmaster"
+	[ -f "$("$PG_BINDIR/pg_config" --sharedir)/extension/memcow.control" ] ||
+		die "memcow.control not found beside $PG_BINDIR: install contrib/memcow first (ninja / meson test --suite setup)"
+	MEMCOW_GUC_OFF_OPTS="-c shared_preload_libraries=memcow -c $MEMCOW_GUC_NAME=off"
+	log "guc-off: preloading memcow with $MEMCOW_GUC_NAME=off for the seed"
 }
 
 # ---------------------------------------------------------------------------
@@ -506,20 +486,14 @@ step_apply_schema()
 	psql_do template1 -f "$SCHEMA_SQL" >>"$BUILD_LOG" 2>&1 \
 		|| die "schema.sql failed; see $BUILD_LOG"
 
-	# Phase 2: the lane half of contrib/memcow (memcow_backend_reset,
-	# memcow_backend_counters) has to exist in every lane database, and
-	# anything created in a lane at run time is overlay content that the
-	# next reset discards -- the extension's own pg_proc rows included.  So
-	# it goes into the seed, through template1, and it is part of the seed
-	# recipe.  Skipped only when the module is not installed beside this
-	# binary, and loudly, because a seed without it cannot run Phase 2.
-	if [ -f "$("$PG_BINDIR/pg_config" --sharedir)/extension/memcow.control" ]; then
-		log "creating extension memcow in template1"
-		psql_do template1 -c "CREATE EXTENSION memcow;" >>"$BUILD_LOG" 2>&1 \
-			|| die "CREATE EXTENSION memcow failed; see $BUILD_LOG"
-	else
-		log "WARNING: memcow.control not found beside $PG_BINDIR; the seed will not support lane reset"
-	fi
+	# The lane half of contrib/memcow (memcow_backend_reset, the login
+	# admission trigger) has to exist in every lane database, and anything
+	# created in a lane at run time is overlay content that the next reset
+	# discards -- the extension's own pg_proc rows included.  So it goes into
+	# the seed, through template1, and it is part of the seed recipe.
+	log "creating extension memcow in template1"
+	psql_do template1 -c "CREATE EXTENSION memcow;" >>"$BUILD_LOG" 2>&1 \
+		|| die "CREATE EXTENSION memcow failed; see $BUILD_LOG"
 }
 
 # ---------------------------------------------------------------------------
