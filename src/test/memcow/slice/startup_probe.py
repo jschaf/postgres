@@ -13,6 +13,7 @@ import sys
 ap = argparse.ArgumentParser()
 ap.add_argument('--dbname', required=True)
 ap.add_argument('--protocol', choices=['simple', 'extended'], required=True)
+ap.add_argument('--guc', action='append', default=[], help='startup GUC pair NAME=VALUE')
 args = ap.parse_args()
 pack = struct.pack
 
@@ -22,6 +23,11 @@ def message(kind, payload):
 params = {'user': os.environ.get('PGUSER', 'postgres'), 'database': args.dbname,
           'options': os.environ.get('PGOPTIONS', ''),
           'application_name': 'memcow-startup-probe'}
+for guc in args.guc:
+    name, sep, value = guc.partition('=')
+    if not sep or not name:
+        ap.error('--guc requires NAME=VALUE')
+    params[name] = value
 payload = pack('!I', 196608) + b''.join(
     k.encode() + b'\0' + v.encode() + b'\0' for k, v in params.items()) + b'\0'
 startup = pack('!I', len(payload) + 4) + payload

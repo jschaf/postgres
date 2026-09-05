@@ -597,6 +597,8 @@ nc_S2_overlay_corruption()
 	local out
 	out=$(psql -c "SELECT evict_rel('public.events')" \
 		-c "SELECT count(*) FROM public.events")
+	ck_match "control read actually returned the seed rows" '^4000$' "$out"
+	ck_nomatch "control read raised no unrelated error" 'ERROR|FATAL' "$out"
 	if printf '%s' "$out" | grep -Eq 'ERROR:  invalid page in block 5 of relation'; then
 		ck "sabotage detected: uncorrupted read must NOT report an invalid page" 1
 	else
@@ -681,6 +683,8 @@ nc_S3_set_tablespace()
 	local before after
 	before=$(psql -tA -c "SELECT md5(string_agg(t.*::text, '|' ORDER BY event_id)) FROM public.events t")
 	after=$(psql -tA -c "SELECT md5(string_agg(t.*::text, '|' ORDER BY event_id) || 'x') FROM public.events t")
+	ck_match "control obtained the original digest" '^[0-9a-f]{32}$' "$before"
+	ck_match "control obtained the changed digest" '^[0-9a-f]{32}$' "$after"
 	if [ "$before" = "$after" ]; then
 		ck "sabotage detected: digest comparison reacts to changed content" 1
 	else
@@ -781,6 +785,8 @@ nc_S4_pg_prewarm()
 
 	r=$(psql -tA -c "SELECT pg_prewarm('public.events', 'read', 'main')")
 	other=$(psql -tA -c "SELECT pg_prewarm('public.accounts_pkey', 'buffer', 'main')")
+	ck_match "control read a positive heap block count" '^[1-9][0-9]*$' "$r"
+	ck_match "control read a positive index block count" '^[1-9][0-9]*$' "$other"
 	ck "sabotage detected: the modes-agree comparison distinguishes $r from $other" \
 	   "$([ "$r" != "$other" ] && echo 0 || echo 1)"
 }
@@ -866,6 +872,7 @@ nc_S5_past_eof()
 	ensure_test_aio
 	local out
 	out=$(psql -c "SELECT read_rel_block_ll('public.events', 3, nblocks=>1)")
+	ck_nomatch "control in-range read raised no unrelated error" 'ERROR|FATAL' "$out"
 	ck_nomatch "sabotage detected: an in-range read produces no past-EOF error" \
 		'memcow could not read block' "$out"
 }
@@ -1276,6 +1283,7 @@ nc_S9_documented_divergences()
 	restart || { ck "server started" 1; return; }
 	local out
 	out=$(psql -c "SELECT 'relsize', pg_relation_size('public.events')")
+	ck_eq "control actually read the zero size" 'relsize|0' "$out"
 	ck_nomatch "sabotage detected: pg_relation_size is not non-zero" \
 		'^relsize\|[1-9]' "$out"
 
@@ -2166,6 +2174,28 @@ S15_auth_fence()
 
 	out=$(PGOPTIONS="-c memcow.lane_nonce=$nonce" psql -c "SELECT 1")
 	ck_match "armed lane: the current nonce passes both fences" '^1$' "$out"
+
+	local opts bad protocol
+	for opts in "-cmemcow.lane_nonce=$nonce" "--memcow.lane_nonce=$nonce" \
+		"-c memcow.lane_nonce=0 -c memcow.lane_nonce=$nonce"; do
+		out=$(PGOPTIONS="$opts" psql -c "SELECT 1")
+		ck_match "nonce spelling and last-setting-wins: $opts" '^1$' "$out"
+	done
+	for bad in 0 -1 invalid 2147483648; do
+		out=$(PGOPTIONS="-c memcow.lane_nonce=$nonce -c memcow.lane_nonce=$bad" psql -c "SELECT 1")
+		ck_match "invalid final nonce is refused: $bad" 'FATAL:.*nonce mismatch' "$out"
+	done
+	for protocol in simple extended; do
+		out=$(PGHOST=$SOCKDIR PGPORT=$PORT PGOPTIONS='-c memcow.lane_nonce=0' \
+			python3 "$HERE/startup_probe.py" --dbname "$DB" --protocol "$protocol" \
+			--guc "memcow.lane_nonce=$nonce")
+		ck_match "$protocol: startup GUC pair overrides the options nonce" 'r1-cmd-ran' "$out"
+		out=$(PGHOST=$SOCKDIR PGPORT=$PORT PGOPTIONS="-c memcow.lane_nonce=$nonce" \
+			python3 "$HERE/startup_probe.py" --dbname "$DB" --protocol "$protocol" \
+			--guc memcow.lane_nonce=0)
+		ck_match "$protocol: invalid final startup GUC pair is refused" 'FATAL:.*nonce mismatch' "$out"
+		ck_nomatch "$protocol: invalid startup never dispatched" 'r1-cmd-ran' "$out"
+	done
 
 	# --- armed and closed: refused at auth as well (plan §4.1) -----------------
 	out=$(psql_ctl -c "SELECT memcow_lane_reset($dboid)")

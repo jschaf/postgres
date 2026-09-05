@@ -140,10 +140,6 @@ class PGError(Exception):
         return self.message.strip()
 
 
-class ConnectionLost(PGError):
-    pass
-
-
 def _s(b):
     return b.decode('utf-8', 'replace') if b is not None else None
 
@@ -182,7 +178,7 @@ class Conn:
         pq = self.pq
         if not res:
             msg = _s(pq.PQerrorMessage(self.h)) or 'no result'
-            raise ConnectionLost(msg)
+            raise PGError(msg)
         try:
             st = pq.PQresultStatus(res)
             if st in (PGRES_TUPLES_OK, PGRES_COMMAND_OK, PGRES_EMPTY_QUERY):
@@ -212,7 +208,7 @@ class Conn:
         r = self._result(self.pq.PQexec(self.h, sql.encode()))
         if r.error is not None:
             if self.pq.PQstatus(self.h) != CONNECTION_OK:
-                raise ConnectionLost(r.error, r.sqlstate, r.detail)
+                raise PGError(r.error, r.sqlstate, r.detail)
             raise PGError(r.error, r.sqlstate, r.detail)
         return r
 
