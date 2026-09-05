@@ -405,6 +405,10 @@ n_pass=0; n_fail=0
 for i in $(seq 0 $(( ${#CELL_ID[@]} - 1 ))); do
 	case ${CELL_RESULT[$i]:-} in PASS) n_pass=$((n_pass + 1)) ;; FAIL) n_fail=$((n_fail + 1)) ;; esac
 done
+# Set the exit status outside the tee pipeline's subshell.
+if [ "$REQUIRE_URING" -eq 1 ] && [ "$n_unavail" -gt 0 ]; then
+	RC=1
+fi
 {
 	print_cells "MATRIX SUMMARY" RESULT CELL_RESULT
 	printf '%d passed, %d failed, %d UNAVAILABLE on this host\n' "$n_pass" "$n_fail" "$n_unavail"
@@ -412,7 +416,6 @@ done
 		printf 'MATRIX COVERAGE: INCOMPLETE (%d unrun cells)\n' "$n_unavail"
 		if [ $REQUIRE_URING -eq 1 ]; then
 			printf -- '--require-io-uring was given: treating unavailable cells as a failure\n'
-			RC=1
 		fi
 	else
 		printf 'MATRIX COVERAGE: COMPLETE\n'
