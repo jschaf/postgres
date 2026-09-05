@@ -207,8 +207,6 @@ class Conn:
         result (the last result of a multi-statement string)."""
         r = self._result(self.pq.PQexec(self.h, sql.encode()))
         if r.error is not None:
-            if self.pq.PQstatus(self.h) != CONNECTION_OK:
-                raise PGError(r.error, r.sqlstate, r.detail)
             raise PGError(r.error, r.sqlstate, r.detail)
         return r
 
