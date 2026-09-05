@@ -49,6 +49,11 @@ if [ "$do_build" = 1 ]; then
 	step "ninja"
 	ninja -C "$build_dir" || exit 1
 fi
+step "install"
+# On macOS, system shells/interpreters strip DYLD_LIBRARY_PATH in the
+# pg_regress and TAP subprocess chains. Install the libraries at their
+# compiled-in paths too; the configured prefix is private to this build.
+ninja -C "$build_dir" install || exit 1
 step "install into tmp_install"
 meson test -C "$build_dir" --suite setup >/dev/null || { echo "ci.sh: tmp_install failed" >&2; exit 1; }
 
