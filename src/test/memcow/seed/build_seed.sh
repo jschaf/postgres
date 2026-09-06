@@ -202,6 +202,9 @@ SCHEMA_SQL=$(dirname "$SCRIPT_PATH")/schema.sql
 #                              not describe the schema the hook applies).
 SCHEMA_HOOK=${MEMCOW_SEED_SCHEMA_HOOK:-}
 SCHEMA_HOOK_RECIPE=${MEMCOW_SEED_SCHEMA_RECIPE:-}
+# Optional embedder validation after lane creation, before accepting the seed.
+# Receives the same connection environment, PGDATABASE=postgres and lane count.
+VERIFY_HOOK=${MEMCOW_SEED_VERIFY_HOOK:-}
 
 BUILD_DIR=$SEED_DIR.build
 BUILD_LOG=$SEED_DIR.build.log
@@ -372,6 +375,7 @@ step_validate_build()
 			printf 'schema=%s\n'  "$(sha256_of "$SCHEMA_SQL")"
 			printf 'schema_hook=%s\n' "$SCHEMA_HOOK"
 			printf 'schema_hook_recipe=%s\n' "$SCHEMA_HOOK_RECIPE"
+			printf 'verify_hook=%s\n' "$VERIFY_HOOK"
 		} | sha256_of_stdin
 	)
 
@@ -748,6 +752,11 @@ step_initdb
 step_start_server
 step_apply_schema
 step_create_databases
+if [ -n "$VERIFY_HOOK" ]; then
+	PGHOST=$SOCK_DIR PGPORT=$BUILD_PORT PGUSER=$SUPERUSER PGDATABASE=postgres \
+		MEMCOW_SEED_LANES=$LANES sh -c "$VERIFY_HOOK" >>"$BUILD_LOG" 2>&1 \
+		|| die "MEMCOW_SEED_VERIFY_HOOK failed; see $BUILD_LOG"
+fi
 step_freeze
 step_clean_shutdown
 step_prune_wal
