@@ -428,10 +428,7 @@ class LanePool:
         self.last_ready_age_ms = 0.0
         self.lease_waits = 0        # leases that found the ready queue empty
         self.leases = 0
-        if self.nresetters > 0:
-            self.ready = queue.Queue()
-        else:
-            self.ready = collections.deque()
+        self.ready = queue.Queue()
 
     # --- connection strings ------------------------------------------------
 
@@ -466,10 +463,7 @@ class LanePool:
     def _make_ready(self, lane):
         lane.state = 'READY'
         lane.ready_at = time.monotonic()
-        if self.nresetters > 0:
-            self.ready.put(lane)
-        else:
-            self.ready.append(lane)
+        self.ready.put(lane)
 
     def _open_lane(self, lane):
         """Plan §3.3: open M connections, register them, then bring the lane
@@ -515,27 +509,22 @@ class LanePool:
 
     def lease(self):
         self.leases += 1
-        if self.nresetters > 0:
-            t0 = time.monotonic()
-            depth = self.ready.qsize()
-            try:
-                lane = self.ready.get(timeout=self.lease_timeout)
-            except queue.Empty:
-                raise PoolError('no lane became ready within %.0fs (%d resetter failure(s): %s)'
-                                % (self.lease_timeout, len(self.failures), self.failures[:3]))
-            now = time.monotonic()
-            self.last_lease_wait_ms = (now - t0) * 1000.0
-            self.last_ready_depth = depth
-            self.last_ready_age_ms = (now - lane.ready_at) * 1000.0
-            if depth == 0:
-                self.lease_waits += 1
-        else:
-            if not self.ready:
+        blocking = self.nresetters > 0
+        t0 = time.monotonic()
+        depth = self.ready.qsize()
+        try:
+            lane = self.ready.get(block=blocking, timeout=self.lease_timeout)
+        except queue.Empty:
+            if not blocking:
                 raise PoolError('no ready lane')
-            lane = self.ready.popleft()
-            self.last_lease_wait_ms = 0.0
-            self.last_ready_depth = len(self.ready) + 1
-            self.last_ready_age_ms = (time.monotonic() - lane.ready_at) * 1000.0
+            raise PoolError('no lane became ready within %.0fs (%d resetter failure(s): %s)'
+                            % (self.lease_timeout, len(self.failures), self.failures[:3]))
+        now = time.monotonic()
+        self.last_lease_wait_ms = (now - t0) * 1000.0 if blocking else 0.0
+        self.last_ready_depth = depth
+        self.last_ready_age_ms = (now - lane.ready_at) * 1000.0
+        if blocking and depth == 0:
+            self.lease_waits += 1
         lane.state = 'LEASED'
         return Wrapper(self, lane)
 
