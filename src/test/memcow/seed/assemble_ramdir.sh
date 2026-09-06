@@ -124,6 +124,22 @@ SHARED_BUFFERS=${MEMCOW_SHARED_BUFFERS:-128MB}
 MAX_CONNECTIONS=${MEMCOW_MAX_CONNECTIONS:-200}
 WAL_LEVEL=${MEMCOW_WAL_LEVEL:-replica}
 
+# Assemble into an ORDINARY directory instead of attaching a RAM disk.
+#
+# The runtime PGDATA holds only NON-relation files -- relation forks stay
+# mmapped read-only in the seed -- so there is very little here to make fast:
+# measured 35 MiB after a full embedder test run, of which 16 MiB is pg_wal.
+# With fsync=off the page cache already does what the RAM disk would, and a
+# measured A/B of the two showed no difference in wall time.  What the RAM disk
+# does cost is a mount lifecycle to manage and reap, pinned memory, and a
+# macOS/Linux split (hdiutil vs a pre-mounted tmpfs).
+#
+# This mode is for embedders that would rather not carry that.  It changes
+# nothing else: the same non-relation files are copied by the same rules and the
+# same runtime settings block is written, including the WAL bounds -- those bound
+# a PANIC-on-write-failure risk, not just RAM.
+NO_RAMDISK=0
+
 MARKER_BASENAME=.memcow_ramdir
 CONF_BEGIN='# --- BEGIN memcow runtime settings (assemble_ramdir.sh; generated) ---'
 CONF_END='# --- END memcow runtime settings ---'
@@ -134,6 +150,7 @@ for a in "$@"; do
 	case $a in
 		--detach) MODE=detach ;;
 		--status) MODE=status ;;
+		--no-ramdisk) NO_RAMDISK=1 ;;
 		--help)   awk '/^set -euo pipefail/{exit} NR>1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		*)        args+=("$a") ;;
 	esac
@@ -149,7 +166,7 @@ while getopts 's:m:z:p:b:fh' opt; do
 		b) PG_BINDIR=$OPTARG ;;
 		f) FORCE=1 ;;
 		h) awk '/^set -euo pipefail/{exit} NR>1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-		*) echo "usage: $0 [-s SEEDDIR] [-m MOUNT] [-z MB] [-p PORT] [-b BINDIR] [-f] [--detach|--status]" >&2
+		*) echo "usage: $0 [-s SEEDDIR] [-m MOUNT] [-z MB] [-p PORT] [-b BINDIR] [-f] [--no-ramdisk] [--detach|--status]" >&2
 		   exit 2 ;;
 	esac
 done
@@ -294,6 +311,17 @@ do_status()
 do_detach()
 {
 	local dev pid
+
+	if [ "$NO_RAMDISK" = 1 ]; then
+		if pid=$(postmaster_pid_on_ramdir); then
+			[ "$FORCE" = 1 ] || die "a postmaster (pid $pid) is still running on $PGDATA_DIR; stop it or re-run with -f"
+			log "stopping postmaster pid $pid (-f)"
+			"$PG_BINDIR/pg_ctl" -D "$PGDATA_DIR" -m immediate -w stop >/dev/null 2>&1 || true
+		fi
+		rm -rf "${PGDATA_DIR:?}" "$MARKER"
+		log "removed $PGDATA_DIR (--no-ramdisk: nothing to unmount)"
+		return 0
+	fi
 
 	dev=$(ram_dev_for_mount "$RAM_MOUNT")
 	if [ -z "$dev" ]; then
@@ -473,6 +501,30 @@ do_assemble()
 	local dev existing_mb pid
 
 	check_seed
+
+	if [ "$NO_RAMDISK" = 1 ]; then
+		if pid=$(postmaster_pid_on_ramdir); then
+			[ "$FORCE" = 1 ] || die "a postmaster (pid $pid) is running on $PGDATA_DIR; stop it or re-run with -f"
+			log "stopping postmaster pid $pid (-f)"
+			"$PG_BINDIR/pg_ctl" -D "$PGDATA_DIR" -m immediate -w stop >/dev/null 2>&1 || true
+		fi
+		if mount | grep -q " on $RAM_MOUNT "; then
+			die "$RAM_MOUNT is a mount point; --no-ramdisk wants a plain directory (use --detach first)"
+		fi
+		log "assembling into a plain directory at $RAM_MOUNT (--no-ramdisk)"
+		rm -rf "${PGDATA_DIR:?}"
+		mkdir -p "$PGDATA_DIR"
+		copy_nonrelation_files
+		write_runtime_conf
+		write_marker
+		log "dir ready"
+		printf 'MEMCOW_SEED_DIR=%s\n'  "$SEED_DIR"
+		printf 'MEMCOW_RAM_MOUNT=%s\n' "$RAM_MOUNT"
+		printf 'PGDATA=%s\n'           "$PGDATA_DIR"
+		printf 'PGHOST=%s\n'           "$PGDATA_DIR"
+		printf 'PGPORT=%s\n'           "$PGPORT_SETTING"
+		return 0
+	fi
 
 	dev=$(ram_dev_for_mount "$RAM_MOUNT")
 	if [ -n "$dev" ]; then

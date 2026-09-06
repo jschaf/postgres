@@ -186,6 +186,23 @@ esac
 SCRIPT_PATH=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 SCHEMA_SQL=$(dirname "$SCRIPT_PATH")/schema.sql
 
+# Optional embedder hook, run once against template1 after schema.sql and the
+# memcow extension, and BEFORE the lane databases are cloned from it --
+# so whatever it creates is inherited byte-identically by every lane, exactly
+# as schema.sql is.  It exists because an embedder's schema is not always a
+# static .sql file: Takeoffs applies its migration ledger through a TypeScript
+# runner, which needs a live connection rather than a psql -f.
+#
+#   MEMCOW_SEED_SCHEMA_HOOK    command line, run through `sh -c` with PGHOST,
+#                              PGPORT, PGUSER and PGDATABASE=template1 exported.
+#                              A non-zero exit fails the build.
+#   MEMCOW_SEED_SCHEMA_RECIPE  opaque string folded into seed_recipe_sha256, so
+#                              the caller can make the seed rebuild when ITS
+#                              inputs change (the hook command line alone does
+#                              not describe the schema the hook applies).
+SCHEMA_HOOK=${MEMCOW_SEED_SCHEMA_HOOK:-}
+SCHEMA_HOOK_RECIPE=${MEMCOW_SEED_SCHEMA_RECIPE:-}
+
 BUILD_DIR=$SEED_DIR.build
 BUILD_LOG=$SEED_DIR.build.log
 SOCK_DIR=
@@ -353,6 +370,8 @@ step_validate_build()
 			printf 'script=%s\n'  "$(sha256_of "$SCRIPT_PATH")"
 			printf 'module=%s\n' "$MEMCOW_MODULE_SHA256"
 			printf 'schema=%s\n'  "$(sha256_of "$SCHEMA_SQL")"
+			printf 'schema_hook=%s\n' "$SCHEMA_HOOK"
+			printf 'schema_hook_recipe=%s\n' "$SCHEMA_HOOK_RECIPE"
 		} | sha256_of_stdin
 	)
 
@@ -496,6 +515,13 @@ step_apply_schema()
 	log "creating extension memcow in template1"
 	psql_do template1 -c "CREATE EXTENSION memcow;" >>"$BUILD_LOG" 2>&1 \
 		|| die "CREATE EXTENSION memcow failed; see $BUILD_LOG"
+
+	if [ -n "$SCHEMA_HOOK" ]; then
+		log "running MEMCOW_SEED_SCHEMA_HOOK against template1"
+		PGHOST=$SOCK_DIR PGPORT=$BUILD_PORT PGUSER=$SUPERUSER PGDATABASE=template1 \
+			sh -c "$SCHEMA_HOOK" >>"$BUILD_LOG" 2>&1 \
+			|| die "MEMCOW_SEED_SCHEMA_HOOK failed; see $BUILD_LOG"
+	fi
 }
 
 # ---------------------------------------------------------------------------
