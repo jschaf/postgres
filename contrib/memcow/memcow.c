@@ -988,28 +988,25 @@ memcow_check_fingerprint(void)
 				 errdetail("Fingerprint file is \"%s\".", path),
 				 errhint("Rebuild the seed with this server binary.")));
 
-	memcow_fingerprint_expect(image, path, "pg_control_version",
-							  PG_CONTROL_VERSION);
-	memcow_fingerprint_expect(image, path, "catalog_version_no",
-							  CATALOG_VERSION_NO);
-	memcow_fingerprint_expect(image, path, "block_size", BLCKSZ);
-	memcow_fingerprint_expect(image, path, "relseg_blocks", RELSEG_SIZE);
-	memcow_fingerprint_expect(image, path, "wal_block_size", XLOG_BLCKSZ);
+	{
+		const struct
+		{
+			const char *key;
+			int64		expected;
+		} fields[] = {
+			{"pg_control_version", PG_CONTROL_VERSION},
+			{"catalog_version_no", CATALOG_VERSION_NO},
+			{"block_size", BLCKSZ},
+			{"relseg_blocks", RELSEG_SIZE},
+			{"wal_block_size", XLOG_BLCKSZ},
+			/* Page verification uses the running cluster's checksum setting. */
+			{"data_page_checksum_version", data_checksums}
+		};
 
-	/*
-	 * data_page_checksum_version is the one key compared against a *runtime*
-	 * value rather than a compile-time constant, and it has to be: whether the
-	 * cluster verifies checksums is a property of its pg_control, not of the
-	 * build.  It matters more here than anywhere else in this function,
-	 * because the unmodified buffer completion callbacks run PageIsVerified()
-	 * over every page memcow hands them, using the running cluster's setting
-	 * against the seed's stored checksums.  A seed written without checksums,
-	 * served to a cluster that expects them, fails verification on every page
-	 * -- which would present as universal data corruption rather than as a
-	 * configuration error.
-	 */
-	memcow_fingerprint_expect(image, path, "data_page_checksum_version",
-							  data_checksums);
+		for (int i = 0; i < lengthof(fields); i++)
+			memcow_fingerprint_expect(image, path, fields[i].key,
+									  fields[i].expected);
+	}
 
 	/* The engine is now a shared library: cover rebuilds of it as well. */
 	{
