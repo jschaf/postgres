@@ -536,15 +536,6 @@ typedef struct MemcowShmemState
 	LWLock		lock;			/* serializes slot creation */
 
 	/*
-	 * Bumped whenever a slot is created.  A backend that looked for a
-	 * database's overlay and did not find one caches that negative answer
-	 * against this counter, so the common case -- a read of a relation in a
-	 * database nobody has written to -- costs one unlocked atomic read rather
-	 * than a locked scan of the slot array on every smgr_nblocks().
-	 */
-	pg_atomic_uint32 generation;
-
-	/*
 	 * Bumped by every PUBLISH.  memcow_close() compares it against a
 	 * process-local copy so that the common case -- no reset since this
 	 * process last looked -- is one atomic read, and only a process that has
@@ -565,18 +556,15 @@ static MemcowShmemState *MemcowShmem = NULL;
 /*
  * This process's attachment to one database's overlay.
  *
- * area == NULL means "as of generation absent_gen, this database had no
- * overlay".  Attachments are never dropped once made: see memcow_close().
+ * area == NULL means this process has no live attachment. See memcow_close().
  */
 struct MemcowDbLocal
 {
-	Oid			dbOid;			/* hash key -- must be first */
 	dsa_area   *area;			/* NULL if there is no overlay (yet) */
 	dshash_table *rels;
 	dshash_table *blocks;
 	uint32		epoch;			/* epoch this attachment was made at */
 	MemcowDbSlot *slot;			/* the directory slot; slots never move */
-	uint32		absent_gen;		/* only meaningful while area == NULL */
 };
 
 /*
@@ -621,14 +609,17 @@ typedef struct MemcowFork
 } MemcowFork;
 
 /*
- * Per-process memcow state, established by memcow_init().  All are NULL when
- * memcow is off, and memcow_open() asserts they are not NULL when it is: with
+ * Per-process memcow state, established by memcow_init(). The context and
+ * seed hash stay NULL when memcow is off; memcow_open() checks the context: with
  * real state here, an smgropen() that beat smgrinit() would be a null deref
  * rather than the harmless no-op it used to be.
  */
 static MemoryContext MemcowCxt = NULL;
 static HTAB *MemcowSeedHash = NULL;
-static HTAB *MemcowDbHash = NULL;
+/* Indexed by shared directory slot, not database OID. Slots never move or
+ * change identity. The initialized prefix can include untouched slots. */
+static MemcowDbLocal MemcowDbs[MEMCOW_MAX_OVERLAY_DBS];
+static int MemcowNDbSlots;
 
 /* the reset_generation this process has already acted on */
 static uint32 MemcowSeenResetGen = 0;
@@ -713,7 +704,6 @@ MemcowShmemInit(void)
 		MemcowShmem->block_tranche = LWLockNewTrancheId("MemcowOverlayBlock");
 		LWLockInitialize(&MemcowShmem->lock,
 						 LWLockNewTrancheId("MemcowOverlayDirectory"));
-		pg_atomic_init_u32(&MemcowShmem->generation, 1);
 		pg_atomic_init_u32(&MemcowShmem->reset_generation, 1);
 	}
 	LWLockRelease(AddinShmemInitLock);
@@ -778,20 +768,6 @@ memcow_init(void)
 	ctl.hcxt = MemcowCxt;
 	MemcowSeedHash = hash_create("memcow seed relation table", 400, &ctl,
 								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-
-	/*
-	 * This process's overlay attachments, keyed by dbOid.  An ordinary
-	 * backend has at most two live entries (its own database and dbOid 0 for
-	 * the shared catalogs); the checkpointer and bgwriter flush buffers for
-	 * every database and so accumulate one per database they have written.
-	 * 8 is therefore already generous as an initial size, and dynahash grows
-	 * it if a process proves otherwise.
-	 */
-	ctl.keysize = sizeof(Oid);
-	ctl.entrysize = sizeof(MemcowDbLocal);
-	ctl.hcxt = MemcowCxt;
-	MemcowDbHash = hash_create("memcow overlay attachment table", 8, &ctl,
-							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	/*
 	 * Attachments are counted per epoch in the directory (MemcowDbSlot), and
@@ -1405,6 +1381,20 @@ memcow_overlay_params(const dshash_parameters *template, int tranche_id)
 	return params;
 }
 
+/* Find a local attachment by its immutable directory identity. */
+static MemcowDbLocal *
+memcow_find_local(Oid dbOid)
+{
+	for (int i = 0; i < MemcowNDbSlots; i++)
+	{
+		MemcowDbLocal *db = &MemcowDbs[i];
+
+		if (db->slot != NULL && db->slot->dbOid == dbOid)
+			return db;
+	}
+	return NULL;
+}
+
 /*
  * Attach this process to one database's overlay, creating the overlay if this
  * is the first write anywhere in that database and create is true.
@@ -1443,18 +1433,16 @@ memcow_overlay(Oid dbOid, bool create)
 	MemcowDbLocal *db;
 	MemcowDbSlot *slot = NULL;
 	MemoryContext oldcxt;
-	uint32		gen;
 	uint32		epoch;
-	bool		found;
 	dsa_area   *area;
 	dshash_table *rels;
 	dshash_table *blocks;
 	dshash_parameters params;
 
-	Assert(MemcowDbHash != NULL);
+	Assert(MemcowCxt != NULL);
 	Assert(MemcowShmem != NULL);
 
-	db = (MemcowDbLocal *) hash_search(MemcowDbHash, &dbOid, HASH_FIND, NULL);
+	db = memcow_find_local(dbOid);
 	if (db != NULL && db->area != NULL)
 	{
 		/*
@@ -1474,40 +1462,13 @@ memcow_overlay(Oid dbOid, bool create)
 		memcow_detach_db(db);
 	}
 
-	/*
-	 * Either we have never looked, or we looked and found nothing.  A cached
-	 * "nothing" is good until somebody creates a slot, which bumps the
-	 * generation; the unlocked read is safe because the only way this process
-	 * can observe a page written through a newly created overlay is via
-	 * bufmgr, whose own locking has already ordered that write ahead of this
-	 * read.
-	 */
-	gen = pg_atomic_read_u32(&MemcowShmem->generation);
-	if (db != NULL && db->absent_gen == gen && !create)
-		return NULL;
-
 	LWLockAcquire(&MemcowShmem->lock, create ? LW_EXCLUSIVE : LW_SHARED);
 
-	slot = memcow_find_slot(dbOid);
+	slot = db != NULL ? db->slot : memcow_find_slot(dbOid);
 
 	if (slot == NULL && !create)
 	{
-		/*
-		 * Remember the absence against the generation we read before taking
-		 * the lock, never against a fresher one: a slot created between the
-		 * read and here must invalidate this cache entry.
-		 */
 		LWLockRelease(&MemcowShmem->lock);
-
-		db = (MemcowDbLocal *) hash_search(MemcowDbHash, &dbOid,
-										   HASH_ENTER, &found);
-		if (!found)
-		{
-			db->area = NULL;
-			db->rels = NULL;
-			db->blocks = NULL;
-		}
-		db->absent_gen = gen;
 		return NULL;
 	}
 
@@ -1549,13 +1510,13 @@ memcow_overlay(Oid dbOid, bool create)
 	MemoryContextSwitchTo(oldcxt);
 	LWLockRelease(&MemcowShmem->lock);
 
-	db = (MemcowDbLocal *) hash_search(MemcowDbHash, &dbOid, HASH_ENTER, NULL);
+	db = &MemcowDbs[slot - MemcowShmem->slots];
+	MemcowNDbSlots = Max(MemcowNDbSlots, (int) (db - MemcowDbs) + 1);
 	db->area = area;
 	db->rels = rels;
 	db->blocks = blocks;
 	db->epoch = epoch;
 	db->slot = slot;
-	db->absent_gen = 0;
 
 	return db;
 }
@@ -1670,7 +1631,6 @@ memcow_create_slot(Oid dbOid, size_t limit, dsa_area **areap,
 
 	pg_write_barrier();
 	MemcowShmem->nslots++;
-	pg_atomic_fetch_add_u32(&MemcowShmem->generation, 1);
 
 	return slot;
 }
@@ -1678,12 +1638,10 @@ memcow_create_slot(Oid dbOid, size_t limit, dsa_area **areap,
 /*
  * Drop this process's attachment to one database's overlay.
  *
- * INFALLIBLE AND ALLOCATION-FREE, because memcow_close() calls it: dshash and
- * dsa detach only unmap and pfree.  It is not strictly wait-free --
- * dsm_detach() runs dsa's release hook, which takes the area's control lock
- * for a refcount decrement -- but that lock is held only for a few
- * instructions by anyone, and the reset holds no lock at all while it waits
- * for the barrier that gets here (see memcow_lane_reset()).
+ * The fixed local record needs no allocation or hash removal. Detaching
+ * dshash/DSA bookkeeping frees memory and unmaps segments; DSM/DSA control
+ * locks and OS unmap remain involved, and unmap failures can warn. The reset
+ * does not hold the directory LWLock while waiting for the release barrier.
  *
  * The counter is decremented AFTER the mappings are gone, so that a zero
  * count means what RECLAIM needs it to mean: nobody is looking at the arena.
@@ -1704,8 +1662,6 @@ memcow_detach_db(MemcowDbLocal *db)
 	db->area = NULL;
 	db->rels = NULL;
 	db->blocks = NULL;
-	db->slot = NULL;
-	db->absent_gen = 0;			/* never equals a live generation */
 
 	pg_atomic_fetch_sub_u32(&slot->attached[epoch & 1], 1);
 }
@@ -1718,17 +1674,15 @@ memcow_detach_db(MemcowDbLocal *db)
  * because a process with nothing open -- the checkpointer between
  * checkpoints -- never gets a close call, yet can hold an attachment).  Cheap
  * when nothing has happened: one atomic read.  Otherwise a walk of
- * MemcowDbHash, which is bounded by the databases this process has touched
- * and allocates nothing (a dynahash seq scan uses a static slot).
+ * the fixed local attachment array, with no hash scan registration or
+ * allocation. The injection-point lookup below remains separately fallible.
  */
 static void
 memcow_maybe_detach_stale(void)
 {
 	uint32		gen;
-	HASH_SEQ_STATUS status;
-	MemcowDbLocal *db;
 
-	if (MemcowShmem == NULL || MemcowDbHash == NULL)
+	if (MemcowShmem == NULL || MemcowCxt == NULL)
 		return;
 
 	gen = pg_atomic_read_u32(&MemcowShmem->reset_generation);
@@ -1739,7 +1693,9 @@ memcow_maybe_detach_stale(void)
 	 * Negative-control knob for the race tests (R3): a process that keeps a
 	 * stale attachment is what RECLAIM's attach-count gate exists to expose.
 	 * Evaluated once per reset per process, here after the generation check,
-	 * so it costs the barrier path nothing when it is not attached.
+	 * so the no-reset fast path does not perform an injection lookup.
+	 * Injection cache refresh can allocate/load a callback or ERROR: removing
+	 * the attachment hash does not prove an allocation-free release contract.
 	 */
 	if (IS_INJECTION_POINT_ATTACHED("memcow-skip-stale-detach"))
 		return;
@@ -1747,9 +1703,10 @@ memcow_maybe_detach_stale(void)
 	/* the epoch reads below must not be satisfied from before the gen read */
 	pg_read_barrier();
 
-	hash_seq_init(&status, MemcowDbHash);
-	while ((db = (MemcowDbLocal *) hash_seq_search(&status)) != NULL)
+	for (int i = 0; i < MemcowNDbSlots; i++)
 	{
+		MemcowDbLocal *db = &MemcowDbs[i];
+
 		if (db->area == NULL)
 			continue;
 		if (db->epoch != pg_atomic_read_u32(&db->slot->epoch))
@@ -1774,21 +1731,15 @@ memcow_release_stale_epochs(void)
 /*
  * before_shmem_exit callback: drop every attachment this process holds, so
  * that the per-epoch attach counts in the directory stay exact across
- * backend exit.  Every reaching path is one where nothing can be reported,
- * and nothing here can fail.
+ * backend exit. The fixed array needs no scan registration or allocation.
  */
 static void
 memcow_detach_all_at_exit(int code, Datum arg)
 {
-	HASH_SEQ_STATUS status;
-	MemcowDbLocal *db;
-
-	if (MemcowDbHash == NULL)
-		return;
-
-	hash_seq_init(&status, MemcowDbHash);
-	while ((db = (MemcowDbLocal *) hash_seq_search(&status)) != NULL)
+	for (int i = 0; i < MemcowNDbSlots; i++)
 	{
+		MemcowDbLocal *db = &MemcowDbs[i];
+
 		if (db->area != NULL)
 			memcow_detach_db(db);
 	}
@@ -1943,7 +1894,7 @@ memcow_out_of_memory(MemcowDbLocal *db, BlockNumber blocknum, Oid spcOid,
 	 */
 	ereport(ERROR,
 			(errcode(ERRCODE_MEMCOW_ARENA_FULL),
-			 errmsg("memcow overlay for database %u is full", db->dbOid),
+			 errmsg("memcow overlay for database %u is full", db->slot->dbOid),
 			 errdetail("The arena holds %zu bytes; memcow.lane_arena_limit is %d MB. Failed while storing block %u of relation %u/%u.",
 					   total, memcow_lane_arena_limit, blocknum, spcOid,
 					   relNumber),
@@ -2354,113 +2305,29 @@ memcow_open(SMgrRelation reln)
 }
 
 /*
- * memcow_close() -- Close the specified relation, if it isn't closed already.
+ * memcow_close() -- retain immutable seed mappings, release stale arenas.
  *
- * MUST BE INFALLIBLE, for the same reason and then some: every path that
- * reaches smgr_close() is one on which an error cannot be handled.
+ * Close also runs from abort, cache invalidation and the SMGRRELEASE barrier,
+ * so it must not create attachment bookkeeping. The local directory is fixed
+ * storage indexed by the stable shared slot; ordinary backends use their own
+ * database and shared catalogs, while checkpointer/bgwriter may use all slots.
+ * Reset-generation acknowledgement follows a completed detach pass, so a
+ * failed or deliberately skipped pass is revisited by a retry's barrier.
  *
- *	 - AtEOXact_SMgr() -> smgrdestroyall(), reached from AbortTransaction().
- *	   An ereport(ERROR) here re-enters abort processing and recurses until
- *	   PANIC: ERRORDATA_STACK_SIZE exceeded, which the postmaster answers with
- *	   an unbounded crash-restart loop.
- *	 - proc_exit() -> ShutdownPostgres() -> AbortOutOfAnyTransaction(), i.e.
- *	   the same thing during process exit.
- *	 - ProcessBarrierSmgrRelease() -> smgrreleaseall(), the
- *	   PROCSIGNAL_BARRIER_SMGRRELEASE barrier.  This is the barrier the reset
- *	   design depends on: it drives every process in the cluster through
- *	   smgr_close(), so a failure here is a cluster-wide failure.
- *	 - InvalidateSystemCaches() -> RelationCacheInvalidate() ->
- *	   smgrreleaseall(), which is the reset's own adopt call.
+ * Mutable relation facts are read from the arena under their entry locks.
+ * Cached truncate record pointers are guarded by attachment {db, area, epoch}
+ * before use. Detaching the area also detaches both dshash tables and only
+ * then decrements the epoch's attachment count, allowing safe reclamation.
  *
- * The real implementation must therefore also not allocate in a way that can
- * fail, and must not block indefinitely.  Detaching a not-yet-published epoch
- * has to be a pointer swap, not something that can error out.
+ * Seed mappings are immutable and process-scoped: dropping them at close
+ * would repeat mmap/munmap during abort and reset for no freshness benefit.
+ * Unlink reclaims overlay relation storage; close is not relation deletion.
  *
- * STILL A NO-OP AFTER THE OVERLAY LANDED.  This deserves an argument rather
- * than an assumption, because the expectation was that the overlay would give
- * this function work to do.  It does not, and the reason is a property that
- * has to be enforced rather than assumed: MEMCOW KEEPS NO BACKEND-LOCAL CACHE
- * OF MUTABLE OVERLAY STATE.  Every overlay fact -- does this fork exist, how
- * big is it, how much of the seed still shows through, where is block N -- is
- * read out of shared memory under its entry lock at the point of use and is
- * never held past the callback that read it.  There is therefore nothing that
- * can go stale and nothing to invalidate.
- *
- * IT IS AN ENFORCED PROPERTY, NOT A DESCRIPTION.  memcow_unlink() falsified it
- * once, by recording "this relation has been dropped" as a whiteout in this
- * backend's MemcowSeedHash entry -- a mutable, overlay-scoped fact cached in
- * exactly one process, which reset could not discard and which this function's
- * doing nothing then made permanent.  It now records that in the arena
- * instead; see the argument there.  Anything added to memcow that caches a
- * mutable overlay fact process-locally either has to be invalidated here, on
- * a path where no failure can be reported, or it must not exist.  Prefer the
- * second.
- *
- * WHAT REMAINS PROCESS-LOCAL, exhaustively, and why each is exempt:
- *
- *	 - The dsa_area / dshash attachments in MemcowDbHash.  Pinned
- *	   (dsa_pin_mapping) precisely so that they are NOT resource-owner scoped,
- *	   because on the abort path all three ResourceOwnerRelease() phases run
- *	   before AtEOXact_SMgr(); dropping them here would mean re-attaching, and
- *	   re-mapping every segment, on the next query.  They name an arena, not a
- *	   fact about a relation, so nothing about them can be stale until Phase 2
- *	   gives a database more than one arena -- which is why the note below
- *	   exists.
- *	 - MemcowSeedHash and the mappings it points at.  Immutable once resolved,
- *	   over an immutable tree; see MAPPING LIFETIME in the file header.
- *	   Write-once state cannot go stale.
- *
- * Neither is a cache of anything the overlay can change, and that is the
- * distinction the property is actually about.
- *
- * WHAT PHASE 2 WILL PUT HERE, so that it is not rediscovered: with lanes and
- * epochs, a process may hold an attachment to an arena that is no longer the
- * published one for its database, and the old arena's memory cannot be
- * reclaimed until every such attachment is dropped.  The loop is over
- * MemcowDbHash -- bounded by the number of databases this process has
- * touched, and allocation-free -- detaching any entry whose epoch is not the
- * published epoch.  TWO WARNINGS FOR WHOEVER WRITES IT.  First, dsa_detach()
- * takes the area's control lock, so that loop is not wait-free in the strict
- * sense that this comment's contract asks for; it is only ever a short,
- * uncontended lock, but §4.6's barrier must not be able to reach it while
- * anything holds that lock and blocks.  Second, detaching invalidates every
- * dshash_table attached to that arena, so the dshash handles in the same
- * entry must be dropped in the same step.
- *
- * The seed half stays out of this entirely.  The obvious reading of "close"
- * is "drop this fork's seed mappings", and this function does not do that.
- * Seed state is not close-scoped state:
- *
- *	 - It cannot go stale.  memcow.enabled and memcow.seed_directory are both
- *	   PGC_POSTMASTER and the mapping is PROT_READ over a tree nothing in the
- *	   cluster may write, so the bytes behind a mapping are the same bytes for
- *	   as long as the process lives.  The reason md must close on smgr_close --
- *	   an fd surviving the unlink or truncation of the file it names -- has no
- *	   analogue here.
- *	 - Dropping it would be expensive exactly where cheapness is required.
- *	   Path 4 above is a cluster-wide barrier and path 5 is inside the reset's
- *	   25 ms budget; both walk every open relation.  Unmapping every fork a
- *	   backend has touched, only to map them all again on its next query, puts
- *	   an unbounded number of munmap() calls inside an interrupt holdoff on the
- *	   most latency-sensitive path in the design.
- *	 - Doing nothing is the strongest possible form of infallible.  There is no
- *	   hash lookup to get wrong, no free list to corrupt, and no partially
- *	   closed fork for a later call to trip over, which also makes the
- *	   idempotency smgrdestroy() requires (it calls this for all MAX_FORKNUM+1
- *	   forks) trivially true.
- *
- * Storage whose relation is really gone is reclaimed by memcow_unlink()
- * instead, which is where "really gone" is actually known.
- *
- * WHAT PHASE 2 PUT HERE: exactly the loop described above, in
- * memcow_maybe_detach_stale().  One atomic read when no reset has happened
- * since this process last looked (which is every call but one per reset),
- * and otherwise a walk of this process's attachments dropping those whose
- * epoch is no longer published.  Still infallible, still allocation-free,
- * still idempotent; not strictly wait-free (dsa's release hook takes the
- * area's control lock for a few instructions), which is why the reset holds
- * no lock while it waits for the barrier.  reln and forknum are deliberately
- * unused: the seed half stays out of this entirely, for the reasons above.
+ * The array walk itself cannot allocate or exhaust dynahash scan slots.
+ * This is not an infallibility or lock-free claim for the whole call chain:
+ * injection cache refresh can allocate/ERROR, and DSA/DSM detach takes control
+ * locks and unmaps memory. Reset waits without the directory LWLock, while
+ * retaining its database heavyweight lock. See memcow_maybe_detach_stale().
  */
 void
 memcow_close(SMgrRelation reln, ForkNumber forknum)
@@ -3954,8 +3821,7 @@ memcow_backend_adopt(void)
 		epoch = pg_atomic_read_u32(&slot->epoch);
 	LWLockRelease(&MemcowShmem->lock);
 
-	db = (MemcowDbLocal *) hash_search(MemcowDbHash, &MyDatabaseId,
-									   HASH_FIND, NULL);
+	db = memcow_find_local(MyDatabaseId);
 	if (db != NULL && db->area != NULL && db->epoch != epoch)
 		elog(ERROR, "memcow: an attachment to epoch %u of database %u survived adoption of epoch %u",
 			 db->epoch, MyDatabaseId, epoch);
@@ -4607,7 +4473,6 @@ memcow_lane_reset(Oid dbOid, Oid spcOid, int timeout_ms)
 	slot->discard_writes = true;
 	pg_write_barrier();
 	pg_atomic_write_u32(&slot->epoch, new_epoch);
-	pg_atomic_fetch_add_u32(&MemcowShmem->generation, 1);
 	pg_atomic_fetch_add_u32(&MemcowShmem->reset_generation, 1);
 	LWLockRelease(&MemcowShmem->lock);
 	MEMCOW_STEP_END(t0, t.publish_us);
