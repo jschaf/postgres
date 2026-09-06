@@ -440,9 +440,18 @@ sub R4_checkpoint_discard
     my $c2 = background($control, 30);
     my $pid_c2 = $c2->query_safe('SELECT pg_backend_pid()');
     ctl('CHECKPOINT');
+    # The first write can finish against the still-live old attachment before
+    # absorbing the barrier. Dirty the earlier accounts relation in the
+    # control too, so the events write that proves contamination comes later.
+    is(lane("SELECT pg_relation_filenode('public.accounts') < pg_relation_filenode('public.events')"),
+        't', 'checkpoint order places accounts before events');
     $l->query_safe("UPDATE public.events SET kind = 'r4' WHERE event_id = 1;"
-        . ($negative ? '' : ' UPDATE public.accounts SET balance = 0 WHERE account_id = 1;'));
-    attach('memcow-writev-skip-discard', 'notice') if $negative;
+        . ' UPDATE public.accounts SET balance = 0 WHERE account_id = 1;');
+    if ($negative)
+    {
+        attach('memcow-writev-skip-discard', 'notice');
+        attach('memcow-lane-reset-in-sweep', 'wait');
+    }
     attach('memcow-checkpointer-writev', 'wait', $oid);
     $c2->query_until(qr/checkpoint started/, "\\echo checkpoint started\nCHECKPOINT;\n");
     ok(wait_event($ckpt, 'memcow-checkpointer-writev', 30), 'checkpointer parked inside FlushBuffer on a lane buffer');
@@ -454,29 +463,44 @@ sub R4_checkpoint_discard
         '1|true|0', '... having already PUBLISHED epoch 1, nothing discarded yet') unless $negative;
 
     my ($wakes, $sweep_waited, $completed) = (0, 0, 0);
-    for (1 .. 60)
+    if ($negative)
     {
-        # Keep the original one-second observation interval. Checkpointer
-        # writes can park repeatedly, including after absorbing the barrier.
-        usleep(1_000_000);
-        if (ctl("SELECT state FROM pg_stat_activity WHERE pid = $pid_c") eq 'idle')
-        {
-            $completed = 1;
-            last;
-        }
-        if (ctl("SELECT wait_event FROM pg_stat_activity WHERE pid = $ckpt") eq 'memcow-checkpointer-writev')
-        {
-            $sweep_waited = 1 if ctl("SELECT wait_event FROM pg_stat_activity WHERE pid = $pid_c") eq 'BufferIo';
-            wake('memcow-checkpointer-writev');
-            $wakes++;
-        }
+        # After the first write absorbs the barrier, hold the reset before
+        # DropDatabaseBuffers can remove events pages ahead of the writer.
+        wake('memcow-checkpointer-writev');
+        ok(wait_event($pid_c, 'memcow-lane-reset-in-sweep', 20),
+            'discard control holds reset after the barrier, before the sweep');
+        ok(wake_until_idle($pid_c2, 'memcow-checkpointer-writev', 30),
+            'discard control flushed the remaining old pages into the new arena');
+        wake('memcow-lane-reset-in-sweep');
     }
-    die 'reset did not complete within 60 wake attempts' unless $completed;
+    else
+    {
+        for (1 .. 60)
+        {
+            # Keep the original one-second observation interval. Checkpointer
+            # writes can park repeatedly, including after absorbing the barrier.
+            usleep(1_000_000);
+            if (ctl("SELECT state FROM pg_stat_activity WHERE pid = $pid_c") eq 'idle')
+            {
+                $completed = 1;
+                last;
+            }
+            if (ctl("SELECT wait_event FROM pg_stat_activity WHERE pid = $ckpt") eq 'memcow-checkpointer-writev')
+            {
+                $sweep_waited = 1 if ctl("SELECT wait_event FROM pg_stat_activity WHERE pid = $pid_c") eq 'BufferIo';
+                wake('memcow-checkpointer-writev');
+                $wakes++;
+            }
+        }
+        die 'reset did not complete within 60 wake attempts' unless $completed;
+    }
     is($c->query_safe(''), '1', "reset returned epoch 1 once the checkpointer's writes were all released");
     $c2->query_safe('');
     pass('the checkpoint completed');
     if ($negative)
     {
+        detach('memcow-lane-reset-in-sweep');
         detach('memcow-checkpointer-writev');
         detach('memcow-writev-skip-discard');
         ctl("SELECT memcow_lane_open($oid, false)");

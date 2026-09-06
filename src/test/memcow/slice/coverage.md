@@ -34,7 +34,7 @@ proof that every possible implementation defect would fail the test.
 | Auth-to-database-lock window, simple and extended protocols | R1_auth_window (TAP + raw startup_probe.py) | Skip admission: stale-nonce pipelined command executes |
 | SIGSTOPped straggler; no publication on timeout; retry after death | R2_stopped_straggler (TAP) | Omit SIGSTOP: first reset succeeds |
 | Deferred cancel at synthetic COMPLETED_IO; poison/reclaim; clean retained reread | R3_cancel_inflight_io (TAP) | Skip stale detach: named attachment refusal; remove sabotage, exit backend, retry same epoch; checkpointer must detach too |
-| Checkpointer held across barrier and BufferIo sweep; post-publish discard and pre-reset write | R4_checkpoint_discard (TAP) | Skip discard: old r4 page enters new arena |
+| Checkpointer held across barrier and BufferIo sweep; post-publish discard and pre-reset write | R4_checkpoint_discard (TAP) | Skip discard; hold reset before buffer sweep until remaining checkpoint writes complete: old r4 page enters new arena |
 | Shared nailed-catalog invalidation; deferred reload after publish; sweep all lane buffers | R5_sinval_nailed (TAP) | Skip sweep: buffers survive and fresh backend reads r5 |
 
 The TAP cases retain the injection pauses and server-side reset timeouts:
@@ -42,7 +42,11 @@ S14 uses 2000/1500 ms refusals and 5000 ms retries; R2 uses 1500/5000 ms;
 R3 uses 5000 ms and its control 2000 ms; concurrent R4/R5 resets use
 60000 ms. Wait-event polling remains at 100 ms with the original 20 or
 30 second bounds. Repeated checkpointer wakeups retain one-second polling,
-including observation of both ProcSignalBarrier and BufferIo. R3 and R5
+including observation of both ProcSignalBarrier and BufferIo. The R4 control
+also parks at memcow-lane-reset-in-sweep after the barrier, so the sweep cannot
+remove its events page before the sabotaged flush. Its first dirty relation
+is accounts (the fixture ordering is asserted); later events writes then use
+the new attachment. Checkpoint completion retains its 30-second bound. R3 and R5
 retain their 500 ms deferred-interrupt observations. Query timers restart
 per command, using the previous 30-second default and explicit 20/60-second
 completion/workload bounds. PostgreSQL's TAP facilities provide session
