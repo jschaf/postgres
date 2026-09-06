@@ -2905,9 +2905,6 @@ memcow_startreadv(PgAioHandle *ioh,
 				  SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				  void **buffers, BlockNumber nblocks)
 {
-	MemcowFork	f;
-	MemcowBlockKey key;
-
 	Assert(nblocks > 0);
 
 	/*
@@ -2931,39 +2928,13 @@ memcow_startreadv(PgAioHandle *ioh,
 		elog(ERROR, "memcow read of %u blocks exceeds the %d block limit",
 			 nblocks, PG_IOV_MAX);
 
-	memcow_lookup_fork(reln, forknum, false, &f);
-	memcow_block_key(&key, &f.relkey, blocknum);
-
 	/*
-	 * Phase 1: serve every block.  Raises here or not at all.
-	 *
-	 * Both fallible steps live HERE: the overlay lookup, which can wait on a
-	 * partition lock and can fail to find what it is looking for, and the copy
-	 * itself, which must happen while that lock is still held.  Nothing below
-	 * this loop can fail.
-	 *
-	 * No HOLD_INTERRUPTS() of our own: smgrstartreadv() already wraps this
-	 * callback in one, so no CHECK_FOR_INTERRUPTS() can run between here and
-	 * the return -- which matters, because absorbing a SMGRRELEASE barrier
-	 * mid-copy would run smgr_close() over the memory being copied out of.
-	 * Nor a critical section: pgaio_io_complete_synthetic() opens its own,
-	 * narrowly, around the one call that needs it, so that the ereport(ERROR)
-	 * below stays an ordinary error instead of becoming a PANIC.
+	 * Serve every block, including lookup, copy under the partition lock,
+	 * and past-EOF errors, before touching the handle. smgrstartreadv()
+	 * already holds interrupts, so a release barrier cannot detach the
+	 * source mid-copy. Buffer completion still verifies the copied pages.
 	 */
-	for (BlockNumber i = 0; i < nblocks; i++)
-	{
-		if (!memcow_copy_block(&f, &key, blocknum + i, buffers[i]))
-		{
-			RelPathStr	rel = relpath(reln->smgr_rlocator, forknum);
-
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("memcow could not read block %u of relation %s: block is outside the seed and the overlay",
-							blocknum + i, rel.str),
-					 errdetail("The fork has %u block(s), of which the first %u may come from the seed.",
-							   f.nblocks, f.seed_visible)));
-		}
-	}
+	memcow_readv(reln, forknum, blocknum, buffers, nblocks);
 
 	/*
 	 * Phase 2: complete the handle.  Nothing below here may fail.
