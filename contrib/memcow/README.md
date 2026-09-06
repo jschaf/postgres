@@ -61,5 +61,8 @@ The core interfaces are:
 
 Relation records own their locks and remain stable until arena detach. The
 truncate path locks its already-mapped, prewarmed record without a dshash walk;
-close and the barrier path remain allocation-free. Main shared memory and
-DROP TABLESPACE checks use existing extension hooks.
+close and barrier attachment bookkeeping uses a fixed array without allocation.
+Injection-point cache refresh can still allocate or raise ERROR, so the strict
+allocation-free release contract is not established. DSA/DSM detach also takes
+locks and performs OS unmap. Main shared memory and DROP TABLESPACE checks use
+existing extension hooks.
