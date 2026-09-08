@@ -90,6 +90,21 @@ def run_lease(args, pq, base, ctl, probe):
                        resetters=args.resetters, capture_timings=True,
                        resetter_delay_ms=args.resetter_delay_ms,
                        on_cycle=cycles.append, log=lambda m: print('      [pool] %s' % m))
+    # Start the injected delay only once the borrower exhausts ready
+    # capacity. Otherwise useful work on other lanes consumes part of the
+    # delay before lease() waits, so even correct queue-wait attribution can
+    # miss the control's unchanged 0.9 D minimum. This gate belongs only to
+    # the negative control; the positive capacity benchmark is untouched.
+    delay_gate = threading.Event() if args.negative_control and args.resetters > 0 else None
+    if delay_gate is not None:
+        run_cycle = pool._run_cycle
+
+        def cycle_after_starvation(lane, control):
+            if not delay_gate.wait(pool.lease_timeout):
+                raise mp.PoolError('negative control never exhausted ready capacity')
+            return run_cycle(lane, control)
+
+        pool._run_cycle = cycle_after_starvation
     pool.open()
     lane_objs = list(pool.lanes.values())
 
@@ -111,10 +126,15 @@ def run_lease(args, pq, base, ctl, probe):
     for i in range(1, args.leases + 1):
         t0 = time.monotonic()
         try:
+            if delay_gate is not None and pool.ready.empty():
+                delay_gate.set()
             w = pool.lease()
         except mp.PoolError as e:
             fails.append('lease %d: %s' % (i, e))
             break
+        finally:
+            if delay_gate is not None:
+                delay_gate.clear()
         t_l = time.monotonic()
         try:
             w.exec_params(tl.FIRST_QUERY, ['1'])
@@ -146,6 +166,8 @@ def run_lease(args, pq, base, ctl, probe):
                      len(cycles), int(time.monotonic() - t_start)))
 
     # let the resetters finish what is queued, so the leak probe sees a quiet server
+    if delay_gate is not None:
+        delay_gate.set()
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         live = [l for l in lane_objs if l.state != 'RETIRED']
