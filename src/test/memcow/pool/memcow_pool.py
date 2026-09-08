@@ -546,14 +546,15 @@ class LanePool:
     def _run_cycle(self, lane, ctl):
         """drain + reset cycle on the given control connection; returns the
         record.  Raises LaneRetired / PoolError / PGError."""
+        t0 = time.monotonic()
         if self.resetter_delay_ms:
             time.sleep(self.resetter_delay_ms / 1000.0)
-        t0 = time.monotonic()
+        t_drain = time.monotonic()
         self._drain(lane)
         t1 = time.monotonic()
         timings = self._reset_cycle(lane, ctl)
         t2 = time.monotonic()
-        timings['drain_ms'] = (t1 - t0) * 1000.0
+        timings['drain_ms'] = (t1 - t_drain) * 1000.0
         timings['cycle_ms'] = (t2 - t0) * 1000.0
         timings['lane'] = lane.name
         timings['epoch'] = lane.epoch

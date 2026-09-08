@@ -552,6 +552,13 @@ def main():
     pq, base, ctl = tl.connect()
     if args.negative_control and args.driver == 'reset':
         ctl.exec('CREATE EXTENSION IF NOT EXISTS injection_points')
+        # Loading the injection callback initializes persistent named DSM
+        # (the injection registry and wait state). Include instrumentation
+        # in the leak baseline, without parking any baseline reset. Merely
+        # creating the extension does not initialize this shared state.
+        ctl.exec("SELECT injection_points_attach('%s', 'notice')" % NC_POINT)
+        ctl.exec("SELECT injection_points_load('%s')" % NC_POINT)
+        ctl.exec("SELECT injection_points_detach('%s')" % NC_POINT)
     probe = tl.LeakProbe(tl.pgdata(), ctl)
     if args.driver == 'lease':
         rc = run_lease(args, pq, base, ctl, probe)
