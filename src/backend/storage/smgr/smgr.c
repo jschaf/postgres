@@ -122,6 +122,13 @@ RegisterStorageManager(const f_smgr *manager, bool make_default)
 	return index;
 }
 
+/* Whether the manager every relation opens with keeps its pages in memory. */
+bool
+smgr_default_is_volatile(void)
+{
+	return smgrsw[default_smgr].volatile_storage;
+}
+
 /*
  * Each backend has a hashtable that stores all extant SMgrRelation objects.
  * In addition, "unpinned" SMgrRelation objects are chained together in a list.

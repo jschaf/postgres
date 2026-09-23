@@ -78,6 +78,13 @@ char	   *DataDir = NULL;
  */
 int			data_directory_mode = PG_DIR_MODE_OWNER;
 
+/*
+ * When true, the data directory is an immutable image shared by any number of
+ * postmasters, and every mutable byte of this cluster lives in memory: nothing
+ * is written below DataDir, and nothing survives the postmaster.
+ */
+bool		VolatileDataDirectory = false;
+
 char		OutputFileName[MAXPGPATH];	/* debugging output file */
 
 char		my_exec_path[MAXPGPATH];	/* full path to my executable */

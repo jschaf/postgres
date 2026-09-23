@@ -59,6 +59,7 @@ static const f_smgr memcow_smgr =
 	.smgr_immedsync = memcow_immedsync,
 	.smgr_registersync = memcow_registersync,
 	.smgr_fd = memcow_fd,
+	.volatile_storage = true,
 };
 
 static ClientAuthentication_hook_type prev_client_auth_hook = NULL;

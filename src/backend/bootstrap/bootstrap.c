@@ -357,6 +357,7 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	 */
 	checkDataDir();
 	ChangeToDataDir();
+	CheckVolatileDataDirectory();
 
 	CreateDataDirLockFile(false);
 

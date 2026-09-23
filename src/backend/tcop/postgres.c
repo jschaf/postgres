@@ -4259,6 +4259,7 @@ PostgresSingleUserMain(int argc, char *argv[],
 	 */
 	checkDataDir();
 	ChangeToDataDir();
+	CheckVolatileDataDirectory();
 
 	/*
 	 * Create lockfile for data directory.

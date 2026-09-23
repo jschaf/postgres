@@ -3446,6 +3446,14 @@
   boot_val => 'true',
 },
 
+{ name => 'volatile_data_directory', type => 'bool', context => 'PGC_POSTMASTER', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Keeps all mutable cluster state in memory and never writes to the data directory.',
+  long_desc => 'The data directory is opened as an immutable image that any number of servers may share. Requires a volatile default storage manager. Nothing survives a server stop.',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE | GUC_DISALLOW_IN_AUTO_FILE',
+  variable => 'VolatileDataDirectory',
+  boot_val => 'false',
+},
+
 { name => 'wal_block_size', type => 'int', context => 'PGC_INTERNAL', group => 'PRESET_OPTIONS',
   short_desc => 'Shows the block size in the write ahead log.',
   flags => 'GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE',

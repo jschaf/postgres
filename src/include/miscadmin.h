@@ -174,6 +174,7 @@ extern PGDLLIMPORT bool ExitOnAnyError;
 
 extern PGDLLIMPORT char *DataDir;
 extern PGDLLIMPORT int data_directory_mode;
+extern PGDLLIMPORT bool VolatileDataDirectory;
 
 extern PGDLLIMPORT int NBuffers;
 extern PGDLLIMPORT int MaxBackends;
@@ -539,6 +540,8 @@ extern void CreateSocketLockFile(const char *socketfile, bool amPostmaster,
 extern void TouchSocketLockFiles(void);
 extern void AddToDataDirLockFile(int target_line, const char *str);
 extern bool RecheckDataDirLockFile(void);
+extern void CheckVolatileDataDirectory(void);
+extern void PreventInVolatileDataDirectory(const char *what);
 extern void ValidatePgVersion(const char *path);
 extern void process_shared_preload_libraries(void);
 extern void process_session_preload_libraries(void);

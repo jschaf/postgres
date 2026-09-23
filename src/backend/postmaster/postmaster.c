@@ -937,6 +937,12 @@ PostmasterMain(int argc, char *argv[])
 	process_shared_preload_libraries();
 
 	/*
+	 * A volatile data directory's prerequisites include the storage managers
+	 * the preloaded libraries just registered.
+	 */
+	CheckVolatileDataDirectory();
+
+	/*
 	 * Initialize SSL library, if specified.
 	 */
 #ifdef USE_SSL

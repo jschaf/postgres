@@ -120,9 +120,13 @@ typedef struct f_smgr
 	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_registersync) (SMgrRelation reln, ForkNumber forknum);
 	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
+
+	/* Pages never reach durable storage; see volatile_data_directory. */
+	bool		volatile_storage;
 } f_smgr;
 
 extern int RegisterStorageManager(const f_smgr *manager, bool make_default);
+extern bool smgr_default_is_volatile(void);
 
 #define SmgrIsTemp(smgr) \
 	RelFileLocatorBackendIsTemp((smgr)->smgr_rlocator)

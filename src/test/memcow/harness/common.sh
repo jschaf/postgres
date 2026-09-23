@@ -315,3 +315,92 @@ mc_harness_dir()
 {
 	cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd
 }
+
+# ---------------------------------------------------------------------------
+# volatile_data_directory servers
+# ---------------------------------------------------------------------------
+
+# mc_volatile_start SEED PORT LOGFILE PIDFILE [GUC=VAL ...]
+#
+# A postmaster whose data directory IS the immutable seed.  pg_ctl cannot own
+# it: pg_ctl reads postmaster.pid, which a volatile server never writes.  The
+# caller owns the PID recorded in PIDFILE (outside the seed) and readiness is
+# a TCP connection, the only kind of listener the mode allows.  Callers' GUCs
+# come last and so override the baseline.
+mc_volatile_start()
+{
+	local seed=$1 port=$2 logfile=$3 pidfile=$4 pid i g
+	shift 4
+	local args=(-D "$seed" -c volatile_data_directory=on -c "port=$port"
+		-c listen_addresses=127.0.0.1 -c unix_socket_directories=
+		-c shared_preload_libraries=memcow -c memcow.enabled=on
+		-c "memcow.seed_directory=$seed" -c wal_level=minimal
+		-c max_wal_senders=0 -c max_prepared_transactions=0 -c fsync=off
+		-c log_min_messages=warning -c log_statement=none
+		-c restart_after_crash=off)
+	for g in "$@"; do
+		args+=(-c "$g")
+	done
+
+	"$MC_BINDIR/postgres" "${args[@]}" >>"$logfile" 2>&1 &
+	pid=$!
+	echo "$pid" >"$pidfile"
+	for ((i = 0; i < 1200; i++)); do
+		if "$MC_BINDIR/pg_isready" -q -h 127.0.0.1 -p "$port" -d postgres; then
+			return 0
+		fi
+		if ! kill -0 "$pid" 2>/dev/null; then
+			wait "$pid" 2>/dev/null
+			return 1
+		fi
+		sleep 0.1
+	done
+	mc_warn "volatile postmaster $pid not ready on port $port after 120s"
+	return 1
+}
+
+# mc_volatile_stop PIDFILE [SIGNAL]  --- INT is a fast shutdown, QUIT an
+# immediate one, KILL a crash.  Waits for the postmaster to exit.
+mc_volatile_stop()
+{
+	local pidfile=$1 sig=${2:-INT} pid i
+	[ -f "$pidfile" ] || return 0
+	pid=$(cat "$pidfile")
+	rm -f "$pidfile"
+	kill -0 "$pid" 2>/dev/null || return 0
+	kill -"$sig" "$pid" 2>/dev/null
+	for ((i = 0; i < 1200; i++)); do
+		kill -0 "$pid" 2>/dev/null || return 0
+		sleep 0.1
+	done
+	mc_warn "volatile postmaster $pid did not exit on SIG$sig; killing"
+	kill -KILL "$pid" 2>/dev/null
+	return 1
+}
+
+# mc_seed_manifest SEED OUT --- every path below SEED with its type, mode,
+# size and (for regular files) SHA-256.  Two equal manifests mean nothing was
+# created, removed, rewritten or re-permissioned; access times are ignored.
+mc_seed_manifest()
+{
+	local seed=$1 out=$2
+	python3 - "$seed" >"$out" <<'PY'
+import hashlib, os, stat, sys
+root = sys.argv[1]
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames.sort()
+    st = os.lstat(dirpath)
+    print('d %o %s' % (stat.S_IMODE(st.st_mode), os.path.relpath(dirpath, root)))
+    for name in sorted(filenames) + [d for d in dirnames if os.path.islink(os.path.join(dirpath, d))]:
+        path = os.path.join(dirpath, name)
+        st = os.lstat(path)
+        rel = os.path.relpath(path, root)
+        if stat.S_ISREG(st.st_mode):
+            with open(path, 'rb') as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            print('f %o %d %s %s' % (stat.S_IMODE(st.st_mode), st.st_size, digest, rel))
+        else:
+            print('o %o %s -> %s' % (stat.S_IMODE(st.st_mode), rel,
+                                     os.readlink(path) if stat.S_ISLNK(st.st_mode) else ''))
+PY
+}

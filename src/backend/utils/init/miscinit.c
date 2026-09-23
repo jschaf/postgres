@@ -30,6 +30,8 @@
 
 #include "access/htup_details.h"
 #include "access/parallel.h"
+#include "access/twophase.h"
+#include "access/xlog.h"
 #include "catalog/pg_authid.h"
 #include "common/file_perm.h"
 #include "libpq/libpq.h"
@@ -40,14 +42,18 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/syslogger.h"
+#include "replication/walsender.h"
 #include "replication/slotsync.h"
 #include "storage/fd.h"
+#include "storage/dsm_impl.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/pg_shmem.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "storage/smgr.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
@@ -1704,6 +1710,69 @@ RecheckDataDirLockFile(void)
 			(errmsg("lock file \"%s\" contains wrong PID: %ld instead of %ld",
 					DIRECTORY_LOCK_FILE, file_pid, (long) getpid())));
 	return false;
+}
+
+
+/*-------------------------------------------------------------------------
+ *				Volatile data directory support
+ *-------------------------------------------------------------------------
+ */
+
+/* FATAL unless a volatile_data_directory prerequisite holds. */
+static void
+volatile_requires(bool ok, const char *requirement)
+{
+	if (!ok)
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"volatile_data_directory\" requires %s", requirement)));
+}
+
+/*
+ * Refuse settings under which a volatile_data_directory server would write
+ * below DataDir or outside memory.  The postmaster calls this once shared
+ * preload libraries have registered their storage managers; a standalone
+ * backend refuses the mode outright, since only the postmaster owns the
+ * volatile state's lifetime.
+ */
+void
+CheckVolatileDataDirectory(void)
+{
+	if (!VolatileDataDirectory)
+		return;
+
+	volatile_requires(IsPostmasterEnvironment, "a postmaster");
+	volatile_requires(smgr_default_is_volatile(),
+					  "a volatile default storage manager");
+	volatile_requires(wal_level == WAL_LEVEL_MINIMAL,
+					  "\"wal_level\" = minimal");
+	volatile_requires(max_wal_senders == 0, "\"max_wal_senders\" = 0");
+	volatile_requires(max_prepared_xacts == 0,
+					  "\"max_prepared_transactions\" = 0");
+	volatile_requires(shared_memory_type == SHMEM_TYPE_MMAP,
+					  "\"shared_memory_type\" = mmap");
+	volatile_requires(dynamic_shared_memory_type != DSM_IMPL_MMAP,
+					  "\"dynamic_shared_memory_type\" other than mmap");
+	volatile_requires(Unix_socket_directories == NULL ||
+					  Unix_socket_directories[0] == '\0',
+					  "empty \"unix_socket_directories\"");
+	volatile_requires(!Logging_collector, "\"logging_collector\" = off");
+	volatile_requires(external_pid_file == NULL,
+					  "\"external_pid_file\" to be unset");
+}
+
+/*
+ * Raise an ERROR for an operation that would write below DataDir while
+ * volatile_data_directory is on.  `what` names the operation.
+ */
+void
+PreventInVolatileDataDirectory(const char *what)
+{
+	if (VolatileDataDirectory)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("%s is not supported when \"volatile_data_directory\" is enabled",
+						what)));
 }
 
 
