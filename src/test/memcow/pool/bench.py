@@ -16,7 +16,10 @@ bench.py --- plan §7.4, both halves, run under harness/with_server.sh:
     slow).  The negative control inflates one cost term -- the cycle, by a
     client-side sleep of D ms -- and requires this driver to FAIL the
     threshold AND attribute the failure to the starved queue, with the wait
-    p99 at least 0.9 D.
+    p99 at least 0.9 D / R: R resetters that each spend D per cycle deliver
+    at most R lanes per D, so a starved borrower waits D / R per lease on
+    average, and how much longer its longest waits run depends on how the
+    resetters' phases happen to line up, which the control does not own.
 
   bench.py reset  --resets N --lanes A,B [--busy-lanes ... --busy-mode soak|plpgsql]
                   [--negative-control --nc-sweep-wait-ms X]
@@ -36,7 +39,10 @@ bench.py --- plan §7.4, both halves, run under harness/with_server.sh:
     memcow-lane-reset-in-sweep injection point for X ms, inside the
     sweep_buffers term: the run must show sweep_buffers up by >= 0.9 X
     against the baseline it measured first, every other server term
-    unchanged within 1 ms, and the threshold missed.
+    unchanged within 1 ms, and the threshold missed.  The injection point's
+    wait state and the DSM registry that holds it live as long as the
+    server, so they are allocated before the leak baseline, not during the
+    run.
 
 Exit: 0 = thresholds met and no leaks (or, under --negative-control, the
 control behaved), 1 = missed / misattributed / leaked, 2 = could not run.
@@ -210,14 +216,21 @@ def run_lease(args, pq, base, ctl, probe):
         'arena_growth': growth, 'threshold_ok': threshold_ok, 'pass': ok,
     }
     if args.negative_control:
+        # The floor the delay guarantees: D / R per lease on average (see
+        # the module docstring).  0.9 D held only while the resetters'
+        # phases bunched; spread out, Linux CI measured 23.9-27.2 ms at
+        # D = 30, R = 3, and the control failed on a working harness.
+        wait_floor = 0.9 * args.resetter_delay_ms / max(1, args.resetters)
         behaved = (not threshold_ok and attribution == 'starved-queue' and
-                   ws['p99'] is not None and ws['p99'] >= 0.9 * args.resetter_delay_ms and
+                   ws['p99'] is not None and ws['p99'] >= wait_floor and
                    len(lease_ms) == args.leases and not leaks and not fails)
         summary['negative_control_behaved'] = behaved
+        summary['negative_control_wait_floor_ms'] = wait_floor
         print('NEGATIVE CONTROL %s: cycle inflated by %.0f ms client-side -> threshold %s, '
-              'attribution %s, wait p99 %.2f ms'
+              'attribution %s, wait p99 %.2f ms (floor %.2f ms = 0.9 x %.0f ms / %d resetters)'
               % ('BEHAVED' if behaved else 'DID NOT BEHAVE', args.resetter_delay_ms,
-                 'missed' if not threshold_ok else 'MET (wrong)', attribution, ws['p99'] or 0))
+                 'missed' if not threshold_ok else 'MET (wrong)', attribution, ws['p99'] or 0,
+                 wait_floor, args.resetter_delay_ms, max(1, args.resetters)))
         rc = 0 if behaved else 1
     else:
         print('VERDICT: %s -- lease p99 %.3f ms %s %.2f ms; leaks %s; failures %d'
@@ -552,6 +565,13 @@ def main():
     pq, base, ctl = tl.connect()
     if args.negative_control and args.driver == 'reset':
         ctl.exec('CREATE EXTENSION IF NOT EXISTS injection_points')
+        # The first use of the injection point allocates DSM that lives as
+        # long as the server: the DSM registry's area (one 1 MB segment) and
+        # injection_points' wait state (548 bytes) in it.  Allocate both
+        # before the leak baseline, or the reset's leak check counts them.
+        # The point is not attached yet, so the load initializes that state
+        # and loads nothing.
+        ctl.exec("SELECT injection_points_load('%s')" % NC_POINT)
     probe = tl.LeakProbe(tl.pgdata(), ctl)
     if args.driver == 'lease':
         rc = run_lease(args, pq, base, ctl, probe)
