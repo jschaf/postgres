@@ -166,7 +166,16 @@ def wal_kb(pgdata):
     return du_kb(os.path.join(pgdata, 'pg_wal'))
 
 
+def volatile():
+    """A volatile_data_directory server (with_server.sh --volatile)."""
+    return os.environ.get('MEMCOW_VOLATILE') == '1'
+
+
 def dsm_files(pgdata):
+    """The DSM segment count, or -1 when it cannot be measured: a volatile
+    server uses POSIX DSM, whose segments are not files under pgdata."""
+    if volatile():
+        return -1
     d = os.path.join(pgdata, 'pg_dynshmem')
     try:
         return len([f for f in os.listdir(d) if f.startswith('mmap.')])

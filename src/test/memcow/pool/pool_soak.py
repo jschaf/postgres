@@ -95,6 +95,9 @@ def main():
     data_base = tl.data_kb(pgdata)
     print('baseline: dsm segments=%d  pgdata-minus-wal=%dkB  wal=%dkB  lanes=%s  conns/lane=%d'
           % (dsm_base, data_base, tl.wal_kb(pgdata), ','.join(l.name for l in lanes), args.conns))
+    if tl.volatile():
+        print('volatile server: the DSM segment count is UNMEASURED (POSIX DSM); '
+              'with_server.sh checks the seed is byte-identical instead')
     expected_epoch = {l.name: l.epoch for l in lanes}
 
     lat_reset, lat_cycle, lat_lease = [], [], []
