@@ -681,6 +681,8 @@ MemcowShmemRequest(void)
 		prev_shmem_request_hook();
 	if (memcow_enabled)
 		RequestAddinShmemSpace(sizeof(MemcowShmemState));
+	if (memcow_enabled && VolatileDataDirectory)
+		RequestAddinShmemSpace(memcow_slru_shmem_size());
 }
 
 static void
@@ -706,6 +708,8 @@ MemcowShmemInit(void)
 						 LWLockNewTrancheId("MemcowOverlayDirectory"));
 		pg_atomic_init_u32(&MemcowShmem->reset_generation, 1);
 	}
+	if (VolatileDataDirectory)
+		memcow_slru_shmem_init();
 	LWLockRelease(AddinShmemInitLock);
 }
 

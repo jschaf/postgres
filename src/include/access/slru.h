@@ -242,6 +242,42 @@ extern void SlruDeleteSegment(SlruDesc *ctl, int64 segno);
 
 extern int	SlruSyncFileTag(SlruDesc *ctl, const FileTag *ftag, char *path);
 
+/*
+ * Page storage for a volatile data directory (volatile_data_directory).  In
+ * that mode SLRU pages are written here instead of to segment files, read
+ * from here first and from the (read-only) segment files otherwise, and
+ * "deleting" a segment forgets its stored pages.  The segment files below
+ * DataDir are never modified.
+ *
+ * read_page, write_page and page_exists run with SLRU buffer locks held and
+ * possibly inside a critical section: they must not allocate or raise an
+ * ERROR.  A failed write returns false with errno set, which the caller
+ * reports against the page's segment file.  list_segments and forget_segment
+ * run outside critical sections.  The postmaster can scan and delete segments
+ * while it initializes shared memory (async.c clears pg_notify), possibly
+ * before the storage's own shared memory exists; nothing is stored then.
+ */
+typedef struct SlruStorage
+{
+	/* Copy the stored page into buffer; false if none is stored. */
+	bool		(*read_page) (SlruDesc *ctl, int64 pageno, char *buffer);
+
+	/* Store the page, replacing any stored copy. */
+	bool		(*write_page) (SlruDesc *ctl, int64 pageno, const char *buffer);
+
+	/* Whether a page is stored. */
+	bool		(*page_exists) (SlruDesc *ctl, int64 pageno);
+
+	/* The segments with stored pages, as a palloc'd array of *nsegs. */
+	int64	   *(*list_segments) (SlruDesc *ctl, int *nsegs);
+
+	/* Forget every stored page of a segment. */
+	void		(*forget_segment) (SlruDesc *ctl, int64 segno);
+} SlruStorage;
+
+extern void RegisterSlruStorage(const SlruStorage *storage);
+extern bool SlruStorageRegistered(void);
+
 /* SlruScanDirectory public callbacks */
 extern bool SlruScanDirCbReportPresence(SlruDesc *ctl, char *filename,
 										int64 segpage, void *data);

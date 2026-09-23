@@ -30,6 +30,7 @@
 
 #include "access/htup_details.h"
 #include "access/parallel.h"
+#include "access/slru.h"
 #include "access/twophase.h"
 #include "access/xlog.h"
 #include "catalog/pg_authid.h"
@@ -1744,6 +1745,7 @@ CheckVolatileDataDirectory(void)
 	volatile_requires(IsPostmasterEnvironment, "a postmaster");
 	volatile_requires(smgr_default_is_volatile(),
 					  "a volatile default storage manager");
+	volatile_requires(SlruStorageRegistered(), "an SLRU storage provider");
 	volatile_requires(wal_level == WAL_LEVEL_MINIMAL,
 					  "\"wal_level\" = minimal");
 	volatile_requires(max_wal_senders == 0, "\"max_wal_senders\" = 0");

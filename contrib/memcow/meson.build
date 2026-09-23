@@ -3,6 +3,7 @@
 memcow_sources = files(
   'memcow.c',
   'lanes.c',
+  'slru_store.c',
 )
 
 if host_system == 'windows'

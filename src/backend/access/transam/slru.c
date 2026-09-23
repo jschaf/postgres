@@ -75,6 +75,9 @@
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
 
+/* Page storage used in place of segment files under volatile_data_directory */
+static const SlruStorage *slru_storage = NULL;
+
 /*
  * Converts segment number to the filename of the segment.
  *
@@ -193,6 +196,26 @@ static bool SlruScanDirCbDeleteCutoff(SlruDesc *ctl, char *filename,
 static void SlruInternalDeleteSegment(SlruDesc *ctl, int64 segno);
 static inline void SlruRecentlyUsed(SlruShared shared, int slotno);
 
+
+/*
+ * Register the page storage that volatile_data_directory requires.  Must be
+ * called from a shared preload library, before any SLRU page is read.
+ */
+void
+RegisterSlruStorage(const SlruStorage *storage)
+{
+	if (!process_shared_preload_libraries_in_progress)
+		elog(ERROR, "SLRU storage must be registered during shared preload");
+	if (slru_storage != NULL)
+		elog(ERROR, "SLRU storage is already registered");
+	slru_storage = storage;
+}
+
+bool
+SlruStorageRegistered(void)
+{
+	return slru_storage != NULL;
+}
 
 /*
  * Initialization of shared memory
@@ -805,6 +828,10 @@ SimpleLruDoesPhysicalPageExist(SlruDesc *ctl, int64 pageno)
 	/* update the stats counter of checked pages */
 	pgstat_count_slru_blocks_exists(ctl->shared->slru_stats_idx);
 
+	/* A volatile data directory's written pages are in the SLRU storage. */
+	if (VolatileDataDirectory && slru_storage->page_exists(ctl, pageno))
+		return true;
+
 	SlruFileName(ctl, path, segno);
 
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
@@ -858,6 +885,14 @@ SlruPhysicalReadPage(SlruDesc *ctl, int64 pageno, int slotno)
 	off_t		offset = rpageno * BLCKSZ;
 	char		path[MAXPGPATH];
 	int			fd;
+
+	/*
+	 * A volatile data directory reads the pages it wrote from the SLRU
+	 * storage and the rest from the directory's segment files.
+	 */
+	if (VolatileDataDirectory &&
+		slru_storage->read_page(ctl, pageno, shared->page_buffer[slotno]))
+		return true;
 
 	SlruFileName(ctl, path, segno);
 
@@ -973,6 +1008,19 @@ SlruPhysicalWritePage(SlruDesc *ctl, int64 pageno, int slotno, SlruWriteAll fdat
 			XLogFlush(max_lsn);
 			END_CRIT_SECTION();
 		}
+	}
+
+	/*
+	 * A volatile data directory never writes a segment file, so there is no
+	 * file to create and nothing to sync.
+	 */
+	if (VolatileDataDirectory)
+	{
+		if (slru_storage->write_page(ctl, pageno, shared->page_buffer[slotno]))
+			return true;
+		slru_errcause = SLRU_WRITE_FAILED;
+		slru_errno = errno;
+		return false;
 	}
 
 	/*
@@ -1554,6 +1602,13 @@ SlruInternalDeleteSegment(SlruDesc *ctl, int64 segno)
 {
 	char		path[MAXPGPATH];
 
+	/* A volatile data directory's segment files are never removed. */
+	if (VolatileDataDirectory)
+	{
+		slru_storage->forget_segment(ctl, segno);
+		return;
+	}
+
 	/* Forget any fsync requests queued for this segment. */
 	if (ctl->options.sync_handler != SYNC_HANDLER_NONE)
 	{
@@ -1870,6 +1925,27 @@ SlruScanDirectory(SlruDesc *ctl, SlruScanCallback callback, void *data)
 		}
 	}
 	FreeDir(cldir);
+
+	/*
+	 * In a volatile data directory, segments also exist as pages in the SLRU
+	 * storage.  A segment with both a file and stored pages is visited twice;
+	 * the callbacks above are idempotent.
+	 */
+	if (VolatileDataDirectory && !retval)
+	{
+		int64	   *segnos;
+		int			nsegs;
+		char		path[MAXPGPATH];
+
+		segnos = slru_storage->list_segments(ctl, &nsegs);
+		for (int i = 0; i < nsegs && !retval; i++)
+		{
+			SlruFileName(ctl, path, segnos[i]);
+			retval = callback(ctl, path + strlen(ctl->options.Dir) + 1,
+							  segnos[i] * SLRU_PAGES_PER_SEGMENT, data);
+		}
+		pfree(segnos);
+	}
 
 	return retval;
 }

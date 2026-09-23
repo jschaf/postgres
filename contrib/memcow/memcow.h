@@ -29,6 +29,7 @@ extern bool memcow_enabled;
 extern char *memcow_seed_directory;
 extern int memcow_lane_nonce;
 extern int memcow_lane_arena_limit;
+extern int memcow_slru_pages;
 
 /*
  * The SQLSTATE raised when a lane's overlay arena reaches
@@ -77,6 +78,11 @@ extern void memcow_immedsync(SMgrRelation reln, ForkNumber forknum);
 extern void memcow_registersync(SMgrRelation reln, ForkNumber forknum);
 extern int	memcow_fd(SMgrRelation reln, ForkNumber forknum,
 					  BlockNumber blocknum, uint32 *off);
+
+/* SLRU page storage for volatile_data_directory (slru_store.c) */
+extern Size memcow_slru_shmem_size(void);
+extern void memcow_slru_shmem_init(void);
+extern void memcow_slru_register(void);
 
 /* not an smgr callback: consulted by the object-access hook for DROP TABLESPACE */
 extern bool memcow_tablespace_in_use(Oid spcOid);

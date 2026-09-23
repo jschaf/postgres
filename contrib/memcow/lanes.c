@@ -255,9 +255,16 @@ _PG_init(void)
 		"Maximum size of one lane-epoch arena; zero means no limit.", NULL,
 		&memcow_lane_arena_limit, 0, 0, MAX_KILOBYTES, PGC_SIGHUP, GUC_UNIT_MB,
 		NULL, NULL, NULL);
+	DefineCustomIntVariable("memcow.slru_pages",
+		"Pages of SLRU storage for volatile_data_directory.",
+		"Every SLRU page a volatile server writes is kept here for the life of the server.",
+		&memcow_slru_pages, 4096, 16, INT_MAX / 2, PGC_POSTMASTER, 0,
+		NULL, NULL, NULL);
 	MarkGUCPrefixReserved("memcow");
 
 	RegisterStorageManager(&memcow_smgr, memcow_enabled);
+	if (memcow_enabled && VolatileDataDirectory)
+		memcow_slru_register();
 	memcow_shmem_setup();
 
 	prev_object_access_hook = object_access_hook;

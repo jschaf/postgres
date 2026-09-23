@@ -1,7 +1,7 @@
 # contrib/memcow/Makefile
 
 MODULE_big = memcow
-OBJS = memcow.o lanes.o $(WIN32RES)
+OBJS = memcow.o lanes.o slru_store.o $(WIN32RES)
 
 EXTENSION = memcow
 DATA = memcow--1.0.sql

@@ -13,6 +13,7 @@
 #   V1  no relation WAL        DML, DDL and index builds log only commits
 #   V2  volatile WAL           WAL crosses segments; pg_wal never changes
 #   V3  no checkpoints         CHECKPOINT and shutdown leave pg_control alone
+#   V4  memory SLRUs           evicted SLRU pages survive; no segment changes
 #
 # Every case has a negative control (--negative-control).  Where the property
 # is "the mode prevents a write", the control runs the same workload on an
@@ -39,7 +40,7 @@ HARNESS=$(cd -- "$HERE/../harness" && pwd)
 # shellcheck source=../harness/common.sh
 . "$HARNESS/common.sh"
 
-ALL_CASES="V0_prerequisites V1_no_relation_wal V2_volatile_wal V3_no_checkpoints"
+ALL_CASES="V0_prerequisites V1_no_relation_wal V2_volatile_wal V3_no_checkpoints V4_memory_slrus"
 
 SEED=
 BUILD_DIR=
@@ -532,6 +533,125 @@ nc_V3_no_checkpoints()
 	ck_nomatch "the workload runs" 'ERROR' "$out"
 	ck "the stock server's CHECKPOINT rewrites pg_control" \
 		"$([ "$before" != "$(manifest "$STOCK" global/pg_control)" ]; echo $?)"
+	stock_stop
+}
+
+# ===========================================================================
+# V4 --- memory-backed SLRUs
+#
+# With the SLRUs at their minimum of 16 buffers, a million consumed XIDs and
+# 40000 subtransaction-created multixacts evict dirty pg_xact, pg_subtrans
+# and pg_multixact pages, which the mode writes to the SLRU store instead of
+# a segment file.  400 page-sized notifications do the same to pg_notify and
+# then truncate it, which forgets stored segments instead of unlinking.  Commit status written before the eviction must read back
+# correctly afterwards, and no SLRU directory of the image may change.  A
+# store too small for the run fails the write loudly instead of dropping a
+# page.
+# ===========================================================================
+
+V4_GUCS=(transaction_buffers=16 subtransaction_buffers=16
+	multixact_offset_buffers=16 multixact_member_buffers=16 notify_buffers=16)
+V4_SLRUS='pg_xact pg_subtrans pg_multixact pg_notify pg_serial pg_commit_ts'
+V4_SETUP="
+CREATE EXTENSION IF NOT EXISTS xid_wraparound;
+CREATE TABLE v4 (i int, x xid8);
+CREATE TABLE v4m (id int PRIMARY KEY);
+INSERT INTO v4m VALUES (1);
+"
+V4_MULTIXACTS="
+DO \$\$ BEGIN
+	FOR i IN 1..40000 LOOP
+		PERFORM 1 FROM v4m WHERE id = 1 FOR KEY SHARE;
+		BEGIN
+			PERFORM 1 FROM v4m WHERE id = 1 FOR SHARE;
+		EXCEPTION WHEN OTHERS THEN RAISE;	-- a subtransaction
+		END;
+		COMMIT;
+	END LOOP;
+END \$\$;
+"
+# One page of pg_notify per notification, read only after the loop: the
+# queue grows past its buffers.  Once read, later notifications advance its
+# tail, which truncates it.
+V4_NOTIFY="
+LISTEN v4;
+DO \$\$ BEGIN
+	FOR i IN 1..400 LOOP
+		PERFORM pg_notify('v4', repeat('x', 7000));
+		COMMIT;
+	END LOOP;
+END \$\$;
+SELECT 1;
+DO \$\$ BEGIN
+	FOR i IN 1..8 LOOP
+		PERFORM pg_notify('v4', repeat('y', 7000));
+		COMMIT;
+	END LOOP;
+END \$\$;
+SELECT 1;
+"
+
+# v4_run PORT --- the workload; prints the aborted XID.
+v4_run()
+{
+	local port=$1 i aborted
+	vpsql -p "$port" -c "$V4_SETUP" >/dev/null
+	for ((i = 1; i <= 50; i++)); do
+		vpsql -p "$port" -c "INSERT INTO v4 VALUES ($i, pg_current_xact_id())" >/dev/null
+	done
+	aborted=$(vpsql -p "$port" -c BEGIN -c 'SELECT pg_current_xact_id()' -c ROLLBACK)
+	vpsql -p "$port" -c 'SELECT consume_xids(1100000)' >/dev/null
+	printf '%s' "$V4_MULTIXACTS" | vpsql -p "$port" >/dev/null
+	printf '%s' "$V4_NOTIFY" | vpsql -p "$port" >/dev/null
+	printf '%s' "$aborted"
+}
+
+V4_memory_slrus()
+{
+	local before after aborted out
+	before=$(manifest "$SEED" $V4_SLRUS)
+
+	vstart "${V4_GUCS[@]}" memcow.slru_pages=16
+	ck "server starts with a 16-page store" $?
+	vpsql -c "$V4_SETUP" >/dev/null
+	out=$(vpsql -c 'SELECT consume_xids(1100000)')
+	ck_match "a full store fails the SLRU write" 'could not write to file.*No space left on device' "$out"
+	ck_match "and names the setting" 'memcow SLRU store is full' "$(cat "$LOGFILE")"
+	vstop
+
+	vstart "${V4_GUCS[@]}"
+	ck "server starts" $?
+	aborted=$(v4_run "$PORT")
+	ck_eq "every committed row is visible" 50 "$(vpsql -c 'SELECT count(*) FROM v4')"
+	ck_eq "every early commit reads back as committed" 50 \
+		"$(vpsql -c "SELECT count(*) FROM v4 WHERE pg_xact_status(x) = 'committed'")"
+	ck_eq "the early abort reads back as aborted" aborted \
+		"$(vpsql -c "SELECT pg_xact_status('$aborted')")"
+	ck_eq "16+ pages of each of pg_xact, pg_subtrans and pg_multixact were stored" 4 \
+		"$(vpsql -c "SELECT count(*) FROM pg_stat_slru WHERE blks_written >= 16 AND name IN ('transaction', 'subtransaction', 'multixact_offset', 'multixact_member')")"
+	ck_eq "evicted pg_xact pages were read back" t \
+		"$(vpsql -c "SELECT blks_read > 0 FROM pg_stat_slru WHERE name = 'transaction'")"
+	ck_eq "pg_notify was stored and truncated" t \
+		"$(vpsql -c "SELECT blks_written >= 16 AND truncates > 0 FROM pg_stat_slru WHERE name = 'notify'")"
+	out=$(vpsql -c 'UPDATE v4m SET id = id' -c 'SELECT count(*) FROM v4m')
+	ck_eq "the multixact-locked row reads and updates" 1 "$(printf '%s\n' "$out" | tail -1)"
+	vstop
+	after=$(manifest "$SEED" $V4_SLRUS)
+	ck_eq "no SLRU directory changed" "$(printf '%s' "$before" | shasum)" \
+		"$(printf '%s' "$after" | shasum)"
+	ck_nomatch "no store overflow" 'store is full' "$(cat "$LOGFILE")"
+	ck_no_crash
+}
+
+nc_V4_memory_slrus()
+{
+	local before
+	stock_start "$(printf -- '-c %s ' "${V4_GUCS[@]}")"
+	ck "stock server starts" $?
+	before=$(manifest "$STOCK" $V4_SLRUS)
+	v4_run "$PORT" >/dev/null
+	ck "the stock server writes SLRU segments" \
+		"$([ "$before" != "$(manifest "$STOCK" $V4_SLRUS)" ]; echo $?)"
 	stock_stop
 }
 
