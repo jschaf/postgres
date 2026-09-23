@@ -10,6 +10,7 @@
 # against the seed built by seed/build_seed.sh.
 #
 #   V0  prerequisites          the mode refuses every setting that would write
+#   V2  volatile WAL           WAL crosses segments; pg_wal never changes
 #
 # Every case has a negative control (--negative-control).  Where the property
 # is "the mode prevents a write", the control runs the same workload on an
@@ -36,7 +37,7 @@ HARNESS=$(cd -- "$HERE/../harness" && pwd)
 # shellcheck source=../harness/common.sh
 . "$HARNESS/common.sh"
 
-ALL_CASES="V0_prerequisites"
+ALL_CASES="V0_prerequisites V2_volatile_wal"
 
 SEED=
 BUILD_DIR=
@@ -130,6 +131,60 @@ vfails()
 	rm -f "$PIDFILE"
 	cat "$LOGFILE"
 	return 0
+}
+
+# ---------------------------------------------------------------------------
+# the stock control: the same workload, the mode off
+#
+# An ordinary memcow server over a writable copy of the seed, laid out the way
+# assemble_ramdir.sh lays out a runtime: relation pages still come from the
+# seed, everything else goes to the copy.  A negative control proves its
+# instrument by watching the copy change.
+# ---------------------------------------------------------------------------
+
+STOCK=$OUTPUTDIR/stock
+
+stock_start()
+{
+	vstop
+	stock_stop
+	rm -rf "$STOCK" && cp -Rp "$SEED" "$STOCK" && chmod -R u+w "$STOCK" || return 1
+	: >"$LOGFILE"
+	"$MC_BINDIR/pg_ctl" -D "$STOCK" -l "$LOGFILE" -w -t 120 -o "-c port=$PORT \
+		-c listen_addresses=127.0.0.1 -c unix_socket_directories= \
+		-c shared_preload_libraries=memcow -c memcow.enabled=on \
+		-c memcow.seed_directory=$SEED -c wal_level=minimal -c max_wal_senders=0 \
+		-c max_prepared_transactions=0 -c fsync=off -c log_min_messages=warning \
+		$*" start >/dev/null
+}
+
+stock_stop()
+{
+	[ -f "$STOCK/postmaster.pid" ] || return 0
+	"$MC_BINDIR/pg_ctl" -D "$STOCK" -m "${1:-fast}" -w -t 120 stop >/dev/null 2>&1
+}
+
+# manifest DIR SUBTREE... --- the lines of mc_seed_manifest under SUBTREEs.
+manifest()
+{
+	local dir=$1 all
+	shift
+	all=$(mktemp "$OUTPUTDIR/manifest.XXXXXX")
+	mc_seed_manifest "$dir" "$all"
+	if [ $# -eq 0 ]; then
+		cat "$all"
+	else
+		local sub
+		for sub in "$@"; do
+			grep -E " $sub(/|\$)" "$all"
+		done
+	fi
+	rm -f "$all"
+}
+
+control_value() # control_value DIR LABEL --- one pg_controldata field
+{
+	LC_ALL=C "$MC_BINDIR/pg_controldata" -D "$1" | sed -n "s/^$2: *//p"
 }
 
 # ---------------------------------------------------------------------------
@@ -254,10 +309,85 @@ nc_V0_prerequisites()
 }
 
 # ===========================================================================
+# V2 --- volatile WAL
+#
+# Commits and segment switches drive the insert position several segments
+# past the seed's WAL.  Nothing in pg_wal may change, the flush position must
+# still advance (the WAL writer "writes" by moving it), and reading WAL back
+# is refused because it exists only in the WAL buffers.  The server is
+# stopped with SIGQUIT so no shutdown path can hide a write.
+# ===========================================================================
+
+V2_WORKLOAD="
+CREATE TABLE v2 (i int, t text);
+DO \$\$ BEGIN FOR i IN 1..500 LOOP INSERT INTO v2 VALUES (i, repeat('x', 200)); COMMIT; END LOOP; END \$\$;
+SELECT pg_switch_wal() IS NOT NULL;
+INSERT INTO v2 VALUES (-1, 'after one switch');
+SELECT pg_switch_wal() IS NOT NULL;
+INSERT INTO v2 VALUES (-2, 'after two switches');
+SELECT pg_switch_wal() IS NOT NULL;
+INSERT INTO v2 VALUES (-3, 'after three switches');
+"
+
+# segments_past DIR PORT --- how many WAL segments the insert position is
+# past the segment holding the image's checkpoint.
+segments_past()
+{
+	local seg ckpt
+	seg=$(control_value "$1" 'Bytes per WAL segment')
+	ckpt=$(control_value "$1" 'Latest checkpoint location')
+	vpsql -p "$2" -c "SELECT (floor((pg_current_wal_insert_lsn() - '0/0') / $seg)
+		- floor(('$ckpt'::pg_lsn - '0/0') / $seg))::int"
+}
+
+V2_volatile_wal()
+{
+	local before after out i past flushed
+	before=$(manifest "$SEED" pg_wal)
+	vstart
+	ck "server starts" $?
+	out=$(printf "%s" "$V2_WORKLOAD" | vpsql)
+	ck_nomatch "the workload runs" 'ERROR' "$out"
+	past=$(segments_past "$SEED" "$PORT")
+	ck "the insert position is 3+ segments past the image ($past)" "$([ "${past:-0}" -ge 3 ]; echo $?)"
+	ck_eq "the rows are there" 503 "$(vpsql -c 'SELECT count(*) FROM v2')"
+
+	flushed=f
+	for ((i = 0; i < 50; i++)); do
+		flushed=$(vpsql -c "SELECT pg_current_wal_flush_lsn() >= '$(vpsql -c 'SELECT pg_current_wal_insert_lsn()')'::pg_lsn - 8192")
+		[ "$flushed" = t ] && break
+		sleep 0.1
+	done
+	ck_eq "the WAL writer advances the flush position" t "$flushed"
+
+	out=$(vpsql -c 'CREATE EXTENSION pg_walinspect' \
+		-c "SELECT count(*) FROM pg_get_wal_records_info(pg_current_wal_flush_lsn() - 64, pg_current_wal_flush_lsn())")
+	ck_match "reading WAL is refused" 'reading WAL is not supported when "volatile_data_directory" is enabled' "$out"
+
+	vstop QUIT
+	after=$(manifest "$SEED" pg_wal)
+	ck_eq "pg_wal is unchanged" "$(printf '%s' "$before" | shasum)" "$(printf '%s' "$after" | shasum)"
+	ck_no_crash
+}
+
+nc_V2_volatile_wal()
+{
+	local before after out
+	stock_start
+	ck "stock server starts" $?
+	before=$(manifest "$STOCK" pg_wal)
+	out=$(printf "%s" "$V2_WORKLOAD" | vpsql)
+	ck_nomatch "the workload runs" 'ERROR' "$out"
+	stock_stop immediate
+	after=$(manifest "$STOCK" pg_wal)
+	ck "the stock server writes pg_wal" "$([ "$before" != "$after" ]; echo $?)"
+}
+
+# ===========================================================================
 # driver
 # ===========================================================================
 
-trap 'vstop INT' EXIT INT TERM
+trap 'vstop INT; stock_stop immediate' EXIT INT TERM
 
 mc_banner "memcow volatile_data_directory slice tests" \
 	"seed:     $SEED" \

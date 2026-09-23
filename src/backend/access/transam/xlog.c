@@ -2349,6 +2349,21 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 	RefreshXLogWriteResult(LogwrtResult);
 
 	/*
+	 * Volatile WAL is never written, and nothing reads it back, so writing
+	 * and flushing are just advancing the positions.  The caller guarantees
+	 * the request does not pass the inserted WAL.  Emptying the request skips
+	 * the write loop, the flush and the segment bookkeeping below; only the
+	 * shared-memory update runs.
+	 */
+	if (VolatileDataDirectory)
+	{
+		if (LogwrtResult.Write < WriteRqst.Write)
+			LogwrtResult.Write = WriteRqst.Write;
+		LogwrtResult.Flush = LogwrtResult.Write;
+		WriteRqst.Write = WriteRqst.Flush = InvalidXLogRecPtr;
+	}
+
+	/*
 	 * Since successive pages in the xlog cache are consecutively allocated,
 	 * we can usually gather multiple pages together and issue just one
 	 * write() call.  npages is the number of pages we have determined can be
@@ -2824,6 +2839,15 @@ XLogFlush(XLogRecPtr record)
 		return;
 	}
 
+	/*
+	 * Volatile WAL counts as durable the moment it is inserted.  The WAL
+	 * writer and buffer replacement still advance the flush position; see
+	 * XLogWrite().  Pages of permanent relations carry fake LSNs beyond the
+	 * inserted WAL (XLogGetFakeLSN()), so there is nothing to wait for.
+	 */
+	if (VolatileDataDirectory)
+		return;
+
 	/* Quick exit if already known flushed */
 	if (record <= LogwrtResult.Flush)
 		return;
@@ -3218,6 +3242,10 @@ XLogNeedsFlush(XLogRecPtr record)
 		else
 			return true;
 	}
+
+	/* As in XLogFlush(), volatile WAL never needs flushing. */
+	if (VolatileDataDirectory)
+		return false;
 
 	/* Quick exit if already known flushed */
 	if (record <= LogwrtResult.Flush)
@@ -3753,7 +3781,7 @@ PreallocXlogFiles(XLogRecPtr endptr, TimeLineID tli)
 	char		path[MAXPGPATH];
 	uint64		offset;
 
-	if (!XLogCtl->InstallXLogFileSegmentActive)
+	if (!XLogCtl->InstallXLogFileSegmentActive || VolatileDataDirectory)
 		return;					/* unlocked check says no */
 
 	XLByteToPrevSeg(endptr, _logSegNo, wal_segment_size);
@@ -4166,6 +4194,10 @@ ValidateXLOGDirectoryStructure(void)
 				(errcode_for_file_access(),
 				 errmsg("required WAL directory \"%s\" does not exist",
 						XLOGDIR)));
+
+	/* Volatile WAL is never archived or summarized; create nothing. */
+	if (VolatileDataDirectory)
+		return;
 
 	/* Check for archive_status */
 	snprintf(path, MAXPGPATH, XLOGDIR "/archive_status");
@@ -5964,6 +5996,31 @@ StartupXLOG(void)
 			ereport(FATAL,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("control file contains invalid database cluster state")));
+	}
+
+	/*
+	 * Nothing can be recovered into a volatile data directory: its WAL beyond
+	 * the image was never written.  Require an image that needs no recovery
+	 * and asks for none.
+	 */
+	if (VolatileDataDirectory)
+	{
+		static const char *const recovery_files[] = {
+			RECOVERY_SIGNAL_FILE, STANDBY_SIGNAL_FILE,
+			BACKUP_LABEL_FILE, TABLESPACE_MAP,
+		};
+		struct stat st;
+
+		if (ControlFile->state != DB_SHUTDOWNED)
+			ereport(FATAL,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("\"volatile_data_directory\" requires a cleanly shut down data directory")));
+		for (int i = 0; i < lengthof(recovery_files); i++)
+			if (stat(recovery_files[i], &st) == 0)
+				ereport(FATAL,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("\"volatile_data_directory\" does not support recovery, but file \"%s\" exists",
+								recovery_files[i])));
 	}
 
 	/* This is just to allow attaching to startup process with a debugger */
