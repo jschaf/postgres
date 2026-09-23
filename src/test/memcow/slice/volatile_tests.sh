@@ -11,6 +11,7 @@
 #
 #   V0  prerequisites          the mode refuses every setting that would write
 #   V2  volatile WAL           WAL crosses segments; pg_wal never changes
+#   V3  no checkpoints         CHECKPOINT and shutdown leave pg_control alone
 #
 # Every case has a negative control (--negative-control).  Where the property
 # is "the mode prevents a write", the control runs the same workload on an
@@ -37,7 +38,7 @@ HARNESS=$(cd -- "$HERE/../harness" && pwd)
 # shellcheck source=../harness/common.sh
 . "$HARNESS/common.sh"
 
-ALL_CASES="V0_prerequisites V2_volatile_wal"
+ALL_CASES="V0_prerequisites V2_volatile_wal V3_no_checkpoints"
 
 SEED=
 BUILD_DIR=
@@ -381,6 +382,65 @@ nc_V2_volatile_wal()
 	stock_stop immediate
 	after=$(manifest "$STOCK" pg_wal)
 	ck "the stock server writes pg_wal" "$([ "$before" != "$after" ]; echo $?)"
+}
+
+# ===========================================================================
+# V3 --- no checkpoints, no control-file writes
+#
+# CHECKPOINT, a fast shutdown and a crash all leave the image's pg_control
+# byte-identical, so every later start is a start from the image's own clean
+# shutdown: no recovery, and the same checkpoint the image was built with.
+# pg_control_checkpoint() reads the file, not shared memory.
+# ===========================================================================
+
+V3_no_checkpoints()
+{
+	local before ckpt out i started
+	before=$(manifest "$SEED" global/pg_control)
+	ckpt=$(control_value "$SEED" 'Latest checkpoint location')
+	vstart log_min_messages=log
+	ck "server starts" $?
+	out=$(vpsql -c 'CREATE TABLE v3 AS SELECT generate_series(1, 1000) i' -c CHECKPOINT \
+		-c 'SELECT checkpoint_lsn FROM pg_control_checkpoint()')
+	ck_eq "CHECKPOINT leaves the file's checkpoint alone" "$ckpt" "$(printf '%s\n' "$out" | tail -1)"
+	ck_nomatch "no checkpoint ran" 'checkpoint (starting|complete)' "$(cat "$LOGFILE")"
+
+	vstop INT
+	ck_eq "a fast shutdown leaves pg_control unchanged" "$before" "$(manifest "$SEED" global/pg_control)"
+
+	vstart log_min_messages=log
+	ck "the server restarts" $?
+	ck_match "the restart starts from the image's shutdown" 'database system was shut down at' "$(cat "$LOGFILE")"
+	ck_eq "the restart sees the image, not the previous run" 0 \
+		"$(vpsql -c "SELECT count(*) FROM pg_class WHERE relname = 'v3'")"
+
+	vstop KILL
+	started=1
+	for ((i = 0; i < 20; i++)); do
+		if vstart log_min_messages=log 2>/dev/null; then
+			started=0
+			break
+		fi
+		sleep 0.5
+	done
+	ck "a crashed server restarts" $started
+	ck_nomatch "without recovery" 'was interrupted|redo starts|automatic recovery' "$(cat "$LOGFILE")"
+	vstop INT
+	ck_eq "pg_control is unchanged" "$before" "$(manifest "$SEED" global/pg_control)"
+	ck_no_crash
+}
+
+nc_V3_no_checkpoints()
+{
+	local before out
+	stock_start
+	ck "stock server starts" $?
+	before=$(manifest "$STOCK" global/pg_control)
+	out=$(vpsql -c 'CREATE TABLE v3 AS SELECT generate_series(1, 1000) i' -c CHECKPOINT)
+	ck_nomatch "the workload runs" 'ERROR' "$out"
+	ck "the stock server's CHECKPOINT rewrites pg_control" \
+		"$([ "$before" != "$(manifest "$STOCK" global/pg_control)" ]; echo $?)"
+	stock_stop
 }
 
 # ===========================================================================

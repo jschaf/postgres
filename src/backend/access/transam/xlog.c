@@ -4669,11 +4669,15 @@ ReadControlFile(void)
 /*
  * Utility wrapper to update the control file.  Note that the control
  * file gets flushed.
+ *
+ * A volatile data directory's control file is only the shared-memory copy;
+ * the image's file keeps the state it was built with.
  */
 static void
 UpdateControlFile(void)
 {
-	update_controlfile(DataDir, ControlFile, true);
+	if (!VolatileDataDirectory)
+		update_controlfile(DataDir, ControlFile, true);
 }
 
 /*
@@ -7212,6 +7216,10 @@ ShutdownXLOG(int code, Datum arg)
 	 */
 	WalSndWaitStopping();
 
+	/* A volatile data directory has nothing to persist; see CreateCheckPoint. */
+	if (VolatileDataDirectory)
+		return;
+
 	if (RecoveryInProgress())
 		CreateRestartPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_FAST);
 	else
@@ -7509,6 +7517,15 @@ CreateCheckPoint(int flags)
 	/* sanity check */
 	if (RecoveryInProgress() && (flags & CHECKPOINT_END_OF_RECOVERY) == 0)
 		elog(ERROR, "can't create a checkpoint during recovery");
+
+	/*
+	 * A checkpoint makes buffers, SLRUs and the control file durable.  In a
+	 * volatile data directory none of them ever will be, and nothing will
+	 * replay from a redo pointer, so every request -- timed, forced,
+	 * CHECKPOINT, shutdown -- completes without doing anything.
+	 */
+	if (VolatileDataDirectory)
+		return false;
 
 	/*
 	 * Prepare to accumulate statistics.
