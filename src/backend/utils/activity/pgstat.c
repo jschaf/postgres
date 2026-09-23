@@ -557,9 +557,13 @@ pgstat_discard_stats(void)
 
 	/* NB: this needs to be done even in single user mode */
 
-	/* First, cleanup the main pgstats file */
-	ret = unlink(PGSTAT_STAT_PERMANENT_FILENAME);
-	if (ret != 0)
+	/*
+	 * First, cleanup the main pgstats file.  A volatile data directory's
+	 * stats always start empty, and its file belongs to the image.
+	 */
+	if (VolatileDataDirectory)
+		ret = 0;
+	else if ((ret = unlink(PGSTAT_STAT_PERMANENT_FILENAME)) != 0)
 	{
 		if (errno == ENOENT)
 			elog(DEBUG2,
@@ -627,7 +631,8 @@ pgstat_before_server_shutdown(int code, Datum arg)
 	if (code == 0)
 	{
 		pgStatLocal.shmem->is_shutdown = true;
-		pgstat_write_statsfile();
+		if (!VolatileDataDirectory)
+			pgstat_write_statsfile();
 	}
 }
 

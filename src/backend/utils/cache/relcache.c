@@ -6209,6 +6209,13 @@ load_relcache_init_file(bool shared)
 				magic;
 	int			i;
 
+	/*
+	 * A volatile data directory never has init files of its own; any in the
+	 * image would describe the image, not this server's catalogs.
+	 */
+	if (VolatileDataDirectory)
+		return false;
+
 	if (shared)
 		snprintf(initfilename, sizeof(initfilename), "global/%s",
 				 RELCACHE_INIT_FILENAME);
@@ -6628,9 +6635,10 @@ write_relcache_init_file(bool shared)
 
 	/*
 	 * If we have already received any relcache inval events, there's no
-	 * chance of succeeding so we may as well skip the whole thing.
+	 * chance of succeeding so we may as well skip the whole thing.  A
+	 * volatile data directory is never written.
 	 */
-	if (relcacheInvalsReceived != 0L)
+	if (relcacheInvalsReceived != 0L || VolatileDataDirectory)
 		return;
 
 	/*
@@ -6896,6 +6904,10 @@ RelationCacheInitFilePreInvalidate(void)
 	char		localinitfname[MAXPGPATH];
 	char		sharedinitfname[MAXPGPATH];
 
+	/* No init files are written in a volatile data directory. */
+	if (VolatileDataDirectory)
+		return;
+
 	if (DatabasePath)
 		snprintf(localinitfname, sizeof(localinitfname), "%s/%s",
 				 DatabasePath, RELCACHE_INIT_FILENAME);
@@ -6918,7 +6930,8 @@ RelationCacheInitFilePreInvalidate(void)
 void
 RelationCacheInitFilePostInvalidate(void)
 {
-	LWLockRelease(RelCacheInitLock);
+	if (!VolatileDataDirectory)
+		LWLockRelease(RelCacheInitLock);
 }
 
 /*
@@ -6937,6 +6950,10 @@ RelationCacheInitFileRemove(void)
 	DIR		   *dir;
 	struct dirent *de;
 	char		path[MAXPGPATH + sizeof(PG_TBLSPC_DIR) + sizeof(TABLESPACE_VERSION_DIRECTORY)];
+
+	/* No init files are written in a volatile data directory. */
+	if (VolatileDataDirectory)
+		return;
 
 	snprintf(path, sizeof(path), "global/%s",
 			 RELCACHE_INIT_FILENAME);

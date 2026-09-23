@@ -757,6 +757,26 @@ PGSharedMemoryCreate(Size size,
 	}
 
 	/*
+	 * The SysV block exists only as an interlock keyed on the data directory,
+	 * and many postmasters share a volatile data directory (which requires
+	 * shared_memory_type=mmap).  The anonymous segment carries the header.
+	 */
+	if (VolatileDataDirectory)
+	{
+		Assert(AnonymousShmem != NULL);
+		hdr = (PGShmemHeader *) AnonymousShmem;
+		hdr->creatorPID = getpid();
+		hdr->magic = PGShmemMagic;
+		hdr->dsm_control = 0;
+		hdr->device = statbuf.st_dev;
+		hdr->inode = statbuf.st_ino;
+		hdr->totalsize = size;
+		hdr->content_offset = MAXALIGN(sizeof(PGShmemHeader));
+		*shim = hdr;
+		return hdr;
+	}
+
+	/*
 	 * Loop till we find a free IPC key.  Trust CreateDataDirLockFile() to
 	 * ensure no more than one postmaster per data directory can enter this
 	 * loop simultaneously.  (CreateDataDirLockFile() does not entirely ensure

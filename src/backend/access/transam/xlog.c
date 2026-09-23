@@ -4451,10 +4451,11 @@ ReadControlFile(void)
 	ssize_t		r;
 
 	/*
-	 * Read data...
+	 * Read data...  A volatile data directory may be on a read-only
+	 * filesystem.
 	 */
 	fd = BasicOpenFile(XLOG_CONTROL_FILE,
-					   O_RDWR | PG_BINARY);
+					   (VolatileDataDirectory ? O_RDONLY : O_RDWR) | PG_BINARY);
 	if (fd < 0)
 		ereport(PANIC,
 				(errcode_for_file_access(),
@@ -6197,7 +6198,7 @@ StartupXLOG(void)
 	 * TODO: With a bit of extra work we could just start with a pgstat file
 	 * associated with the checkpoint redo location we're starting from.
 	 */
-	if (didCrash)
+	if (didCrash || VolatileDataDirectory)
 		pgstat_discard_stats();
 	else
 		pgstat_restore_stats();

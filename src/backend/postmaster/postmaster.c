@@ -1079,17 +1079,20 @@ PostmasterMain(int argc, char *argv[])
 	 * process is invoked. Because, after that, they can be used by
 	 * postmaster's SIGUSR1 signal handler.
 	 */
-	RemovePromoteSignalFiles();
+	if (!VolatileDataDirectory)
+	{
+		RemovePromoteSignalFiles();
 
-	/* Do the same for logrotate signal file */
-	RemoveLogrotateSignalFiles();
+		/* Do the same for logrotate signal file */
+		RemoveLogrotateSignalFiles();
 
-	/* Remove any outdated file holding the current log filenames. */
-	if (unlink(LOG_METAINFO_DATAFILE) < 0 && errno != ENOENT)
-		ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("could not remove file \"%s\": %m",
-						LOG_METAINFO_DATAFILE)));
+		/* Remove any outdated file holding the current log filenames. */
+		if (unlink(LOG_METAINFO_DATAFILE) < 0 && errno != ENOENT)
+			ereport(LOG,
+					(errcode_for_file_access(),
+					 errmsg("could not remove file \"%s\": %m",
+							LOG_METAINFO_DATAFILE)));
+	}
 
 	/*
 	 * If enabled, start up syslogger collection subprocess
@@ -1306,7 +1309,7 @@ PostmasterMain(int argc, char *argv[])
 	 * Record postmaster options.  We delay this till now to avoid recording
 	 * bogus options (eg, unusable port number).
 	 */
-	if (!CreateOptsFile(argc, argv, my_exec_path))
+	if (!VolatileDataDirectory && !CreateOptsFile(argc, argv, my_exec_path))
 		ExitPostmaster(1);
 
 	/*

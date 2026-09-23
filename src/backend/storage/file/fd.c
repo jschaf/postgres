@@ -3325,6 +3325,13 @@ RemovePgTempFiles(void)
 	struct dirent *spc_de;
 
 	/*
+	 * A volatile data directory never gets temporary files, and any it held
+	 * would belong to the image, not to this postmaster.
+	 */
+	if (VolatileDataDirectory)
+		return;
+
+	/*
 	 * First process temp files in pg_default ($PGDATA/base)
 	 */
 	snprintf(temp_path, sizeof(temp_path), "base/%s", PG_TEMP_FILES_DIR);

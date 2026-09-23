@@ -4139,8 +4139,9 @@ memcow_lane_sweep_files(MemcowDbSlot *slot, Oid dbOid, Oid spcOid)
 	int			ourlen;
 	int			seedlen;
 
+	/* A volatile data directory never writes an init file to remove. */
 	snprintf(path, sizeof(path), "%s/%s", dbpath, RELCACHE_INIT_FILENAME);
-	if (unlink(path) != 0 && errno != ENOENT)
+	if (!VolatileDataDirectory && unlink(path) != 0 && errno != ENOENT)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not remove file \"%s\": %m", path)));

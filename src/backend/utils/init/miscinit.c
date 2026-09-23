@@ -1472,6 +1472,12 @@ CreateLockFile(const char *filename, bool amPostmaster,
 void
 CreateDataDirLockFile(bool amPostmaster)
 {
+	/*
+	 * Any number of postmasters may share a volatile data directory: none of
+	 * them writes to it, so there is nothing to interlock.
+	 */
+	if (VolatileDataDirectory)
+		return;
 	CreateLockFile(DIRECTORY_LOCK_FILE, amPostmaster, "", true, DataDir);
 }
 
@@ -1536,6 +1542,10 @@ AddToDataDirLockFile(int target_line, const char *str)
 	char	   *destptr;
 	char		srcbuffer[BLCKSZ];
 	char		destbuffer[BLCKSZ];
+
+	/* A volatile data directory has no lock file; see CreateDataDirLockFile. */
+	if (VolatileDataDirectory)
+		return;
 
 	fd = open(DIRECTORY_LOCK_FILE, O_RDWR | PG_BINARY, 0);
 	if (fd < 0)
@@ -1660,6 +1670,10 @@ RecheckDataDirLockFile(void)
 	ssize_t		len;
 	long		file_pid;
 	char		buffer[BLCKSZ];
+
+	/* A volatile data directory has no lock file; see CreateDataDirLockFile. */
+	if (VolatileDataDirectory)
+		return true;
 
 	fd = open(DIRECTORY_LOCK_FILE, O_RDWR | PG_BINARY, 0);
 	if (fd < 0)

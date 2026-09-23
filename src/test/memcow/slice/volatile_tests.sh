@@ -14,6 +14,7 @@
 #   V2  volatile WAL           WAL crosses segments; pg_wal never changes
 #   V3  no checkpoints         CHECKPOINT and shutdown leave pg_control alone
 #   V4  memory SLRUs           evicted SLRU pages survive; no segment changes
+#   V5  shared image           four postmasters on one seed, no file written
 #
 # Every case has a negative control (--negative-control).  Where the property
 # is "the mode prevents a write", the control runs the same workload on an
@@ -40,7 +41,7 @@ HARNESS=$(cd -- "$HERE/../harness" && pwd)
 # shellcheck source=../harness/common.sh
 . "$HARNESS/common.sh"
 
-ALL_CASES="V0_prerequisites V1_no_relation_wal V2_volatile_wal V3_no_checkpoints V4_memory_slrus"
+ALL_CASES="V0_prerequisites V1_no_relation_wal V2_volatile_wal V3_no_checkpoints V4_memory_slrus V5_shared_image"
 
 SEED=
 BUILD_DIR=
@@ -656,6 +657,80 @@ nc_V4_memory_slrus()
 }
 
 # ===========================================================================
+# V5 --- startup and shutdown files; many postmasters on one image
+#
+# Four postmasters start on the same seed at once, which needs no lock file
+# and no shared-memory interlock.  Each sees only its own writes.  A SIGKILL
+# of one leaves the others serving, and it restarts at once.  Relcache init
+# files, stats and the rest are never written: the whole seed is identical
+# afterwards.  The control shows an ordinary server writing its lock file,
+# options file and relcache init files.
+# ===========================================================================
+
+V5_SERVERS=4
+V5_WORKLOAD="CREATE TABLE v5 (i int); INSERT INTO v5 SELECT generate_series(1, 100); SELECT count(*) FROM pg_class; ANALYZE v5; CHECKPOINT"
+
+V5_shared_image()
+{
+	local before i n ports=() pids=() out
+	before=$(manifest "$SEED")
+	vstop
+	: >"$LOGFILE"
+	for ((n = 0; n < V5_SERVERS; n++)); do
+		ports[n]=$(mc_free_port)
+		: >"$LOGFILE.$n"
+		mc_volatile_start "$SEED" "${ports[n]}" "$LOGFILE.$n" "$PIDFILE.$n" &
+		pids[n]=$!
+	done
+	for ((n = 0; n < V5_SERVERS; n++)); do
+		wait "${pids[n]}"
+		ck "postmaster $n starts on the shared image" $?
+	done
+	for ((n = 0; n < V5_SERVERS; n++)); do
+		vpsql -p "${ports[n]}" -c "$V5_WORKLOAD" -c "INSERT INTO v5 VALUES ($((1000 + n)))" >/dev/null
+	done
+	for ((n = 0; n < V5_SERVERS; n++)); do
+		ck_eq "postmaster $n sees only its own rows" "101 $((1000 + n))" \
+			"$(vpsql -p "${ports[n]}" -c 'SELECT count(*), max(i) FROM v5' | tr '|' ' ')"
+	done
+	ck_eq "a new connection sees the catalogs (no init file)" t \
+		"$(vpsql -p "${ports[0]}" -c "SELECT count(*) > 0 FROM pg_class WHERE relname = 'v5'")"
+	for f in postmaster.pid postmaster.opts global/pg_internal.init; do
+		ck "no $f in the image" "$([ ! -e "$SEED/$f" ]; echo $?)"
+	done
+
+	mc_volatile_stop "$PIDFILE.0" KILL
+	for ((n = 1; n < V5_SERVERS; n++)); do
+		ck_eq "postmaster $n survives a SIGKILL of postmaster 0" 101 \
+			"$(vpsql -p "${ports[n]}" -c 'SELECT count(*) FROM v5')"
+	done
+	mc_volatile_start "$SEED" "${ports[0]}" "$LOGFILE.0" "$PIDFILE.0"
+	ck "postmaster 0 restarts beside the others" $?
+	ck_eq "and starts from the image" 0 \
+		"$(vpsql -p "${ports[0]}" -c "SELECT count(*) FROM pg_class WHERE relname = 'v5'")"
+
+	for ((n = 0; n < V5_SERVERS; n++)); do
+		mc_volatile_stop "$PIDFILE.$n" INT
+		cat "$LOGFILE.$n" >>"$LOGFILE"
+	done
+	out=$(manifest "$SEED")
+	ck_eq "the seed is byte-identical" "$(printf '%s' "$before" | shasum)" "$(printf '%s' "$out" | shasum)"
+	[ "$before" = "$out" ] || diff <(printf '%s\n' "$before") <(printf '%s\n' "$out") | head -20
+	ck_no_crash
+}
+
+nc_V5_shared_image()
+{
+	stock_start
+	ck "stock server starts" $?
+	vpsql -c "$V5_WORKLOAD" >/dev/null
+	for f in postmaster.pid postmaster.opts global/pg_internal.init; do
+		ck "the stock server writes $f" "$([ -e "$STOCK/$f" ]; echo $?)"
+	done
+	stock_stop
+}
+
+# ===========================================================================
 # driver
 # ===========================================================================
 
@@ -670,6 +745,9 @@ mc_banner "memcow volatile_data_directory slice tests" \
 PASSED=0
 FAILED=0
 FAILED_NAMES=
+
+# The standing invariant: no case, positive or control, changes the seed.
+mc_seed_manifest "$SEED" "$OUTPUTDIR/seed.before"
 
 for c in "${CASES[@]}"; do
 	CASE_FAIL=0
@@ -690,6 +768,16 @@ for c in "${CASES[@]}"; do
 		[ $STOP_ON_FAIL -eq 1 ] && break
 	fi
 done
+
+mc_seed_manifest "$SEED" "$OUTPUTDIR/seed.after"
+if cmp -s "$OUTPUTDIR/seed.before" "$OUTPUTDIR/seed.after"; then
+	printf '\n  ok      the seed is byte-identical after every case\n'
+else
+	printf '\n  NOT OK  the seed changed:\n'
+	diff "$OUTPUTDIR/seed.before" "$OUTPUTDIR/seed.after" | head -20 | sed 's/^/          /'
+	FAILED=$((FAILED + 1))
+	FAILED_NAMES="$FAILED_NAMES seed-manifest"
+fi
 
 RC=0
 [ $FAILED -eq 0 ] || RC=1
