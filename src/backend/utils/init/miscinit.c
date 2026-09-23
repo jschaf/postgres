@@ -1773,6 +1773,12 @@ CheckVolatileDataDirectory(void)
 					  Unix_socket_directories[0] == '\0',
 					  "empty \"unix_socket_directories\"");
 	volatile_requires(!Logging_collector, "\"logging_collector\" = off");
+	/* Reinitializing after a crash would reuse add-in state for a new segment. */
+	volatile_requires(!restart_after_crash, "\"restart_after_crash\" = off");
+#ifdef EXEC_BACKEND
+	/* EXEC_BACKEND children read their settings from files below DataDir. */
+	volatile_requires(false, "a build without EXEC_BACKEND");
+#endif
 	volatile_requires(external_pid_file == NULL,
 					  "\"external_pid_file\" to be unset");
 }

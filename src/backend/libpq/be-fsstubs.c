@@ -508,6 +508,9 @@ be_lo_export(PG_FUNCTION_ARGS)
 	 * world-writable export files doesn't seem wise.
 	 */
 	text_to_cstring_buffer(filename, fnamebuf, sizeof(fnamebuf));
+	/* A relative path would name a file below DataDir. */
+	if (!is_absolute_path(fnamebuf))
+		PreventInVolatileDataDirectory("lo_export to a relative path");
 	oumask = umask(S_IWGRP | S_IWOTH);
 	PG_TRY();
 	{

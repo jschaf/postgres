@@ -7533,10 +7533,19 @@ CreateCheckPoint(int flags)
 	 * A checkpoint makes buffers, SLRUs and the control file durable.  In a
 	 * volatile data directory none of them ever will be, and nothing will
 	 * replay from a redo pointer, so every request -- timed, forced,
-	 * CHECKPOINT, shutdown -- completes without doing anything.
+	 * CHECKPOINT, shutdown -- persists nothing.  It still truncates the SLRUs
+	 * that only checkpoints truncate, which would otherwise grow for the life
+	 * of the server.
 	 */
 	if (VolatileDataDirectory)
+	{
+		if (!shutdown)
+		{
+			TruncateSUBTRANS(GetOldestTransactionIdConsideredRunning());
+			CheckPointPredicate();
+		}
 		return false;
+	}
 
 	/*
 	 * Prepare to accumulate statistics.

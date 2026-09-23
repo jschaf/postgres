@@ -1107,7 +1107,8 @@ CheckPointPredicate(void)
 	 * before deleting the file in which they sit, which would be completely
 	 * pointless.
 	 */
-	SimpleLruWriteAll(SerialSlruCtl, true);
+	if (!VolatileDataDirectory)
+		SimpleLruWriteAll(SerialSlruCtl, true);
 }
 
 /*------------------------------------------------------------------------*/

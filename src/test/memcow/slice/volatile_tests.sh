@@ -268,6 +268,7 @@ V0_REFUSALS=(
 	'dynamic_shared_memory_type=mmap|"dynamic_shared_memory_type" other than mmap'
 	"unix_socket_directories=$OUTPUTDIR|empty \"unix_socket_directories\""
 	'logging_collector=on|"logging_collector" = off'
+	'restart_after_crash=on|"restart_after_crash" = off'
 	"external_pid_file=$OUTPUTDIR/external.pid|\"external_pid_file\" to be unset"
 )
 
@@ -548,7 +549,7 @@ nc_V3_no_checkpoints()
 # then truncate it, which forgets stored segments instead of unlinking.  Commit status written before the eviction must read back
 # correctly afterwards, and no SLRU directory of the image may change.  A
 # store too small for the run fails the write loudly instead of dropping a
-# page.
+# page.  Checkpoints still truncate pg_subtrans, which nothing else does.
 # ===========================================================================
 
 V4_GUCS=(transaction_buffers=16 subtransaction_buffers=16
@@ -637,11 +638,25 @@ V4_memory_slrus()
 		"$(vpsql -c "SELECT blks_written >= 16 AND truncates > 0 FROM pg_stat_slru WHERE name = 'notify'")"
 	out=$(vpsql -c 'UPDATE v4m SET id = id' -c 'SELECT count(*) FROM v4m')
 	ck_eq "the multixact-locked row reads and updates" 1 "$(printf '%s\n' "$out" | tail -1)"
+
 	vstop
 	after=$(manifest "$SEED" $V4_SLRUS)
 	ck_eq "no SLRU directory changed" "$(printf '%s' "$before" | shasum)" \
 		"$(printf '%s' "$after" | shasum)"
 	ck_nomatch "no store overflow" 'store is full' "$(cat "$LOGFILE")"
+	ck_no_crash
+
+	# Only checkpoints truncate pg_subtrans, and a volatile checkpoint still
+	# does: a million XIDs need ~490 pg_subtrans pages, far past a 128-page
+	# store, unless each CHECKPOINT forgets the pages before the oldest XID.
+	vstart "${V4_GUCS[@]}" memcow.slru_pages=128
+	vpsql -c 'CREATE EXTENSION IF NOT EXISTS xid_wraparound' >/dev/null
+	out=$(for ((i = 0; i < 10; i++)); do
+		vpsql -c 'SELECT consume_xids(100000)' -c CHECKPOINT
+	done)
+	ck_nomatch "checkpoints keep pg_subtrans within a 128-page store" 'ERROR|store is full' \
+		"$out$(cat "$LOGFILE")"
+	vstop
 	ck_no_crash
 }
 
@@ -756,6 +771,7 @@ V6_REFUSALS=(
 	"ALTER SYSTEM SET work_mem = '1MB'|ALTER SYSTEM"
 	'BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_export_snapshot(); COMMIT|exporting a snapshot'
 	'VACUUM FULL pg_class|rewriting a mapped catalog'
+	"SELECT lo_from_bytea(424242, 'x'); SELECT lo_export(424242, 'v6.bin')|lo_export to a relative path"
 )
 
 V6_refusals()

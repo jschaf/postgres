@@ -1557,11 +1557,14 @@ restart:
 			continue;
 
 		/*
-		 * If page is clean, just change state to EMPTY (expected case).
+		 * If page is clean, just change state to EMPTY (expected case).  A
+		 * volatile data directory drops dirty pages too: writing one would
+		 * only store a page the truncation is about to forget.
 		 */
 		if (shared->page_status[slotno] == SLRU_PAGE_VALID &&
-			!shared->page_dirty[slotno])
+			(!shared->page_dirty[slotno] || VolatileDataDirectory))
 		{
+			shared->page_dirty[slotno] = false;
 			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
 			continue;
 		}
@@ -1664,8 +1667,9 @@ restart:
 
 		/* If page is clean, just change state to EMPTY (expected case). */
 		if (shared->page_status[slotno] == SLRU_PAGE_VALID &&
-			!shared->page_dirty[slotno])
+			(!shared->page_dirty[slotno] || VolatileDataDirectory))
 		{
+			shared->page_dirty[slotno] = false;
 			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
 			continue;
 		}
