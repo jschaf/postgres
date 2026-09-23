@@ -1634,6 +1634,20 @@ PathNameOpenFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
 }
 
 /*
+ * A volatile data directory has nowhere for a temporary file to go: spills
+ * are errors, and the operation must fit in memory.
+ */
+static void
+PreventTemporaryFileInVolatileDataDirectory(void)
+{
+	if (VolatileDataDirectory)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("temporary files are not supported when \"volatile_data_directory\" is enabled"),
+				 errhint("Raise \"work_mem\" or \"maintenance_work_mem\" so the operation fits in memory.")));
+}
+
+/*
  * Create directory 'directory'.  If necessary, create 'basedir', which must
  * be the directory above it.  This is designed for creating the top-level
  * temporary directory on demand before creating a directory underneath it.
@@ -1647,6 +1661,8 @@ PathNameOpenFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
 void
 PathNameCreateTemporaryDir(const char *basedir, const char *directory)
 {
+	PreventTemporaryFileInVolatileDataDirectory();
+
 	if (MakePGDirectory(directory) < 0)
 	{
 		if (errno == EEXIST)
@@ -1714,6 +1730,7 @@ OpenTemporaryFile(bool interXact)
 	File		file = 0;
 
 	Assert(temporary_files_allowed);	/* check temp file access is up */
+	PreventTemporaryFileInVolatileDataDirectory();
 
 	/*
 	 * Make sure the current resource owner has space for this File before we
@@ -1851,6 +1868,7 @@ PathNameCreateTemporaryFile(const char *path, bool error_on_failure)
 	File		file;
 
 	Assert(temporary_files_allowed);	/* check temp file access is up */
+	PreventTemporaryFileInVolatileDataDirectory();
 
 	ResourceOwnerEnlarge(CurrentResourceOwner);
 

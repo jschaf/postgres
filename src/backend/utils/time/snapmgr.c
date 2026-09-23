@@ -1127,6 +1127,8 @@ ExportSnapshot(Snapshot snapshot)
 	char		path[MAXPGPATH];
 	char		pathtmp[MAXPGPATH];
 
+	PreventInVolatileDataDirectory("exporting a snapshot");
+
 	/*
 	 * It's tempting to call RequireTransactionBlock here, since it's not very
 	 * useful to export a snapshot that will disappear immediately afterwards.

@@ -4516,6 +4516,8 @@ AlterSystemSetConfigFile(AlterSystemStmt *altersysstmt)
 	char		AutoConfFileName[MAXPGPATH];
 	char		AutoConfTmpFileName[MAXPGPATH];
 
+	PreventInVolatileDataDirectory("ALTER SYSTEM");
+
 	/*
 	 * Extract statement arguments
 	 */

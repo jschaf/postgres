@@ -328,6 +328,8 @@ RelationMapUpdateMap(Oid relationId, RelFileNumber fileNumber, bool shared,
 {
 	RelMapFile *map;
 
+	PreventInVolatileDataDirectory("rewriting a mapped catalog");
+
 	if (IsBootstrapProcessingMode())
 	{
 		/*

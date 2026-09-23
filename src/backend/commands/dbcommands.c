@@ -762,6 +762,8 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	CreateDBStrategy dbstrategy = CREATEDB_WAL_LOG;
 	createdb_failure_params fparms;
 
+	PreventInVolatileDataDirectory("CREATE DATABASE");
+
 	/* Report error if name has \n or \r character. */
 	if (strpbrk(dbname, "\n\r"))
 		ereport(ERROR,
@@ -1729,6 +1731,8 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 				nslots_active;
 	int			nsubscriptions;
 
+	PreventInVolatileDataDirectory("DROP DATABASE");
+
 	/*
 	 * Look up the target database's OID, and get exclusive lock on it. We
 	 * need this to ensure that no new backend starts up in the target
@@ -2070,6 +2074,8 @@ movedb(const char *dbname, const char *tblspcname)
 	DIR		   *dstdir;
 	struct dirent *xlde;
 	movedb_failure_params fparms;
+
+	PreventInVolatileDataDirectory("ALTER DATABASE SET TABLESPACE");
 
 	/*
 	 * Look up the target database's OID, and get exclusive lock on it. We

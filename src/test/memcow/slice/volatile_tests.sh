@@ -15,6 +15,7 @@
 #   V3  no checkpoints         CHECKPOINT and shutdown leave pg_control alone
 #   V4  memory SLRUs           evicted SLRU pages survive; no segment changes
 #   V5  shared image           four postmasters on one seed, no file written
+#   V6  temp files, refusals   spills and DataDir-writing commands are errors
 #
 # Every case has a negative control (--negative-control).  Where the property
 # is "the mode prevents a write", the control runs the same workload on an
@@ -41,7 +42,7 @@ HARNESS=$(cd -- "$HERE/../harness" && pwd)
 # shellcheck source=../harness/common.sh
 . "$HARNESS/common.sh"
 
-ALL_CASES="V0_prerequisites V1_no_relation_wal V2_volatile_wal V3_no_checkpoints V4_memory_slrus V5_shared_image"
+ALL_CASES="V0_prerequisites V1_no_relation_wal V2_volatile_wal V3_no_checkpoints V4_memory_slrus V5_shared_image V6_refusals"
 
 SEED=
 BUILD_DIR=
@@ -727,6 +728,76 @@ nc_V5_shared_image()
 	for f in postmaster.pid postmaster.opts global/pg_internal.init; do
 		ck "the stock server writes $f" "$([ -e "$STOCK/$f" ]; echo $?)"
 	done
+	stock_stop
+}
+
+# ===========================================================================
+# V6 --- temporary files and the commands that would write the directory
+#
+# A sort, a hash join and an index build that exceed their memory budget
+# fail with a named error and a work_mem hint instead of creating
+# base/pgsql_tmp; given the memory, the same statements succeed.  Commands
+# whose whole effect is a file below DataDir are refused by name.  The
+# control shows an ordinary server spilling and running ALTER SYSTEM.
+# ===========================================================================
+
+V6_SETUP="SET work_mem = '64MB'; CREATE TABLE v6 AS SELECT g AS i, md5(g::text) AS t FROM generate_series(1, 200000) g"
+V6_SPILLS=(
+	"SET work_mem = '64kB'; SELECT count(*) FROM (SELECT t FROM v6 ORDER BY t) s"
+	"SET work_mem = '64kB'; SET enable_mergejoin = off; SET enable_nestloop = off; SELECT count(*) FROM v6 a JOIN v6 b USING (t)"
+	"SET maintenance_work_mem = '1MB'; SET max_parallel_maintenance_workers = 0; CREATE INDEX v6_t ON v6 (t)"
+)
+V6_REFUSALS=(
+	'CREATE DATABASE v6db|CREATE DATABASE'
+	'DROP DATABASE memcow_lane_07|DROP DATABASE'
+	'ALTER DATABASE memcow_lane_07 SET TABLESPACE pg_default|ALTER DATABASE SET TABLESPACE'
+	"CREATE TABLESPACE v6ts LOCATION '/nonexistent'|CREATE TABLESPACE"
+	'DROP TABLESPACE IF EXISTS v6ts|DROP TABLESPACE'
+	"ALTER SYSTEM SET work_mem = '1MB'|ALTER SYSTEM"
+	'BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_export_snapshot(); COMMIT|exporting a snapshot'
+	'VACUUM FULL pg_class|rewriting a mapped catalog'
+)
+
+V6_refusals()
+{
+	local stmt entry want out
+	vstart
+	ck "server starts" $?
+	printf "%s;\n" "$V6_SETUP" | vpsql >/dev/null
+	for stmt in "${V6_SPILLS[@]}"; do
+		out=$(printf '%s;\n' "$stmt" | vpsql)
+		ck_match "spill refused: ${stmt##*; }" \
+			'temporary files are not supported when "volatile_data_directory" is enabled' "$out"
+	done
+	ck_match "the refusal names the fix" 'HINT: +Raise "work_mem" or "maintenance_work_mem"' "$out"
+	out=$(printf '%s;\n' "SET work_mem = '256MB'" "${V6_SPILLS[0]#*; }" \
+		"SET maintenance_work_mem = '256MB'" "SET max_parallel_maintenance_workers = 4" \
+		"SET min_parallel_table_scan_size = 0" "CREATE INDEX v6_t ON v6 (t)" | vpsql)
+	# Parallel workers hand sorted runs over in files; the planner uses none.
+	ck_nomatch "with the memory, the sort and a parallel-eligible index build run" 'ERROR' "$out"
+
+	for entry in "${V6_REFUSALS[@]}"; do
+		out=$(printf '%s;\n' "${entry%%|*}" | vpsql)
+		want=${entry#*|}
+		ck_match "refused: $want" "ERROR: +$want is not supported when \"volatile_data_directory\" is enabled" "$out"
+	done
+	ck "no pgsql_tmp in the image" "$([ ! -e "$SEED/base/pgsql_tmp" ]; echo $?)"
+	vstop
+	ck_no_crash
+}
+
+nc_V6_refusals()
+{
+	local out
+	stock_start
+	ck "stock server starts" $?
+	printf "%s;\n" "$V6_SETUP" | vpsql >/dev/null
+	out=$(printf '%s;\n' "${V6_SPILLS[0]}" | vpsql)
+	ck_nomatch "the stock server spills" 'ERROR' "$out"
+	ck "and creates base/pgsql_tmp" "$([ -d "$STOCK/base/pgsql_tmp" ]; echo $?)"
+	out=$(vpsql -c "ALTER SYSTEM SET work_mem = '1MB'")
+	ck_nomatch "the stock server runs ALTER SYSTEM" 'ERROR' "$out"
+	ck_match "and writes postgresql.auto.conf" "work_mem = '1MB'" "$(cat "$STOCK/postgresql.auto.conf")"
 	stock_stop
 }
 

@@ -7218,6 +7218,14 @@ plan_create_index_workers(Oid tableOid, Oid indexOid)
 	if (!IsUnderPostmaster || max_parallel_maintenance_workers == 0)
 		return 0;
 
+	/*
+	 * Parallel index builds hand their sorted runs over in temporary files,
+	 * even when every run fits in memory, and a volatile data directory has
+	 * none.
+	 */
+	if (VolatileDataDirectory)
+		return 0;
+
 	/* Set up largely-dummy planner state */
 	query = makeNode(Query);
 	query->commandType = CMD_SELECT;

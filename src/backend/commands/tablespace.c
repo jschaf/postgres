@@ -219,6 +219,8 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 	Datum		newOptions;
 	bool		in_place;
 
+	PreventInVolatileDataDirectory("CREATE TABLESPACE");
+
 	/* Must be superuser */
 	if (!superuser())
 		ereport(ERROR,
@@ -411,6 +413,8 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 	Oid			tablespaceoid;
 	char	   *detail;
 	char	   *detail_log;
+
+	PreventInVolatileDataDirectory("DROP TABLESPACE");
 
 	/*
 	 * Find the target tuple
