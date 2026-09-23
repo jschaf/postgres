@@ -325,13 +325,17 @@ mc_harness_dir()
 # A postmaster whose data directory IS the immutable seed.  pg_ctl cannot own
 # it: pg_ctl reads postmaster.pid, which a volatile server never writes.  The
 # caller owns the PID recorded in PIDFILE (outside the seed) and readiness is
-# a TCP connection, the only kind of listener the mode allows.  Callers' GUCs
-# come last and so override the baseline.
+# a TCP connection, the only kind of listener the mode allows.  Another server
+# may hold the port while this one has not bound it yet, so readiness also
+# requires this start's cluster_name.  Callers' GUCs come last and so override
+# the baseline.
 mc_volatile_start()
 {
-	local seed=$1 port=$2 logfile=$3 pidfile=$4 pid i g
+	local seed=$1 port=$2 logfile=$3 pidfile=$4 pid i g name
 	shift 4
+	name=mcvol-$$-$RANDOM$RANDOM
 	local args=(-D "$seed" -c volatile_data_directory=on -c "port=$port"
+		-c "cluster_name=$name"
 		-c listen_addresses=127.0.0.1 -c unix_socket_directories=
 		-c shared_preload_libraries=memcow -c memcow.enabled=on
 		-c "memcow.seed_directory=$seed" -c wal_level=minimal
@@ -346,7 +350,8 @@ mc_volatile_start()
 	pid=$!
 	echo "$pid" >"$pidfile"
 	for ((i = 0; i < 1200; i++)); do
-		if "$MC_BINDIR/pg_isready" -q -h 127.0.0.1 -p "$port" -d postgres; then
+		if [ "$("$MC_BINDIR/psql" -X -A -t -h 127.0.0.1 -p "$port" -U "${PGUSER:-postgres}" \
+			-d postgres -c 'SHOW cluster_name' 2>/dev/null)" = "$name" ]; then
 			return 0
 		fi
 		if ! kill -0 "$pid" 2>/dev/null; then
