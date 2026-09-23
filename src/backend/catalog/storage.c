@@ -140,7 +140,7 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 			break;
 		case RELPERSISTENCE_PERMANENT:
 			procNumber = INVALID_PROC_NUMBER;
-			needs_wal = true;
+			needs_wal = !VolatileDataDirectory;
 			break;
 		default:
 			elog(ERROR, "invalid relpersistence: %c", relpersistence);
@@ -171,7 +171,12 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 		pendingDeletes = pending;
 	}
 
-	if (relpersistence == RELPERSISTENCE_PERMANENT && !XLogIsNeeded())
+	/*
+	 * WAL-skipped storage is synced or logged at commit, except in a volatile
+	 * data directory, where it is never logged and there is nothing to sync.
+	 */
+	if (relpersistence == RELPERSISTENCE_PERMANENT && !XLogIsNeeded() &&
+		!VolatileDataDirectory)
 	{
 		Assert(procNumber == INVALID_PROC_NUMBER);
 		AddPendingSync(&rlocator);

@@ -20,6 +20,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_publication.h"
+#include "miscadmin.h"
 #include "nodes/bitmapset.h"
 #include "partitioning/partdefs.h"
 #include "rewrite/prs2lock.h"
@@ -635,10 +636,12 @@ RelationCloseSmgr(Relation relation)
  *
  * Returns false if wal_level = minimal and this relation is created or
  * truncated in the current transaction.  See "Skipping WAL for New
- * RelFileLocator" in src/backend/access/transam/README.
+ * RelFileLocator" in src/backend/access/transam/README.  Always false in a
+ * volatile data directory, whose relation pages never outlive the postmaster.
  */
 #define RelationNeedsWAL(relation)										\
-	(RelationIsPermanent(relation) && (XLogIsNeeded() ||				\
+	(RelationIsPermanent(relation) && !VolatileDataDirectory &&		\
+	 (XLogIsNeeded() ||													\
 	  (relation->rd_createSubid == InvalidSubTransactionId &&			\
 	   relation->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)))
 

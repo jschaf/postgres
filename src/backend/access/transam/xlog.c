@@ -6584,6 +6584,16 @@ StartupXLOG(void)
 	XLogCtl->LogwrtRqst.Flush = EndOfLog;
 
 	/*
+	 * A volatile data directory's permanent relations draw fake LSNs from the
+	 * unlogged counter (XLogGetFakeLSN()).  Start it past every LSN a page of
+	 * the image can carry: permanent pages were written no later than the
+	 * image's last checkpoint, unlogged pages no later than its saved counter.
+	 */
+	if (VolatileDataDirectory)
+		pg_atomic_write_membarrier_u64(&XLogCtl->unloggedLSN,
+									   Max(ControlFile->unloggedLSN, EndOfLog));
+
+	/*
 	 * Preallocate additional log files, if wanted.
 	 */
 	PreallocXlogFiles(EndOfLog, newTLI);

@@ -5750,8 +5750,12 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 		 *
 		 * We don't check full_page_writes here because that logic is included
 		 * when we call XLogInsert() since the value changes dynamically.
+		 *
+		 * A volatile data directory writes no relation WAL, and a page that
+		 * lives in memory cannot tear, so it just dirties the page.
 		 */
-		if (XLogHintBitIsNeeded() && (lockstate & BM_PERMANENT))
+		if (XLogHintBitIsNeeded() && (lockstate & BM_PERMANENT) &&
+			!VolatileDataDirectory)
 		{
 			/*
 			 * If we must not write WAL, due to a relfilelocator-specific

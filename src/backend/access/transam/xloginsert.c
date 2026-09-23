@@ -578,6 +578,16 @@ XLogGetFakeLSN(Relation rel)
 		 */
 		return GetFakeLSNForUnloggedRel();
 	}
+	else if (VolatileDataDirectory)
+	{
+		/*
+		 * No relation is ever WAL-logged, so a shared counter serves, as for
+		 * unlogged relations.  StartupXLOG() starts it past every LSN on a
+		 * page of the data directory.
+		 */
+		Assert(!RelationNeedsWAL(rel));
+		return GetFakeLSNForUnloggedRel();
+	}
 	else
 	{
 		/*

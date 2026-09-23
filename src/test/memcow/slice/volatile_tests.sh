@@ -10,6 +10,7 @@
 # against the seed built by seed/build_seed.sh.
 #
 #   V0  prerequisites          the mode refuses every setting that would write
+#   V1  no relation WAL        DML, DDL and index builds log only commits
 #   V2  volatile WAL           WAL crosses segments; pg_wal never changes
 #   V3  no checkpoints         CHECKPOINT and shutdown leave pg_control alone
 #
@@ -38,7 +39,7 @@ HARNESS=$(cd -- "$HERE/../harness" && pwd)
 # shellcheck source=../harness/common.sh
 . "$HARNESS/common.sh"
 
-ALL_CASES="V0_prerequisites V2_volatile_wal V3_no_checkpoints"
+ALL_CASES="V0_prerequisites V1_no_relation_wal V2_volatile_wal V3_no_checkpoints"
 
 SEED=
 BUILD_DIR=
@@ -307,6 +308,97 @@ nc_V0_prerequisites()
 		ck "wal_level=replica starts without the mode" 1
 	fi
 	rm -rf "$copy"
+}
+
+# ===========================================================================
+# V1 --- no relation WAL
+#
+# DDL, DML, every index AM's build and insert paths, a sequence, VACUUM and
+# hint-bit setting on existing pages run one statement per transaction.  The
+# WAL they generate must be commit records only: at most V1_BYTES_PER_XACT
+# per statement plus a page of slack.  The control shows the same workload
+# writing megabytes on an ordinary server.  GiST, which orders page splits by
+# LSN, must still answer correctly with fake LSNs, which start past the
+# image's WAL; amcheck verifies the B-tree.
+# ===========================================================================
+
+V1_BYTES_PER_XACT=128
+V1_SETUP="
+CREATE EXTENSION IF NOT EXISTS amcheck;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+CREATE TABLE v1 (i int PRIMARY KEY, t text, p point, a int[], r int4range);
+CREATE SEQUENCE v1_seq;
+"
+V1_WORKLOAD=(
+	"INSERT INTO v1 SELECT g, md5(g::text), point(g % 97, g % 89), ARRAY[g % 7, g % 11], int4range(g, g + 10) FROM generate_series(1, 20000) g"
+	"CREATE INDEX v1_gist ON v1 USING gist (p)"
+	"CREATE INDEX v1_hash ON v1 USING hash (t)"
+	"CREATE INDEX v1_brin ON v1 USING brin (i)"
+	"CREATE INDEX v1_gin ON v1 USING gin (a)"
+	"CREATE INDEX v1_spgist ON v1 USING spgist (r)"
+	"INSERT INTO v1 SELECT g, md5(g::text), point(g % 97, g % 89), ARRAY[g % 7], int4range(g, g + 1) FROM generate_series(20001, 30000) g"
+	"UPDATE v1 SET t = t || 'x' WHERE i % 3 = 0"
+	"DELETE FROM v1 WHERE i % 5 = 0"
+	"SELECT count(*) FROM v1"
+	"VACUUM v1"
+	"SELECT count(nextval('v1_seq')) FROM generate_series(1, 1000)"
+	"ALTER SEQUENCE v1_seq RESTART"
+	"CREATE TABLE v1_copy AS SELECT * FROM v1"
+	"ALTER TABLE v1_copy ADD COLUMN z int DEFAULT 7"
+	"CLUSTER v1 USING v1_pkey"
+	"INSERT INTO v1 SELECT g, 'far', point(g, g), ARRAY[g], int4range(g, g + 1) FROM generate_series(40001, 42000) g"
+)
+V1_GIST_COUNT="SELECT count(*) FROM v1 WHERE p <@ box '((10,10),(20,20))'"
+
+# v1_run PORT --- the workload; prints the WAL bytes it generated.
+v1_run()
+{
+	local port=$1 start end stmt out
+	vpsql -p "$port" -c "$V1_SETUP" >/dev/null
+	start=$(vpsql -p "$port" -c 'SELECT pg_current_wal_insert_lsn()')
+	for stmt in "${V1_WORKLOAD[@]}"; do
+		out=$(vpsql -p "$port" -c "$stmt")
+		case $out in
+			*ERROR*) printf 'statement failed: %s\n%s\n' "$stmt" "$out" >&2 ;;
+		esac
+	done
+	end=$(vpsql -p "$port" -c 'SELECT pg_current_wal_insert_lsn()')
+	vpsql -p "$port" -c "SELECT '$end'::pg_lsn - '$start'::pg_lsn"
+}
+
+V1_no_relation_wal()
+{
+	local bytes bound ckpt out
+	vstart
+	ck "server starts" $?
+	bytes=$(v1_run "$PORT")
+	bound=$(( ${#V1_WORKLOAD[@]} * V1_BYTES_PER_XACT + 8192 ))
+	ck "the workload wrote $bytes WAL bytes, at most $bound" \
+		"$([ "${bytes:-999999999}" -le "$bound" ]; echo $?)"
+
+	out=$(vpsql -c "SET enable_indexscan = off" -c "SET enable_bitmapscan = off" -c "$V1_GIST_COUNT")
+	ck_eq "GiST answers as a heap scan does" "$out" \
+		"$(vpsql -c "SET enable_seqscan = off" -c "$V1_GIST_COUNT")"
+	ck_eq "the far inserts are found through GiST" 2000 \
+		"$(vpsql -c "SET enable_seqscan = off" -c "SELECT count(*) FROM v1 WHERE p <@ box '((40001,40001),(42000,42000))'")"
+	ckpt=$(control_value "$SEED" 'Latest checkpoint location')
+	ck_eq "the GiST root carries a fake LSN past the image's WAL" t \
+		"$(vpsql -c "SELECT lsn > '$ckpt'::pg_lsn FROM page_header(get_raw_page('v1_gist', 0))")"
+	out=$(vpsql -c "SELECT bt_index_check('v1_pkey', true)")
+	ck_nomatch "amcheck verifies the B-tree" 'ERROR' "$out"
+	vstop
+	ck_no_crash
+}
+
+nc_V1_no_relation_wal()
+{
+	local bytes
+	stock_start
+	ck "stock server starts" $?
+	bytes=$(v1_run "$PORT")
+	ck "the stock server logged $bytes bytes, more than 1MB" \
+		"$([ "${bytes:-0}" -gt 1048576 ]; echo $?)"
+	stock_stop
 }
 
 # ===========================================================================
